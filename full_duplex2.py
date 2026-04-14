@@ -46,6 +46,15 @@ _template_dir = os.path.dirname(os.path.abspath(__file__)) or "."
 _template_env = Environment(loader=FileSystemLoader(_template_dir))
 _prompt_template = _template_env.get_template("full-duplex2.jinja2")
 
+import nemo.collections.asr as nemo_asr
+try:
+    import torch as _torch
+    _asr_device = "cuda" if _torch.cuda.is_available() else "cpu"
+except ImportError:
+    _asr_device = "cpu"
+_asr_model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
+_asr_model.to(_asr_device)
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -133,7 +142,7 @@ class DuplexAudioAgent:
         # ASR windows (same semantics as full_duplex.py)
         self.asr_windows: List[AsrTimestampWindow] = []
         self.max_asr_windows: int = 20
-        self.mutable_asr_windows: int = 10
+        self.mutable_asr_windows: int = 3
 
     # ------------------------------------------------------------------
     # Helpers
@@ -151,13 +160,7 @@ class DuplexAudioAgent:
         return self._tts_client
 
     def _get_asr_model(self):
-        if self._asr_model is None:
-            import nemo.collections.asr as nemo_asr
-            self._asr_model = nemo_asr.models.ASRModel.from_pretrained(
-                "nvidia/parakeet-tdt-0.6b-v2",
-            )
-            self._asr_model.to(self._device)
-        return self._asr_model
+        return _asr_model
 
     def _ensure_current_block(self, now: float) -> None:
         if self._current_block is None:
@@ -243,6 +246,10 @@ class DuplexAudioAgent:
                 tmp_path = f.name
                 sf.write(f.name, full_audio, MIC_SAMPLE_RATE)
             output = model.transcribe([tmp_path], timestamps=True)
+        except Exception as exc:
+            print(f"[asr] transcribe error: {exc!r}")
+            import traceback; traceback.print_exc()
+            return
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -250,9 +257,10 @@ class DuplexAudioAgent:
                 except OSError:
                     pass
 
-        word_segments = (
-            output[0].timestamp.get("word", []) if output else []
-        )
+        text = repr(output[0].text) if output else "(empty)"
+        print(f"[asr] transcribed {len(full_audio)/MIC_SAMPLE_RATE:.1f}s -> {text}")
+        word_segments = output[0].timestep.get("word", []) if output else []
+        print(f"[asr] word_segments={word_segments}")
 
         # Group words into windows by matching abs end_time to a block
         windows: dict = {}
@@ -266,9 +274,10 @@ class DuplexAudioAgent:
                     windows.setdefault(idx, []).append((word, abs_end))
                     break
 
+        print(f"[asr] windows={windows}")
         for idx, words in windows.items():
             start_ts, end_ts, _ = rolling[idx]
-            self.ingest_parakeet_window(start_ts, end_ts, words, f"mic-{idx}")
+            self.ingest_parakeet_window(start_ts, end_ts, words, f"mic-{start_ts:.3f}")
 
     # ------------------------------------------------------------------
     # Word queue management
