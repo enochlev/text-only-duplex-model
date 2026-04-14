@@ -16,3 +16,7 @@ Rules:
 - Be concise and natural, as in real spoken dialogue.
 - Do not repeat yourself — if you already said something, do not say it again.
 - Respond naturally to what the user has said most recently.
+{% if has_forced_words %}
+
+IMPORTANT: Your response MUST begin with the exact words shown immediately after <new_assistant_message>. Those words are already being spoken and cannot be changed. Continue naturally from there.
+{% endif %}

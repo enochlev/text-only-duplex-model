@@ -3,10 +3,15 @@ name = "text-only-duplex-model"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "gradio>=6.9.0",
     "openai>=2.26.0",
+    "python-dotenv>=1.0.1",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "torchvision>=0.15.0",
+    "soundfile>=0.12.1",
 ]
 
 [dependency-groups]
