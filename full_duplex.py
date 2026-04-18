@@ -127,9 +127,11 @@ for _noisy in ("nemo", "nemo_logging", "lightning", "pytorch_lightning", "omegac
 _os.environ.setdefault("TQDM_DISABLE", "1")  # suppress NeMo progress bars
 
 _asr_model = None
+_piper_voice_cache = {}
 # NeMo's transcribe() is not thread-safe (freeze/unfreeze race).
 # All background ASR threads must hold this lock before calling transcribe().
 _asr_lock = _threading.Lock()
+_piper_lock = _threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +191,73 @@ def _resample(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
     return resampled.squeeze(0).numpy()
 
 
+def resolve_device(device: Optional[str] = None) -> str:
+    if device is not None:
+        return device
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+def preload_piper_voice(
+    tts_model: str = TTS_MODEL,
+    device: Optional[str] = None,
+):
+    resolved_device = resolve_device(device)
+    cache_key = (tts_model, resolved_device)
+    with _piper_lock:
+        cached = _piper_voice_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        from piper.download_voices import download_voice
+
+        download_voice("en_US-danny-low", tts_model, force_redownload=False)
+
+        from piper.voice import PiperVoice
+
+        voice = PiperVoice.load(tts_model, use_cuda=(resolved_device == "cuda"))
+        _piper_voice_cache[cache_key] = voice
+        return voice
+
+
+def preload_asr_model():
+    global _asr_model
+    if _asr_model is None:
+        import nemo.collections.asr as nemo_asr
+
+        device = resolve_device()
+        _asr_model = nemo_asr.models.ASRModel.from_pretrained(
+            "nvidia/parakeet-tdt-0.6b-v2",
+            map_location=device,
+        )
+        _asr_model.to(device)
+        try:
+            from nemo.utils import logging as _nemo_logging
+            import logging as _py_logging
+
+            _nemo_logging.setLevel(_py_logging.ERROR)
+        except Exception:
+            pass
+    return _asr_model
+
+
+def preload_duplex_models(
+    tts_model: str = TTS_MODEL,
+    device: Optional[str] = None,
+) -> None:
+    resolved_device = resolve_device(device)
+    preload_piper_voice(tts_model=tts_model, device=resolved_device)
+    preload_asr_model()
+
+
 # ---------------------------------------------------------------------------
 # DuplexAudioAgent  (audio-in / audio-out — Piper TTS + Parakeet ASR)
 # ---------------------------------------------------------------------------
@@ -206,12 +275,7 @@ class DuplexAudioAgent:
         tts_fn: Optional[Callable[[str], tuple]] = None,
         asr_fn: Optional[Callable] = None,
     ):
-        if device is None:
-            try:
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                device = "cpu"
+        device = resolve_device(device)
 
         self._n = math.ceil(wpm * default_block_s / 60)
         self._default_block_s = default_block_s
@@ -377,37 +441,14 @@ class DuplexAudioAgent:
 
     def _get_piper_voice(self):
         if self._piper_voice is None:
-            from piper.download_voices import download_voice
-            download_voice("en_US-danny-low", self._tts_model, force_redownload=False)
-
-            from piper.voice import PiperVoice
-            self._piper_voice = PiperVoice.load(
-                self._tts_model, use_cuda=(self._device == "cuda")
+            self._piper_voice = preload_piper_voice(
+                tts_model=self._tts_model,
+                device=self._device,
             )
         return self._piper_voice
 
     def _get_asr_model(self):
-        global _asr_model
-        if _asr_model is None:
-            import nemo.collections.asr as nemo_asr
-            try:
-                import torch as _torch
-                device = "cuda" if _torch.cuda.is_available() else "cpu"
-                if device == "cpu":
-                    #try mps
-                    if _torch.backends.mps.is_available():
-                        device = "mps"
-            except ImportError:
-                device = "cpu"
-            _asr_model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2",map_location=device)
-            _asr_model.to(device)
-            try:
-                from nemo.utils import logging as _nemo_logging
-                import logging as _logging
-                _nemo_logging.setLevel(_logging.ERROR)
-            except Exception:
-                pass
-        return _asr_model
+        return preload_asr_model()
 
     def _ensure_current_block(self, now: float) -> None:
         if self._current_block is None:

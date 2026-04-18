@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.115.0",
     "gradio>=6.9.0",
     "openai>=2.26.0",
     "python-dotenv>=1.0.1",
@@ -15,6 +16,8 @@ dependencies = [
     "piper-tts>=1.4.2",
     "transformers<5",
     "nemo-toolkit[asr]>=2.7.2",
+    "uvicorn>=0.35.0",
+    "websockets>=15.0.1",
 ]
 
 [dependency-groups]
