@@ -71,6 +71,26 @@ def llm_generate(system_prompt: str, user_message: str) -> str:
     )
     return _extract_response_text(response)
 
+# call local vllm. Not with caht but with completion
+def local_llm_generate(system_prompt: str, user_message: str) -> str:
+    import requests
+    url = "http://localhost:8000/v1/completions"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": "fd",
+        "prompt": user_message,
+        "max_tokens": 12,
+        "temperature": 0.0,
+        # logprobs
+        "logprobs": 5
+    }
+    response = requests.post(url, json=payload, headers=headers)
+    out = response.json().get("choices", [{}])[0].get("text", "").strip()
+    return out    
+# #test it
+# response  = local_llm_generate("system prompt", "Hi how are you?")
+# print(response)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -92,8 +112,8 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(__file__)) or "."
 _template_env = Environment(loader=FileSystemLoader(_MODULE_DIR))
 _prompt_template = _template_env.get_template("full-duplex.jinja2")
 
-_DEFAULT_TTS_MODEL = os.path.join(_MODULE_DIR, "voices", "en_US-lessac-medium.onnx") # 22kHz model
-_FAST_TTS_MODEL = os.path.join(_MODULE_DIR, "voices", "en_US-danny-low.onnx") # 16kHz model with faster inference but lower quality
+#TTS_MODEL = os.path.join(_MODULE_DIR, "en_US-lessac-medium.onnx") # 22kHz model
+TTS_MODEL = os.path.join(_MODULE_DIR, "voices","en_US-danny-low.onnx") # 16kHz model with faster inference but lower quality
 
 # ---------------------------------------------------------------------------
 # ASR model (lazy-loaded on first use)
@@ -178,9 +198,9 @@ class DuplexAudioAgent:
         self,
         wpm: int = DEFAULT_WPM,
         default_block_s: float = DEFAULT_BLOCK_S,
-        tts_model: str = _FAST_TTS_MODEL,
+        tts_model: str = TTS_MODEL,
         device: Optional[str] = None,
-        llm_generate_fn: Callable[[str, str], str] = llm_generate,
+        llm_generate_fn: Callable[[str, str], str] = local_llm_generate,
         max_prompt_blocks: int = 20,
         # Injected for testing (None → use real implementations)
         tts_fn: Optional[Callable[[str], tuple]] = None,
@@ -357,6 +377,9 @@ class DuplexAudioAgent:
 
     def _get_piper_voice(self):
         if self._piper_voice is None:
+            from piper.download_voices import download_voice
+            download_voice("en_US-danny-low", self._tts_model, force_redownload=False)
+
             from piper.voice import PiperVoice
             self._piper_voice = PiperVoice.load(
                 self._tts_model, use_cuda=(self._device == "cuda")
@@ -376,7 +399,7 @@ class DuplexAudioAgent:
                         device = "mps"
             except ImportError:
                 device = "cpu"
-            _asr_model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
+            _asr_model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2",map_location=device)
             _asr_model.to(device)
             try:
                 from nemo.utils import logging as _nemo_logging

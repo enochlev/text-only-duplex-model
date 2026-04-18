@@ -8,11 +8,13 @@ dependencies = [
     "gradio>=6.9.0",
     "openai>=2.26.0",
     "python-dotenv>=1.0.1",
-    "torch>=2.0.0",
-    "torchaudio>=2.0.0",
-    "torchvision>=0.15.0",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+    "torchvision==0.21.0",
     "soundfile>=0.12.1",
     "piper-tts>=1.4.2",
+    "transformers<5",
+    "nemo-toolkit[asr]>=2.7.2",
 ]
 
 [dependency-groups]
