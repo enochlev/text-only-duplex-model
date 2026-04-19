@@ -802,6 +802,7 @@ class DuplexAudioAgent:
             cleaned = self._normalize(raw).strip()
             if cleaned.endswith("</s>"):
                 cleaned = cleaned[:-4].strip()
+            cleaned = cleaned.replace("<idle>", "").strip()
             print(f"[llm←] words={len(cleaned.split())} text={cleaned!r}")
             self.last_llm_error = None
 
