@@ -9,6 +9,8 @@ wheels/
 # Virtual environments
 .venv
 .env
+.DS_Store
+.claude*
 
 # Project
 voices/*

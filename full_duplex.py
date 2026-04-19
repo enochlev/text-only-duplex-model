@@ -21,6 +21,8 @@ import numpy as np
 from dotenv import load_dotenv
 from jinja2 import Environment, FileSystemLoader
 from openai import OpenAI
+from groq import Groq
+
 
 load_dotenv()
 
@@ -32,22 +34,6 @@ load_dotenv()
 _llm_client: Optional[OpenAI] = None
 
 
-def _extract_response_text(response) -> str:
-    text = getattr(response, "output_text", None)
-    if isinstance(text, str) and text.strip():
-        return text
-
-    output = getattr(response, "output", None) or []
-    chunks: List[str] = []
-    for item in output:
-        content_items = getattr(item, "content", None) or []
-        for content in content_items:
-            if getattr(content, "type", "") == "output_text":
-                value = getattr(content, "text", None)
-                if value:
-                    chunks.append(value)
-    return "\n".join(chunks).strip()
-
 
 def _get_llm_client() -> OpenAI:
     global _llm_client
@@ -58,8 +44,17 @@ def _get_llm_client() -> OpenAI:
         _llm_client = OpenAI(api_key=api_key)
     return _llm_client
 
+def _get_groq_client() -> Groq:
+    global _llm_client
+    if _llm_client is None:
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY is required")
+        _llm_client = Groq(api_key=api_key)
+    return _llm_client
 
-def llm_generate(system_prompt: str, user_message: str) -> str:
+
+def llm_generate_openai(system_prompt: str, user_message: str) -> str:
     client = _get_llm_client()
     model = os.getenv("OPENAI_MODEL", "gpt-5.4-nano").strip() or "gpt-5.4-nano"
     response = client.responses.create(
@@ -69,7 +64,23 @@ def llm_generate(system_prompt: str, user_message: str) -> str:
         reasoning={"effort": "none"},
         max_output_tokens=16,
     )
-    return _extract_response_text(response)
+    return response.output[0].content[0].text.strip()
+
+def llm_generate_groq(system_prompt: str, user_message: str) -> str:
+    client = _get_groq_client()
+    model = os.getenv("GROQ_MODEL", "qwen/qwen3-32b").strip() or "qwen/qwen3-32b"
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=8,
+        temperature=0.0,
+        reasoning_effort="none",
+    )
+    return response.choices[0].message.content.strip()
+
 
 # call local vllm. Not with caht but with completion
 def local_llm_generate(system_prompt: str, user_message: str) -> str:
@@ -270,7 +281,7 @@ class DuplexAudioAgent:
         default_block_s: float = DEFAULT_BLOCK_S,
         tts_model: str = TTS_MODEL,
         device: Optional[str] = None,
-        llm_generate_fn: Callable[[str, str], str] = local_llm_generate,
+        llm_generate_fn: Callable[[str, str], str] = llm_generate_groq,
         max_prompt_blocks: int = 20,
         # Injected for testing (None → use real implementations)
         tts_fn: Optional[Callable[[str], tuple]] = None,
@@ -686,6 +697,11 @@ class DuplexAudioAgent:
             self._committed_words.extend(to_commit)
             self._clear_pending_response_timing()
             print(f"[commit] {to_commit} | committed={self._committed_words}")
+            # Words were consumed — allow LLM to continue generating the next chunk
+            # regardless of whether context_version changed. Without this, the AI
+            # goes silent after the first response until the user speaks again.
+            if not self._pending_words:
+                self._last_accepted_response_context_version = None
 
     def _update_pending_queue(self, proposal_words: List[str]) -> None:
         committed = self._committed_words
