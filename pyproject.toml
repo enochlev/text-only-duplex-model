@@ -3,7 +3,7 @@ name = "text-only-duplex-model"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.115.0",
     "gradio>=6.9.0",
@@ -14,7 +14,6 @@ dependencies = [
     "torchvision==0.21.0",
     "soundfile>=0.12.1",
     "piper-tts>=1.4.2",
-    "transformers<5",
     "nemo-toolkit[asr]>=2.7.2",
     "uvicorn>=0.35.0",
     "websockets>=15.0.1",
