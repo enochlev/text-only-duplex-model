@@ -217,9 +217,10 @@ def preload_piper_voice(
         if cached is not None:
             return cached
 
+        from pathlib import Path
         from piper.download_voices import download_voice
 
-        download_voice("en_US-danny-low", tts_model, force_redownload=False)
+        download_voice("en_US-danny-low", Path(tts_model).parent, force_redownload=False)
 
         from piper.voice import PiperVoice
 
