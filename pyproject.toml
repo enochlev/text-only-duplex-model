@@ -24,6 +24,15 @@ dependencies = [
 dev = [
     "pytest>=8.4.0",
 ]
+train = [
+    # RL training dependencies (full_duplex_trainer.py)
+    # vLLM requires matching CUDA version; pin to avoid breakage with weight-sync API.
+    "vllm>=0.4.0,<0.6.0",
+    "transformers>=4.40.0",
+    "accelerate>=0.29.0",
+    # Audio loading for StaticAudioSimulator (MP3 support)
+    "librosa>=0.10.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
