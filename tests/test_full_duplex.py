@@ -9,9 +9,11 @@ import math
 import queue
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import full_duplex
 
 from full_duplex import (
     DEFAULT_BLOCK_S,
@@ -102,10 +104,10 @@ def test_commit_block_words_takes_n():
 
 def test_commit_block_words_fewer_than_n():
     agent = make_agent()
-    agent._pending_words = ["hello", "world"]
+    agent._pending_words = ["hello", "world."]
     agent._ensure_current_block(1000.0)
     agent._commit_block_words()
-    assert agent._current_block.assistant_text == "hello world"
+    assert agent._current_block.assistant_text == "hello world."
     assert agent._pending_words == []
 
 
@@ -120,26 +122,28 @@ def test_commit_block_words_empty_pending():
 
 def test_commit_block_words_updates_committed():
     agent = make_agent()
-    agent._pending_words = ["hello", "world"]
+    agent._pending_words = ["hello", "world."]
     agent._ensure_current_block(1000.0)
     agent._commit_block_words()
-    assert agent._committed_words == ["hello", "world"]
+    assert agent._committed_words == ["hello", "world."]
 
 
 def test_commit_block_words_accumulates_committed_across_calls():
     agent = make_agent()
-    agent._pending_words = ["a", "b", "c", "d", "e", "f"]
+    agent._pending_words = ["a", "b", "c", "d", "e", "f."]
     agent._ensure_current_block(1000.0)
     agent._commit_block_words()  # commits a b c d e
     # Simulate second block
     agent._current_block = DuplexAudioBlock("b1", 1002.0, 1004.0)
     agent._commit_block_words()  # commits f
-    assert agent._committed_words == ["a", "b", "c", "d", "e", "f"]
+    assert agent._committed_words == ["a", "b", "c", "d", "e", "f."]
 
 
-def test_commit_block_words_attaches_pending_response_timings():
+def test_commit_block_words_drops_short_nonterminal_tail_and_reopens_llm():
     agent = make_agent()
-    agent._pending_words = ["hello", "world"]
+    agent.context_version = 3
+    agent._last_accepted_response_context_version = 3
+    agent._pending_words = ["tail"]
     agent._pending_llm_latency_s = 0.123
     agent._pending_response_asr_latency_s = 0.456
     agent._pending_response_source_block_id = "src-1"
@@ -147,7 +151,25 @@ def test_commit_block_words_attaches_pending_response_timings():
 
     agent._commit_block_words()
 
-    assert agent._current_block.assistant_text == "hello world"
+    assert agent._current_block.assistant_text == ""
+    assert agent._pending_words == []
+    assert agent._pending_llm_latency_s is None
+    assert agent._pending_response_asr_latency_s is None
+    assert agent._pending_response_source_block_id is None
+    assert agent._last_accepted_response_context_version is None
+
+
+def test_commit_block_words_attaches_pending_response_timings():
+    agent = make_agent()
+    agent._pending_words = ["hello", "world."]
+    agent._pending_llm_latency_s = 0.123
+    agent._pending_response_asr_latency_s = 0.456
+    agent._pending_response_source_block_id = "src-1"
+    agent._ensure_current_block(1000.0)
+
+    agent._commit_block_words()
+
+    assert agent._current_block.assistant_text == "hello world."
     assert agent._current_block.llm_latency_s == 0.123
     assert agent._current_block.asr_latency_s == 0.456
     assert agent._current_block.response_source_block_id == "src-1"
@@ -231,6 +253,50 @@ def test_update_pending_queue_shorter_proposal():
     agent._pending_words = ["a", "b", "c"]
     agent._update_pending_queue(["a"])
     assert agent._pending_words == ["a"]
+
+
+def test_llm_generate_groq_omits_unsupported_reasoning_effort(monkeypatch):
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    monkeypatch.setattr(full_duplex, "_llm_client", fake_client)
+    monkeypatch.setattr(full_duplex, "_next_model_index", 1)
+
+    result = full_duplex.llm_generate_groq("sys", "user")
+
+    assert result == "ok"
+    assert captured["model"] == "llama-3.1-8b-instant"
+    assert "reasoning_effort" not in captured
+
+
+def test_llm_generate_groq_keeps_supported_reasoning_effort(monkeypatch):
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    monkeypatch.setattr(full_duplex, "_llm_client", fake_client)
+    monkeypatch.setattr(full_duplex, "_next_model_index", 2)
+
+    result = full_duplex.llm_generate_groq("sys", "user")
+
+    assert result == "ok"
+    assert captured["model"] == "openai/gpt-oss-20b"
+    assert captured["reasoning_effort"] == "low"
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +786,46 @@ def test_waiting_poll_can_start_llm_before_next_block_ts():
     agent.poll()
 
     assert calls["count"] == 2
+
+
+def test_dropped_short_tail_allows_same_context_llm_continuation():
+    responses = iter([
+        "one two three four five six seven eight nine ten eleven",
+        "twelve thirteen fourteen fifteen sixteen",
+    ])
+    calls = {"count": 0}
+
+    def llm_fn(_, __):
+        calls["count"] += 1
+        return next(responses)
+
+    agent = make_agent(llm_fn=llm_fn)
+    agent.receive_text_message("hi")
+
+    force_block(agent)
+    assert calls["count"] == 1
+    assert agent._pending_words == [
+        "one", "two", "three", "four", "five",
+        "six", "seven", "eight", "nine", "ten", "eleven",
+    ]
+
+    advance(agent, 2.1)
+    force_block(agent)
+    assert agent.blocks[-1].assistant_text == "one two three four five"
+
+    advance(agent, 2.1)
+    force_block(agent)
+    assert agent.blocks[-1].assistant_text == "six seven eight nine ten"
+    assert agent._pending_words == ["eleven"]
+    assert calls["count"] == 1
+
+    advance(agent, 2.1)
+    force_block(agent)
+
+    assert calls["count"] == 2
+    assert agent._pending_words == [
+        "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    ]
 
 
 # ---------------------------------------------------------------------------

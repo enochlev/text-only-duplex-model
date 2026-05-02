@@ -7,6 +7,8 @@ Exports:
 - llm_generate     : thin OpenAI wrapper used by DuplexAudioAgent
 """
 
+import contextlib
+import io
 import math
 import os
 import queue
@@ -62,23 +64,38 @@ def llm_generate_openai(system_prompt: str, user_message: str) -> str:
         instructions=system_prompt,
         input=[{"role": "user", "content": user_message}],
         reasoning={"effort": "none"},
-        max_output_tokens=16,
+        max_output_tokens=12,
     )
     return response.output[0].content[0].text.strip()
 
+GROQ_MODEL_CONFIGS = [
+    {"model": "qwen/qwen3-32b", "params": {"reasoning_effort": "none"}},
+    {"model": "llama-3.1-8b-instant", "params": {}},
+    #{"model": "openai/gpt-oss-20b", "params": {"reasoning_effort": "low"}},
+    {"model": "llama-3.3-70b-versatile", "params": {}},
+    {"model": "meta-llama/llama-4-scout-17b-16e-instruct", "params": {}},
+]
+_next_model_index = 0
+_last_used_model: str = ""
+
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
+    global _next_model_index, _last_used_model
     client = _get_groq_client()
-    model = os.getenv("GROQ_MODEL", "qwen/qwen3-32b").strip() or "qwen/qwen3-32b"
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
+    config = GROQ_MODEL_CONFIGS[_next_model_index]
+    model = config["model"]
+    _last_used_model = model
+    _next_model_index = (_next_model_index + 1) % len(GROQ_MODEL_CONFIGS)
+    request_params = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
-        max_tokens=8,
-        temperature=0.0,
-        reasoning_effort="none",
-    )
+        "max_tokens": 12,
+        "temperature": 0.0,
+    }
+    request_params.update(config["params"])
+    response = client.chat.completions.create(**request_params)
     return response.choices[0].message.content.strip()
 
 
@@ -310,6 +327,7 @@ class DuplexAudioAgent:
         self._pending_response_source_block_id: Optional[str] = None
         self._latest_user_source_block_id: Optional[str] = None
         self._last_accepted_response_context_version: Optional[int] = None
+        self._last_ctx_flush_user_fingerprint: str = ""
         self.last_llm_error: Optional[str] = None
         self.last_llm_error_seq: int = 0
 
@@ -541,13 +559,14 @@ class DuplexAudioAgent:
         if sample_rate != ASR_SAMPLE_RATE:
             arr = _resample(arr, sample_rate, ASR_SAMPLE_RATE)
         self._mic_current = np.concatenate([self._mic_current, arr])
-        print(f"[mic] chunk sr={sample_rate} samples={len(audio_array)}  accumulated={len(self._mic_current)}")
         chunk = self._drain_audio_queue()
-        if chunk is not None:
-            print(f"[mic] returning queued TTS chunk sr={chunk[0]} samples={len(chunk[1])}")
         return chunk
 
     def _seal_mic_block(self, start_ts: float, end_ts: float) -> None:
+        # Timestamps use server receive time, not client "spoken at" time.
+        # Audio streams over a single ordered TCP connection so chunks always
+        # arrive in order; for local deployment latency is ~1ms and consistent,
+        # so server clock accurately reflects the real-time audio flow.
         sealed = self._mic_current.copy()
         self._mic_current = np.zeros(0, dtype=np.float32)
         self._mic_rolling.append((start_ts, end_ts, sealed))
@@ -565,6 +584,44 @@ class DuplexAudioAgent:
             self._executor.submit(self._asr_fn, rolling_copy, self)
         else:
             self._executor.submit(self._run_parakeet, rolling_copy)
+
+    def _user_content_fingerprint(self, rolling: list) -> str:
+        """Normalized token sequence from all rolling blocks' user text.
+        Identical fingerprint across ASR passes means the same words shifted
+        block slots (timestamp drift) but no new content arrived."""
+        tokens = []
+        for start_ts, _, _ in rolling:
+            for block in self.blocks:
+                if abs(block.start_ts - start_ts) < 0.5:
+                    if block.user_text:
+                        tokens.extend(self._change_tokens(block.user_text))
+                    break
+        return " ".join(tokens)
+
+    def _deduplicate_block_boundary(self, windows: dict, n_rolling: int) -> None:
+        """Drop first word of first-mutable block when it duplicates last word of frozen-boundary block.
+
+        NeMo's word timestamps can shift slightly when given more audio context, causing the
+        same word to appear at the tail of the last frozen block and the head of the first
+        mutable block in successive ASR passes. Since the frozen block can't be corrected,
+        we drop the duplicate from the mutable side.
+        """
+        frozen_idx = n_rolling - self.mutable_asr_windows - 1
+        mutable_idx = n_rolling - self.mutable_asr_windows
+        if frozen_idx < 0 or mutable_idx >= n_rolling:
+            return
+        frozen_words = windows.get(frozen_idx)
+        mutable_words = windows.get(mutable_idx)
+        if not frozen_words or not mutable_words:
+            return
+        if self._norm(frozen_words[-1][0]) == self._norm(mutable_words[0][0]):
+            print(
+                f"[asr→dedup] boundary idx={frozen_idx}/{mutable_idx} "
+                f"dropped duplicate {mutable_words[0][0]!r} from mutable block"
+            )
+            mutable_words.pop(0)
+            if not mutable_words:
+                del windows[mutable_idx]
 
     def _run_parakeet(self, rolling: List[tuple]) -> None:
         import tempfile
@@ -587,7 +644,8 @@ class DuplexAudioAgent:
                 tmp_path = f.name
                 sf.write(f.name, full_audio, ASR_SAMPLE_RATE)
             with _asr_lock:
-                output = model.transcribe([tmp_path], timestamps=True)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    output = model.transcribe([tmp_path], timestamps=True)
         except Exception as exc:
             print(f"[asr] transcribe error: {exc!r}")
             import traceback; traceback.print_exc()
@@ -623,6 +681,36 @@ class DuplexAudioAgent:
         # The periodic poll() reruns the LLM each block, so corrections are picked up
         # automatically on the next cycle.
         n_rolling = len(rolling)
+        self._deduplicate_block_boundary(windows, n_rolling)
+
+        # Fix A: clear mutable blocks whose words shifted to a later block this pass.
+        # Without this, stale text persists in those slots and the fingerprint check
+        # below sees spurious duplicate tokens.
+        _mutable_start_idx = max(0, n_rolling - self.mutable_asr_windows)
+        for _idx in range(_mutable_start_idx, n_rolling):
+            if _idx in windows:
+                continue
+            _block_start_ts = rolling[_idx][0]
+            for _blk in self.blocks:
+                if abs(_blk.start_ts - _block_start_ts) < 0.5:
+                    if _blk.user_text:
+                        print(f"[asr→block] block@{_block_start_ts:.1f} shift-clear old={_blk.user_text!r}")
+                        _blk.user_text = ""
+                    break
+
+        # Fix C: freeze ASR updates after the user goes silent.
+        # Silence is measured from HISTORICAL block text, not the current ASR windows.
+        # Measuring from windows would fail when a timestamp-drifted trailing word
+        # appears in the latest empty block — that word defeats a windows-based freeze
+        # but the historical blocks correctly show the user has been silent.
+        _recent_blocks = self.blocks[-n_rolling:] if len(self.blocks) >= n_rolling else self.blocks
+        _trailing_silence = 0
+        for _blk in reversed(_recent_blocks):
+            if _blk.user_text:
+                break
+            _trailing_silence += 1
+        _speech_frozen = _trailing_silence >= 2
+
         any_changed = False
         earliest_changed_index = None
         latest_changed_target = None
@@ -645,22 +733,50 @@ class DuplexAudioAgent:
                 target.asr_latency_s = asr_latency
                 target.asr_started_perf_s = asr_started_perf
                 if is_mutable or not target.user_text:
+                    if _speech_frozen:
+                        if target.user_text:
+                            continue  # already-transcribed block: always freeze
+                        else:
+                            # Empty block during freeze: allow only if the word contains
+                            # tokens NOT seen in the most recent non-empty block.
+                            # A word whose tokens are all already there is a timestamp-
+                            # drifted trailing word, not genuine new speech.
+                            _prev_text = ''
+                            for _pi in range(target_index - 1, -1, -1):
+                                if self.blocks[_pi].user_text:
+                                    _prev_text = self.blocks[_pi].user_text
+                                    break
+                            if _prev_text:
+                                _new_tok = set(self._change_tokens(word_text))
+                                _prev_tok = set(self._change_tokens(_prev_text))
+                                if _new_tok and _new_tok.issubset(_prev_tok):
+                                    continue  # drift word, skip
                     old = target.user_text
                     target.user_text = word_text
                     if old != word_text:
-                        any_changed = True
-                        if target_index is not None and (
-                            earliest_changed_index is None or target_index < earliest_changed_index
-                        ):
-                            earliest_changed_index = target_index
-                        latest_changed_target = target
                         change_kind = self._classify_text_change(old, word_text)
                         print(
                             f"[asr→block] block@{block_start_ts:.1f} {change_kind} "
                             f"old={old!r} new={word_text!r}"
                         )
+                        if change_kind != "punctuation":
+                            any_changed = True
+                            if target_index is not None and (
+                                earliest_changed_index is None or target_index < earliest_changed_index
+                            ):
+                                earliest_changed_index = target_index
+                            latest_changed_target = target
             else:
                 print(f"[asr] no matching block for start_ts={block_start_ts:.1f}")
+
+        # Fix B: suppress flush when user content is unchanged across rolling blocks.
+        # Same words in different block slots (NeMo timestamp drift) must not restart the LLM.
+        if any_changed:
+            _current_fp = self._user_content_fingerprint(rolling)
+            if _current_fp == self._last_ctx_flush_user_fingerprint:
+                any_changed = False   # same words, different slots — skip flush
+            else:
+                self._last_ctx_flush_user_fingerprint = _current_fp
 
         # Only bump context_version when text actually changed so the next LLM
         # poll picks up the new transcription — but in-flight calls are NOT
@@ -684,8 +800,18 @@ class DuplexAudioAgent:
     # ------------------------------------------------------------------
 
     def _commit_block_words(self) -> None:
-        to_commit = self._pending_words[:self._n]
-        self._pending_words = self._pending_words[self._n:]
+        total = len(self._pending_words)
+        if total == 0:
+            return
+        # Distribute pending words evenly across however many blocks they span.
+        # e.g. 11 words → 3 blocks of [4, 4, 3]; 6 → [3, 3]; 1-5 → single block.
+        # TTS pads any block under 2s, so short blocks are fine.
+        n_blocks = max(1, math.ceil(total / self._n))
+        base = total // n_blocks
+        remainder = total % n_blocks
+        n_to_commit = base + (1 if remainder > 0 else 0)
+        to_commit = self._pending_words[:n_to_commit]
+        self._pending_words = self._pending_words[n_to_commit:]
         if to_commit:
             text = " ".join(to_commit)
             self._current_block.assistant_text = text
@@ -696,7 +822,8 @@ class DuplexAudioAgent:
                 self._current_block.asr_latency_s = self._pending_response_asr_latency_s
             self._committed_words.extend(to_commit)
             self._clear_pending_response_timing()
-            print(f"[commit] {to_commit} | committed={self._committed_words}")
+            pending_preview = " ".join(self._pending_words[:6]) + ("…" if len(self._pending_words) > 6 else "")
+            print(f"[commit ✓] {text!r}  pending={len(self._pending_words)} words  [{pending_preview}]")
             # Words were consumed — allow LLM to continue generating the next chunk
             # regardless of whether context_version changed. Without this, the AI
             # goes silent after the first response until the user speaks again.
@@ -735,10 +862,8 @@ class DuplexAudioAgent:
         retained = self._pending_words[:mismatch_idx]
         new_tail = proposal_tail_norm[mismatch_idx:]
         self._pending_words = retained + new_tail
-        print(
-            f"[queue] retained={retained} new={new_tail} "
-            f"→ pending={self._pending_words}"
-        )
+        all_words = " ".join(self._pending_words[:10]) + ("…" if len(self._pending_words) > 10 else "")
+        print(f"[queue] kept={len(retained)} +new={len(new_tail)} → {len(self._pending_words)} pending  [{all_words}]")
 
     # ------------------------------------------------------------------
     # Prompt building
@@ -780,12 +905,25 @@ class DuplexAudioAgent:
         generation_source_block_id = self._latest_user_source_block_id
         try:
             system_prompt, user_message = self._build_prompt()
-            history_summary = self._history_summary(self.blocks[-3:])
-            print(
-                f"[llm→] ctx={generation_context_version} "
-                f"history(last3)={history_summary} "
-                f"prompt_tail={repr(user_message[-80:])}"
-            )
+            _log_blocks = self.blocks[-self._max_prompt_blocks:]
+            _W = 55
+            header = f"┌─ LLM REQUEST  ctx={generation_context_version} {'─' * max(0, _W - 20 - len(str(generation_context_version)))}"
+            lines = [header]
+            for i, blk in enumerate(_log_blocks):
+                idx_label = f"B[{i - len(_log_blocks)}]"
+                u = (blk.user_text[:35] + "…") if len(blk.user_text or "") > 35 else (blk.user_text or "-")
+                visible_ai = self._assistant_text_for_prompt(blk)
+                if blk.assistant_text and blk.assistant_text_stale:
+                    ai_part = f'ai="-"  stale={blk.assistant_text[:30]!r}'
+                elif visible_ai:
+                    ai_part = f"ai={visible_ai[:35]!r}"
+                else:
+                    ai_part = 'ai="-"'
+                lines.append(f"│  {idx_label}  u={u!r:<38}  {ai_part}")
+            lines.append(f"│  ({len(self.blocks)} total blocks, showing last {len(_log_blocks)})")
+            tail = user_message[-60:].replace("\n", "↵")
+            lines.append(f"│  tail → …{tail}")
+            print("\n".join(lines))
             llm_t0 = time.perf_counter()
             raw_response = self._llm_generate_fn(system_prompt, user_message)
             llm_latency = time.perf_counter() - llm_t0
@@ -793,28 +931,28 @@ class DuplexAudioAgent:
 
             if generation_context_version != self.context_version:
                 self._clear_pending_response_timing()
-                print(
-                    f"[llm←] stale (ctx {generation_context_version} < "
-                    f"{self.context_version}), discarding {repr(raw)}"
-                )
+                print(f"└─ LLM ← STALE (ctx {generation_context_version} → {self.context_version})  discarded {raw!r}")
                 return
 
             cleaned = self._normalize(raw).strip()
             if cleaned.endswith("</s>"):
                 cleaned = cleaned[:-4].strip()
             cleaned = cleaned.replace("<idle>", "").strip()
-            print(f"[llm←] words={len(cleaned.split())} text={cleaned!r}")
+            model_tag = _last_used_model.split("/")[-1] if _last_used_model else "?"
+            print(f"└─ LLM ← [{model_tag}]  {cleaned!r}  ({len(cleaned.split())} words, {llm_latency:.2f}s)")
             self.last_llm_error = None
 
             if not cleaned:
                 self._clear_pending_response_timing()
                 self._pending_words = []
+                self._last_accepted_response_context_version = generation_context_version
                 return
 
-            proposal_words = cleaned.split()[:self._n]
+            proposal_words = cleaned.split()
             if not proposal_words:
                 self._clear_pending_response_timing()
                 self._pending_words = []
+                self._last_accepted_response_context_version = generation_context_version
                 return
 
             source_block = self._get_block_by_id(generation_source_block_id)
@@ -890,7 +1028,6 @@ class DuplexAudioAgent:
         if now < self._next_block_ts:
             chunk = self._drain_audio_queue()
             if chunk is not None:
-                print(f"[poll] early drain → TTS chunk sr={chunk[0]} samples={len(chunk[1])}")
                 return chunk
             self._maybe_run_llm()
             return None
@@ -952,10 +1089,7 @@ class DuplexAudioAgent:
         self._maybe_run_llm()
         self._prune_history(now)
 
-        chunk = self._drain_audio_queue()
-        if chunk is not None:
-            print(f"[poll] returning TTS chunk sr={chunk[0]} samples={len(chunk[1])}")
-        return chunk
+        return self._drain_audio_queue()
 
     # ------------------------------------------------------------------
     # ASR window management

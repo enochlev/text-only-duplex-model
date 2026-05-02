@@ -41,6 +41,51 @@ _DISCONNECTED_HTML = (
     "</div>"
 )
 
+# Injected once as a <script> tag via gr.Blocks(js=).
+# IMPORTANT: must be plain statements, NOT wrapped in a function — Gradio 6.x
+# injects this verbatim into a <script> tag; a bare function expression would
+# be evaluated and immediately discarded without ever being called.
+#
+# Defines window._audioEnqueue(dataUri):
+#   - Schedules each WAV data-URI to start exactly when the previous chunk ends
+#     using AudioContext.currentTime (hardware-locked, sample-accurate clock).
+#   - Properly awaits ctx.resume() so the first chunk plays even if the browser
+#     created the context in a suspended state (autoplay policy).
+#   - Send "__reset__" to clear the scheduler (on connect / disconnect).
+_INIT_JS = """
+var _fdAudioCtx = null;
+var _fdNextTime = 0;
+
+window._audioEnqueue = function(dataUri) {
+    if (!dataUri) return;
+    if (dataUri === '__reset__') { _fdNextTime = 0; return; }
+
+    if (!_fdAudioCtx || _fdAudioCtx.state === 'closed')
+        _fdAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    var ctx = _fdAudioCtx;
+    // Resume must be awaited — browser autoplay policy suspends new contexts
+    // until a user gesture has occurred. After Connect is clicked the page is
+    // activated and resume() resolves immediately on subsequent calls.
+    var ready = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
+    ready
+        .then(function() { return fetch(dataUri); })
+        .then(function(r) { return r.arrayBuffer(); })
+        .then(function(buf) { return ctx.decodeAudioData(buf); })
+        .then(function(decoded) {
+            var src = ctx.createBufferSource();
+            src.buffer = decoded;
+            src.connect(ctx.destination);
+            // Math.max snaps the cursor forward after silence so a burst of
+            // queued chunks drains without compounding lag.
+            var when = Math.max(ctx.currentTime + 0.05, _fdNextTime);
+            src.start(when);
+            _fdNextTime = when + decoded.duration;
+        })
+        .catch(function(e) { console.error('[audio]', e); });
+};
+"""
+
 
 def _audio_to_data_uri(audio: np.ndarray, sr: int) -> str:
     if audio.dtype in (np.float32, np.float64):
@@ -220,12 +265,12 @@ def _render_blocks(source, t0: Optional[float] = None) -> str:
         if mic_uri:
             audio_html += (
                 f'<span style="color:#e8b84b;font-size:11px">mic:</span> '
-                f'<audio controls style="height:22px;vertical-align:middle" src="{mic_uri}"></audio><br>'
+                f'<audio controls style="height:22px;vertical-align:middle" data-src="{mic_uri}"></audio><br>'
             )
         if tts_uri:
             audio_html += (
                 f'<span style="color:#5cb85c;font-size:11px">tts:</span> '
-                f'<audio controls style="height:22px;vertical-align:middle" src="{tts_uri}"></audio><br>'
+                f'<audio controls style="height:22px;vertical-align:middle" data-src="{tts_uri}"></audio><br>'
             )
 
         rows.append(
@@ -246,7 +291,21 @@ def _render_blocks(source, t0: Optional[float] = None) -> str:
         'padding:8px;border:1px solid #2a2a2a;border-radius:6px">'
         + "\n".join(rows)
         + "</div>"
-        '<script>(function(){var p=document.getElementById("bp");if(p) p.scrollTop=p.scrollHeight;})();</script>'
+        '<script>(function(){'
+        'var p=document.getElementById("bp");'
+        'if(p) p.scrollTop=p.scrollHeight;'
+        # Convert data: URIs → blob: URLs so CSP doesn't block <audio> playback.
+        # fetch() handles data: URIs in all modern browsers.
+        'var audios=p?p.querySelectorAll("audio[data-src]"):[];'
+        'audios.forEach(function(a){'
+        'var ds=a.getAttribute("data-src");'
+        'if(!ds)return;'
+        'a.removeAttribute("data-src");'
+        'fetch(ds).then(function(r){return r.blob();})'
+        '.then(function(b){a.src=URL.createObjectURL(b);})'
+        '.catch(function(e){console.warn("[audio history]",e);});'
+        '});'
+        '})();</script>'
     )
 
 
@@ -255,7 +314,7 @@ def _render_disconnected() -> tuple[str, str]:
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="Full-Duplex Agent Client") as demo:
+    with gr.Blocks(title="Full-Duplex Agent Client", js=_INIT_JS) as demo:
         gr.Markdown("## Full-Duplex Audio Agent Client")
         gr.Markdown(
             "Start the standalone audio server first, then connect this Gradio client to it. "
@@ -270,6 +329,7 @@ def build_demo() -> gr.Blocks:
                 value=server_url_from_address(DEFAULT_SERVER_URL),
             )
             connect_btn = gr.Button("Connect", variant="primary")
+            disconnect_btn = gr.Button("Disconnect", variant="secondary", interactive=False)
 
         with gr.Row():
             with gr.Column(scale=1, min_width=300):
@@ -280,12 +340,7 @@ def build_demo() -> gr.Blocks:
                     label="Microphone",
                     interactive=False,
                 )
-                audio_out = gr.Audio(
-                    streaming=True,
-                    autoplay=True,
-                    type="numpy",
-                    label="Agent output",
-                )
+                audio_transport = gr.Textbox(visible=False, elem_id="audio-transport")
                 status_md = gr.Markdown("_Disconnected — connect to an audio server to begin._")
 
             with gr.Column(scale=2):
@@ -326,7 +381,16 @@ def build_demo() -> gr.Blocks:
                 state_value["client"] = None
                 state_value["snapshot"] = None
                 status = f"_× Unable to connect: {type(exc).__name__}: {exc}_"
-                return state_value, gr.Audio(interactive=False), status, _DISCONNECTED_HTML, _LOADING_HTML
+                return (
+                    state_value,
+                    gr.Audio(interactive=False),
+                    status,
+                    _DISCONNECTED_HTML,
+                    _LOADING_HTML,
+                    gr.Button(interactive=False),  # disconnect_btn
+                    gr.Button(interactive=True),   # connect_btn
+                    "__reset__",                   # audio_transport: clear scheduler
+                )
 
             snapshot = client.get_latest_snapshot()
             state_value["client"] = client
@@ -335,7 +399,34 @@ def build_demo() -> gr.Blocks:
             status = _build_status(snapshot) if snapshot is not None else "_✓ Connected — waiting for first snapshot_"
             blocks_html = _render_blocks(snapshot) if snapshot is not None else _LOADING_HTML
             latency = _render_latency_panel(snapshot) if snapshot is not None else _LOADING_HTML
-            return state_value, gr.Audio(interactive=True), status, blocks_html, latency
+            return (
+                state_value,
+                gr.Audio(interactive=True),
+                status,
+                blocks_html,
+                latency,
+                gr.Button(interactive=True),   # disconnect_btn
+                gr.Button(interactive=True),   # connect_btn
+                "__reset__",                   # audio_transport: clear scheduler
+            )
+
+        def disconnect_server(session_state):
+            state_value = dict(session_state or {})
+            client = state_value.get("client")
+            if client is not None:
+                client.close()
+            state_value["client"] = None
+            state_value["snapshot"] = None
+            return (
+                state_value,
+                gr.Audio(interactive=False),
+                "_Disconnected — connect to an audio server to begin._",
+                _DISCONNECTED_HTML,
+                _LOADING_HTML,
+                gr.Button(interactive=False),  # disconnect_btn
+                gr.Button(interactive=True),   # connect_btn
+                "__reset__",                   # audio_transport: clear scheduler
+            )
 
         def receive_mic(audio, session_state):
             if session_state is None or audio is None:
@@ -375,18 +466,34 @@ def build_demo() -> gr.Blocks:
             status = _build_status(snapshot) if snapshot is not None else "_✓ Connected — waiting for first snapshot_"
             blocks_html = _render_blocks(snapshot) if snapshot is not None else _LOADING_HTML
             latency = _render_latency_panel(snapshot) if snapshot is not None else _LOADING_HTML
-            audio_chunk = client.pop_audio_chunk(timeout=0.0)
 
+            audio_chunk = client.pop_audio_chunk(timeout=0.0)
             if audio_chunk is not None:
-                return audio_chunk, blocks_html, status, latency
+                sr, audio_arr = audio_chunk
+                data_uri = _audio_to_data_uri(audio_arr, sr)
+                return data_uri, blocks_html, status, latency
             return gr.skip(), blocks_html, status, latency
 
         demo.load(on_load, outputs=[state])
 
+        # JS bridge: when Python writes a data URI to audio_transport, the browser
+        # immediately passes it to window._audioEnqueue for AudioContext scheduling.
+        audio_transport.change(
+            fn=None,
+            inputs=[audio_transport],
+            js="(uri) => { if (window._audioEnqueue) window._audioEnqueue(uri); }",
+        )
+
         connect_btn.click(
             connect_server,
             inputs=[server_url, state],
-            outputs=[state, audio_in, status_md, debug_html, latency_html],
+            outputs=[state, audio_in, status_md, debug_html, latency_html, disconnect_btn, connect_btn, audio_transport],
+        )
+
+        disconnect_btn.click(
+            disconnect_server,
+            inputs=[state],
+            outputs=[state, audio_in, status_md, debug_html, latency_html, disconnect_btn, connect_btn, audio_transport],
         )
 
         audio_in.stream(
@@ -398,7 +505,7 @@ def build_demo() -> gr.Blocks:
         timer.tick(
             poll_and_update,
             inputs=[state],
-            outputs=[audio_out, debug_html, status_md, latency_html],
+            outputs=[audio_transport, debug_html, status_md, latency_html],
         )
 
         demo.queue()
