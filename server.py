@@ -179,6 +179,10 @@ class SessionManager:
         for session_id in expired:
             self._sessions.pop(session_id, None)
 
+    def remove(self, session_id: str) -> None:
+        with self._lock:
+            self._sessions.pop(session_id, None)
+
     def get_or_create(self, session_id: Optional[str]) -> DuplexSession:
         now = time.time()
         with self._lock:
@@ -284,6 +288,8 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await poll_task
         except WebSocketDisconnect:
+            if session is not None:
+                await asyncio.to_thread(manager.remove, session.session_id)
             return
 
     return app

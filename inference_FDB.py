@@ -42,7 +42,7 @@ MAX_EVAL_COUNT = None  # Max files to process per task (None = all)
 
 
 CHUNK_MS = 80       # audio chunk duration sent per frame
-SETTLE_S = 3.0      # wait for TTS to finish after all input is sent
+SETTLE_S = 1.5      # wait for TTS to finish after all input is sent
 
 
 def _mono(x: np.ndarray) -> np.ndarray:
