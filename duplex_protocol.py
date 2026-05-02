@@ -66,7 +66,7 @@ def decode_audio_payload(payload: dict[str, Any]) -> tuple[int, np.ndarray]:
     if encoding == "pcm_f32le":
         audio = np.frombuffer(raw, dtype="<f4").astype(np.float32)
     elif encoding == "pcm_s16le":
-        audio = np.frombuffer(raw, dtype="<i2").astype(np.int16)
+        audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
     else:
         raise ValueError(f"Unsupported audio encoding: {encoding}")
 

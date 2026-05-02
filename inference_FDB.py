@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import json
+import time
 from glob import glob
 from pathlib import Path
 from typing import List
@@ -80,6 +81,7 @@ class FDBFileClient:
         audio, sr = sf.read(str(inp), dtype="float32", always_2d=False)
         self.audio = _mono(audio)
         self.sr = sr
+        self.duration_s = len(self.audio) / sr
 
     async def _send(self, ws, stop_event: asyncio.Event) -> None:
         chunk_size = max(1, int(self.sr * CHUNK_MS / 1000.0))
@@ -90,8 +92,14 @@ class FDBFileClient:
         await asyncio.sleep(SETTLE_S)
         stop_event.set()
 
-    async def _recv(self, ws, stop_event: asyncio.Event) -> list[tuple[int, np.ndarray]]:
-        collected: list[tuple[int, np.ndarray]] = []
+    async def _recv(
+        self,
+        ws,
+        stop_event: asyncio.Event,
+        t0: float,
+    ) -> list[tuple[float, int, np.ndarray]]:
+        # Each entry: (arrival_s_from_send_start, sample_rate, audio)
+        segments: list[tuple[float, int, np.ndarray]] = []
         while not stop_event.is_set():
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
@@ -101,10 +109,12 @@ class FDBFileClient:
                 break
             msg = json.loads(raw)
             if msg.get("type") == "audio_chunk":
-                collected.append(_decode_audio(msg))
+                arrival_s = time.time() - t0
+                sr, audio = _decode_audio(msg)
+                segments.append((arrival_s, sr, audio))
             elif msg.get("type") == "warning":
                 print(f"[WARN] {msg.get('source')}: {msg.get('message')}")
-        return collected
+        return segments
 
     async def _run(self) -> None:
         async with websockets.connect(self.url, max_size=None) as ws:
@@ -124,18 +134,32 @@ class FDBFileClient:
 
             # --- concurrent send + receive ---
             stop_event = asyncio.Event()
-            recv_task = asyncio.create_task(self._recv(ws, stop_event))
+            t0 = time.time()
+            recv_task = asyncio.create_task(self._recv(ws, stop_event, t0))
             await self._send(ws, stop_event)
-            collected = await recv_task
+            segments = await recv_task
 
-        if not collected:
+        if not segments:
             print("[WARN] no TTS audio received for", self.inp)
             return
 
-        out_sr = collected[0][0]
-        out_audio = np.concatenate([chunk for _, chunk in collected])
-        sf.write(str(self.out), out_audio, out_sr)
-        print(f"[DONE] {self.inp} → {self.out} ({len(out_audio) / out_sr:.2f}s @ {out_sr} Hz)")
+        out_sr = segments[0][1]
+        target_n = int(round(self.duration_s * out_sr))
+        buf = np.zeros(target_n, dtype=np.float32)
+
+        # Place each chunk at its wall-clock arrival position.
+        # Consecutive chunks (no gap) advance write_cursor so they are
+        # contiguous; a real silence gap (AI was quiet) stays as zeros.
+        write_cursor = 0
+        for arrival_s, _, audio in segments:
+            pos = max(int(round(arrival_s * out_sr)), write_cursor)
+            n = min(len(audio), target_n - pos)
+            if n > 0:
+                buf[pos : pos + n] = audio[:n]
+                write_cursor = pos + n
+
+        sf.write(str(self.out), buf, out_sr)
+        print(f"[DONE] {self.inp} → {self.out} ({len(buf) / out_sr:.2f}s @ {out_sr} Hz)")
 
     def run(self) -> None:
         try:
