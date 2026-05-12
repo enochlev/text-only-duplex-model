@@ -149,6 +149,10 @@ class StepRecord:
     blocks_covered: List[str] = field(default_factory=list)
     """block_ids whose assistant_text originated from this LLM call."""
 
+    user_spoke_before: bool = True
+    """False when context_version did not change since the previous LLM call.
+    Used to identify consecutive silent-user runs for action merging."""
+
     reward: Optional[float] = None
     """Filled by compute_rewards()."""
 
@@ -830,7 +834,13 @@ class VirtualSimulationConnection:
         # agent is referenced by name; Python's late binding means it is
         # resolved at call time (after 'agent = ...' below).
         # ------------------------------------------------------------------
+        # Tracks the context_version at the time of the previous LLM call so
+        # we can detect whether the user spoke between calls.
+        last_context_version: List[int] = [-1]
+
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
+            user_spoke = (agent.context_version != last_context_version[0])
+            last_context_version[0] = agent.context_version
             text, ptok, rtok, lps = llm_generate_train(
                 system_prompt,
                 user_message,
@@ -847,6 +857,7 @@ class VirtualSimulationConnection:
                 log_probs=lps,
                 is_idle=(not text),
                 source_block_id=agent._latest_user_source_block_id,  # late binding ↓
+                user_spoke_before=user_spoke,
             ))
             return text
 
@@ -917,8 +928,10 @@ class VirtualSimulationConnection:
             if tts_out is not None:
                 self.simulator.on_agent_tts(*tts_out)
 
-        # Back-fill blocks_covered using response_source_block_id grouping
+        # Back-fill blocks_covered using response_source_block_id grouping,
+        # then merge consecutive silent-user steps into single actions.
         _fill_blocks_covered(steps, list(agent.blocks))
+        steps = _merge_silent_runs(steps)
 
         return Episode(
             episode_id=episode_id,
@@ -976,6 +989,57 @@ def _fill_blocks_covered(
     for step in steps:
         if step.source_block_id:
             step.blocks_covered = source_to_blocks.get(step.source_block_id, [])
+
+
+def _collapse_run(run: List[StepRecord]) -> StepRecord:
+    """Merge a list of consecutive StepRecords into one combined action."""
+    if len(run) == 1:
+        return run[0]
+    first = run[0]
+    seen: set = set()
+    all_blocks: List[str] = []
+    for s in run:
+        for bid in s.blocks_covered:
+            if bid not in seen:
+                seen.add(bid)
+                all_blocks.append(bid)
+    return StepRecord(
+        step_id=first.step_id,
+        prompt_text=first.prompt_text,
+        full_prompt_tokens=first.full_prompt_tokens,
+        response_token_ids=[t for s in run for t in s.response_token_ids],
+        log_probs=[lp for s in run for lp in s.log_probs],
+        is_idle=all(s.is_idle for s in run),
+        source_block_id=first.source_block_id,
+        blocks_covered=all_blocks,
+        user_spoke_before=first.user_spoke_before,
+    )
+
+
+def _merge_silent_runs(steps: List[StepRecord]) -> List[StepRecord]:
+    """
+    Merge consecutive non-idle steps where the user did not speak between calls.
+
+    When the user is silent, multiple LLM calls all stem from the same
+    conversational decision ("continue speaking"). Grouping them into one
+    action gives a single advantage signal over the whole segment, improving
+    credit assignment and reducing gradient variance.
+    """
+    if not steps:
+        return steps
+    merged: List[StepRecord] = []
+    run: List[StepRecord] = [steps[0]]
+    for step in steps[1:]:
+        # Extend the current run only when: the new step arrived without the
+        # user speaking, and neither the current nor the previous step was idle
+        # (idle steps break the continuity of a speech segment).
+        if not step.user_spoke_before and not step.is_idle and not run[-1].is_idle:
+            run.append(step)
+        else:
+            merged.append(_collapse_run(run))
+            run = [step]
+    merged.append(_collapse_run(run))
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -1152,13 +1216,17 @@ class FullDuplexRLTrainer:
                 nll_mean = out.loss
                 policy_log_prob = -nll_mean * n_resp  # sum of response log_probs
 
-                # KL against rollout policy (prevents large weight updates)
+                # KL against rollout policy (prevents large weight updates).
+                # kl_loss = log π_θ − log π_old: positive when current policy
+                # assigns more probability than the rollout policy did.
+                # Keeping policy_log_prob as a tensor lets gradients flow so
+                # the effective gradient coefficient is (−advantage + kl_coeff).
                 pi_old_sum = sum(step.log_probs[:n_resp]) if step.log_probs else 0.0
-                kl_approx = pi_old_sum - policy_log_prob.detach().item()
+                kl_loss = policy_log_prob - pi_old_sum
 
                 step_loss = (
                     -advantage * policy_log_prob
-                    + self.config.kl_coeff * kl_approx
+                    + self.config.kl_coeff * kl_loss
                 )
                 loss_terms.append(step_loss)
                 total_tokens += n_resp
@@ -1202,8 +1270,8 @@ class FullDuplexRLTrainer:
             rewards = [s.reward or 0.0 for s in ep.steps]
             all_returns.extend(_compute_returns(rewards, self.config.gamma))
         alpha = self.config.baseline_ema_alpha
-        for g in all_returns:
-            self._baseline = (1.0 - alpha) * self._baseline + alpha * g
+        batch_mean = sum(all_returns) / len(all_returns) if all_returns else 0.0
+        self._baseline = (1.0 - alpha) * self._baseline + alpha * batch_mean
 
         # 4. REINFORCE loss + backprop
         self.optimizer.zero_grad()
