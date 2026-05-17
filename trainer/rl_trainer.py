@@ -143,6 +143,12 @@ class TrainerConfig:
     save_every_n_steps: int = 10
     """Save a checkpoint every N training steps. 0 = only save at the end."""
 
+    debug: bool = False
+    """Print per-reward-function scores and export block audio to debug_dir."""
+
+    debug_dir: str = "./debug"
+    """Root directory for debug audio exports (created automatically)."""
+
 
 # ---------------------------------------------------------------------------
 # vLLM generation with training metadata
@@ -567,18 +573,111 @@ class FullDuplexRLTrainer:
     # Reward computation
     # ------------------------------------------------------------------
 
-    def compute_rewards(self, episode: Episode) -> Episode:
+    @staticmethod
+    def _save_wav(path: str, audio: np.ndarray, sample_rate: int) -> None:
+        """Write a float32 or int16 numpy array to a WAV file."""
+        import wave as _wave
+        arr = np.asarray(audio)
+        if arr.dtype != np.int16:
+            arr = (np.clip(arr.astype(np.float32), -1.0, 1.0) * 32767).astype(np.int16)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(arr.tobytes())
+
+    def _debug_step(
+        self,
+        step_num: int,
+        ep_idx: int,
+        step_idx: int,
+        step: "StepRecord",
+        covered: List[DuplexAudioBlock],
+        history: List[DuplexAudioBlock],
+        is_terminal: bool,
+        fn_names: List[str],
+    ) -> float:
+        """Run reward functions with full debug output. Returns total reward."""
+        action_label = f'"{step.response_token_ids}"' if step.is_idle else \
+            f'"{(step.prompt_text or "")[-60:]}"'
+        action_str = "<idle>" if step.is_idle else (step.prompt_text or "")[-80:].strip()
+
+        print(f"\n{'═'*70}")
+        print(f"  Step {step_num:04d}  |  ep={ep_idx}  step_idx={step_idx}"
+              f"  {'TERMINAL' if is_terminal else ''}")
+        print(f"  Action : {'<idle>' if step.is_idle else repr(action_str)}")
+        print(f"  Blocks : {step.blocks_covered or '[]'}")
+
+        total = 0.0
+        for block in covered:
+            blk_dir = os.path.join(
+                self.config.debug_dir,
+                f"step{step_num:04d}",
+                f"ep{ep_idx:02d}",
+            )
+            blk_stem = f"blk_{block.block_id[:8]}"
+
+            # Export audio
+            mic_path = tts_path = None
+            if block.mic_audio is not None and len(block.mic_audio) > 0:
+                mic_path = os.path.join(blk_dir, f"{blk_stem}_mic.wav")
+                self._save_wav(mic_path, block.mic_audio, ASR_SAMPLE_RATE)
+            if block.tts_audio is not None and len(block.tts_audio) > 0:
+                tts_path = os.path.join(blk_dir, f"{blk_stem}_tts.wav")
+                self._save_wav(tts_path, block.tts_audio,
+                               getattr(block, "tts_sr", TTS_SAMPLE_RATE))
+
+            user_snippet = (block.user_text or "<silence>")[:60]
+            bot_snippet  = (block.assistant_text or "<idle>")[:60]
+            print(f"\n  ┌─ Block {block.block_id[:8]}")
+            print(f"  │  user : {user_snippet!r}")
+            print(f"  │  bot  : {bot_snippet!r}")
+            if mic_path:
+                print(f"  │  mic  → {mic_path}")
+            if tts_path:
+                print(f"  │  tts  → {tts_path}")
+            print(f"  │")
+
+            blk_total = 0.0
+            for rm_idx, (fn, w, name) in enumerate(
+                zip(self.reward_fns, self.rm_weights, fn_names), start=1
+            ):
+                score = fn(block, history, is_terminal)
+                weighted = w * score
+                blk_total += weighted
+                marker = "  " if weighted == 0.0 else ("▲ " if weighted > 0 else "▼ ")
+                print(f"  │  RM{rm_idx:<2} {name:<28} raw={score:+.4f}  w={w:.2f}"
+                      f"  → {weighted:+.4f}  {marker}")
+
+            total += blk_total
+            print(f"  └─ block total : {blk_total:+.4f}")
+
+        print(f"  STEP REWARD : {total:+.4f}")
+        return total
+
+    def compute_rewards(self, episode: Episode, ep_idx: int = 0) -> Episode:
         """Fill StepRecord.reward using weighted sum of reward functions."""
+        fn_names = [fn.__name__ for fn in self.reward_fns]
+
         for i, step in enumerate(episode.steps):
             is_terminal = (i == len(episode.steps) - 1)
             covered_ids = set(step.blocks_covered)
             covered = [b for b in episode.blocks if b.block_id in covered_ids]
             history = [b for b in episode.blocks if b.block_id not in covered_ids]
-            total = 0.0
-            for fn, w in zip(self.reward_fns, self.rm_weights):
-                for block in covered:
-                    total += w * fn(block, history, is_terminal)
-            step.reward = total
+
+            if self.config.debug:
+                step.reward = self._debug_step(
+                    self._step_count, ep_idx, i, step,
+                    covered, history, is_terminal, fn_names,
+                )
+            else:
+                total = 0.0
+                for fn, w in zip(self.reward_fns, self.rm_weights):
+                    for block in covered:
+                        total += w * fn(block, history, is_terminal)
+                step.reward = total
+
         return episode
 
     # ------------------------------------------------------------------
@@ -687,7 +786,7 @@ class FullDuplexRLTrainer:
             return {"step": self._step_count, "loss": 0.0, "n_episodes": 0}
 
         # Score
-        episodes = [self.compute_rewards(e) for e in episodes]
+        episodes = [self.compute_rewards(e, ep_idx=i) for i, e in enumerate(episodes)]
 
         # Update EMA baseline from all returns in this batch
         all_returns: List[float] = []

@@ -207,14 +207,26 @@ def coherence_reward(
 # ---------------------------------------------------------------------------
 
 _VAD_URL = "http://localhost:8765/vad"
-_VAD_TIMEOUT_S = 0.1  # 100 ms — if the server is slow/gone, skip immediately
-_vad_available: Optional[bool] = None  # None=untested, True=up, False=down
+_VAD_TIMEOUT_S = 0.5  # 500 ms — generous for CPU inference of 32 MB ONNX
+_VAD_SILENCE_RMS = 1e-4  # below this → treat audio as silence, skip VAD
+_vad_fail_count = 0
+_VAD_RETRY_AFTER = 20   # re-probe server after this many consecutive failures
 
 
 def _vad_classify(mic_audio: np.ndarray) -> Optional[bool]:
-    """Return True if user's turn is complete, False if still talking, None on failure."""
-    global _vad_available
-    if _vad_available is False:
+    """Return True if user's turn is complete, False if still talking, None on failure.
+
+    Returns None (→ ASR fallback) when:
+      - audio RMS is below silence threshold (ScriptTTSSource zero-fills mic_audio)
+      - VAD server is unreachable (retried every _VAD_RETRY_AFTER failures)
+    """
+    global _vad_fail_count
+
+    # Skip VAD on near-silence — avoids false "complete" on zero-filled simulation audio
+    if float(np.sqrt(np.mean(mic_audio.astype(np.float32) ** 2))) < _VAD_SILENCE_RMS:
+        return None
+
+    if _vad_fail_count >= _VAD_RETRY_AFTER:
         return None
 
     audio_b64 = base64.b64encode(
@@ -231,10 +243,10 @@ def _vad_classify(mic_audio: np.ndarray) -> Optional[bool]:
         )
         with urllib.request.urlopen(req, timeout=_VAD_TIMEOUT_S) as resp:
             data = json.loads(resp.read())
-        _vad_available = True
+        _vad_fail_count = 0
         return bool(data["complete"])
     except Exception:
-        _vad_available = False
+        _vad_fail_count += 1
         return None
 
 

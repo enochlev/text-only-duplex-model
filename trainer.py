@@ -58,6 +58,10 @@ def main() -> None:
                         help="Directory to save model checkpoints")
     parser.add_argument("--save-every", type=int, default=0,
                         help="Save a checkpoint every N steps (0 = only save at end)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print per-RM scores and export block audio each step")
+    parser.add_argument("--debug-dir", default="./debug",
+                        help="Directory for debug audio exports (default: ./debug)")
     args = parser.parse_args()
 
     config = TrainerConfig(
@@ -72,6 +76,8 @@ def main() -> None:
         device="cuda",
         output_dir=args.output_dir,
         save_every_n_steps=args.save_every,
+        debug=args.debug,
+        debug_dir=args.debug_dir,
     )
 
     data_pool = make_default_data_pool()
