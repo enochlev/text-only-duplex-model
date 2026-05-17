@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""trainer.py — entry point for full-duplex RL training.
+
+Usage:
+    python trainer.py --model Qwen/Qwen2.5-1.5B-Instruct --steps 100
+
+To mix data sources, build a custom DataPool before calling the trainer:
+
+    from trainer import FullDuplexRLTrainer, TrainerConfig, DataPool
+    from trainer import ScriptTTSSource, StaticWavSource, GPTVoiceSimulator
+
+    pool = DataPool([
+        ScriptTTSSource(script_lines=["Hello!", "How are you?"]),
+        StaticWavSource(path="my_call.wav", script_lines=["Hey there"]),
+        GPTVoiceSimulator(),
+    ], weights=[0.7, 0.2, 0.1])
+"""
+
+import argparse
+
+from trainer import (
+    FullDuplexRLTrainer,
+    TrainerConfig,
+    latency_reward,
+    idle_penalty,
+    response_length_reward,
+    respond_after_user_reward,
+    overlap_penalty,
+    first_sentence_reward,
+    interruption_penalty,
+    silence_too_long_penalty,
+    make_default_data_pool,
+)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a full-duplex conversational policy.")
+    parser.add_argument(
+        "--model",
+        default="Qwen/Qwen2.5-1.5B-Instruct",
+        help="HuggingFace model id or local path",
+    )
+    parser.add_argument("--steps", type=int, default=10, help="Number of training steps")
+    parser.add_argument("--episodes-per-step", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--kl-coeff", type=float, default=0.01)
+    parser.add_argument(
+        "--max-tokens", type=int, default=16,
+        help="Max new tokens per LLM generation call",
+    )
+    parser.add_argument(
+        "--gpu-mem", type=float, default=0.25,
+        help="vLLM GPU memory utilisation (0–1). "
+             "Tip: export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+             "to reduce fragmentation on the training model.",
+    )
+    parser.add_argument("--output-dir", default="./checkpoints",
+                        help="Directory to save model checkpoints")
+    parser.add_argument("--save-every", type=int, default=0,
+                        help="Save a checkpoint every N steps (0 = only save at end)")
+    args = parser.parse_args()
+
+    config = TrainerConfig(
+        model_name_or_path=args.model,
+        vllm_max_tokens=args.max_tokens,
+        vllm_temperature=1.0,
+        vllm_gpu_memory_utilization=args.gpu_mem,
+        learning_rate=args.lr,
+        kl_coeff=args.kl_coeff,
+        episodes_per_train_step=args.episodes_per_step,
+        max_seq_len=712,
+        device="cuda",
+        output_dir=args.output_dir,
+        save_every_n_steps=args.save_every,
+    )
+
+    data_pool = make_default_data_pool()
+
+    reward_fns = [
+        latency_reward,            # TODO: curate a proper latency reward function
+        idle_penalty,
+        response_length_reward,
+        respond_after_user_reward,
+        overlap_penalty,
+        first_sentence_reward,
+        interruption_penalty,
+        silence_too_long_penalty,  # weight slot 1 (e.g. 1.0)
+        silence_too_long_penalty,  # weight slot 2 (e.g. 0.5) — different weight, same fn
+    ]
+
+    trainer = FullDuplexRLTrainer(
+        config=config,
+        data_pool=data_pool,
+        reward_fns=reward_fns,
+    )
+
+    print(
+        f"Starting training: model={args.model}  steps={args.steps}  "
+        f"sources={len(data_pool)}"
+    )
+    history = trainer.train(args.steps)
+
+    avg_loss = sum(m["loss"] for m in history) / len(history) if history else 0.0
+    print(f"\nTraining complete. Average loss: {avg_loss:.4f}")
+
+
+if __name__ == "__main__":
+    main()
