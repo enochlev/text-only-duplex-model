@@ -37,7 +37,7 @@ PHRASES = [
     "Could you explain that one more time, I didn't quite follow?",
 ]
 
-SERVER = "http://localhost:8765"
+SERVER = "http://localhost:10002"
 SR = 16_000
 
 

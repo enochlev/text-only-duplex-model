@@ -29,8 +29,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, WhisperFeatureExtractor
 
-from coherence_reward_server import PORT
-
 SR              = 16_000
 SMART_TURN_PATH = os.path.join(os.path.dirname(__file__), "voices", "smart_turn.onnx")
 NAMO_REPO       = "videosdk-live/Namo-Turn-Detector-v1-Multilingual"
@@ -241,7 +239,7 @@ def vad_overlap(req: OverlapRequest):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=PORT)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--smart-turn-model", default=SMART_TURN_PATH)
     args = parser.parse_args()
 

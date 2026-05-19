@@ -20,7 +20,7 @@ from typing import Optional
 import numpy as np
 import pytest
 
-SERVER = "http://localhost:8765"
+SERVER = "http://localhost:10002"
 SR = 16_000
 
 # Full conversational phrases — expect complete=True
