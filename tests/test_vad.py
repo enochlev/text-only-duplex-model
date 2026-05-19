@@ -21,6 +21,10 @@ import base64
 import json
 import sys
 import urllib.request
+import os
+import dotenv
+
+dotenv.load_dotenv()  # for COHERENCE_PORT, VLLM_PORT
 
 import numpy as np
 
@@ -37,7 +41,7 @@ PHRASES = [
     "Could you explain that one more time, I didn't quite follow?",
 ]
 
-SERVER = "http://localhost:10002"
+SERVER = f"http://localhost:{os.getenv('VAD_PORT', '10002')}"
 SR = 16_000
 
 

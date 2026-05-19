@@ -15,6 +15,9 @@ import numpy as np
 from full_duplex import DuplexAudioBlock
 
 import os as _os
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv()
+
 COHERENCE_SERVER_URL = f"http://localhost:{_os.getenv('COHERENCE_PORT', '10001')}"
 
 _IDLE_TOKENS: frozenset = frozenset({
@@ -213,9 +216,8 @@ def coherence_reward(
 # Both fall back to ASR word-count heuristics when the server is unreachable.
 # ---------------------------------------------------------------------------
 
-_VAD_BASE_URL     = f"http://localhost:{_os.getenv('VAD_PORT', '10002')}"
-_VAD_COMPLETE_URL = f"{_VAD_BASE_URL}/vad/complete"
-_VAD_OVERLAP_URL  = f"{_VAD_BASE_URL}/vad/overlap"
+_VAD_COMPLETE_URL = "http://localhost:10002/vad/complete"
+_VAD_OVERLAP_URL  = "http://localhost:10002/vad/overlap"
 _VAD_TIMEOUT_S    = 1.0   # generous — rewards are computed offline, not real-time
 _VAD_RETRY_AFTER  = 20    # skip N calls after a failure, then retry
 

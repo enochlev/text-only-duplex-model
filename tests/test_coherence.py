@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_coherence.py — smoke-test the coherence reward server.
 
-Runs against http://localhost:10001.
+Runs against http://localhost:{os.getenv('COHERENCE_PORT', '10001')}.
 
 Tests
 -----
@@ -28,8 +28,12 @@ import json
 import sys
 import urllib.request
 import urllib.error
+import dotenv
+import os
 
-SERVER = "http://localhost:10001"
+dotenv.load_dotenv()  # for COHERENCE_PORT, VLLM_PORT
+
+SERVER = f"http://localhost:{os.getenv('COHERENCE_PORT', '10001')}"
 
 
 # ---------------------------------------------------------------------------
