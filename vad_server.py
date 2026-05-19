@@ -21,7 +21,10 @@ import argparse
 import base64
 import os
 
+from dotenv import load_dotenv
 import numpy as np
+
+load_dotenv()
 import onnxruntime as ort
 import torch
 import uvicorn

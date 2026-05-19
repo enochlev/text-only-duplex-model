@@ -25,10 +25,13 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import uvicorn
+
+load_dotenv()
 
 # ── config ────────────────────────────────────────────────────────────────────
 
