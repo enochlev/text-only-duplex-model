@@ -14,7 +14,7 @@ VAD_COMPLETE_BACKEND   "namo" (default) or "smart-turn"
 HF_TOKEN               required for pyannote (gated model)
 
 Run:
-    python vad_server.py [--port 8765]
+    python vad_server.py [--port 10002]
 """
 
 import argparse

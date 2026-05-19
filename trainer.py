@@ -25,7 +25,6 @@ from trainer import (
     idle_penalty,
     response_length_reward,
     respond_after_user_reward,
-    overlap_penalty,
     first_sentence_reward,
     interruption_penalty,
     silence_too_long_penalty,
@@ -82,17 +81,24 @@ def main() -> None:
 
     data_pool = make_default_data_pool()
 
+    # Reward functions and their weights (must be same length).
+    # silence_too_long_penalty is listed twice so it can carry two different
+    # weights: a strong "first miss" tier (1.0) and a lighter "sustained" tier
+    # (0.5) — the escalation inside the function already handles run length,
+    # so the two instances give different gradient magnitudes per call site.
     reward_fns = [
         latency_reward,            # TODO: curate a proper latency reward function
         idle_penalty,
         response_length_reward,
         respond_after_user_reward,
-        overlap_penalty,
         first_sentence_reward,
-        interruption_penalty,
-        silence_too_long_penalty,  # weight slot 1 (e.g. 1.0)
-        silence_too_long_penalty,  # weight slot 2 (e.g. 0.5) — different weight, same fn
+        interruption_penalty,      # pyannote OSD (prod) / ASR word-count (sim)
+        silence_too_long_penalty,  # Namo turn detector — tier 1
+        silence_too_long_penalty,  # Namo turn detector — tier 2 (lighter weight)
     ]
+    reward_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5]
+
+    config.reward_fn_weights = reward_weights
 
     trainer = FullDuplexRLTrainer(
         config=config,

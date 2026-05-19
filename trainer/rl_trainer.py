@@ -599,8 +599,6 @@ class FullDuplexRLTrainer:
         fn_names: List[str],
     ) -> float:
         """Run reward functions with full debug output. Returns total reward."""
-        action_label = f'"{step.response_token_ids}"' if step.is_idle else \
-            f'"{(step.prompt_text or "")[-60:]}"'
         action_str = "<idle>" if step.is_idle else (step.prompt_text or "")[-80:].strip()
 
         print(f"\n{'═'*70}")

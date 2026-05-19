@@ -14,7 +14,7 @@ import numpy as np
 
 from full_duplex import DuplexAudioBlock
 
-COHERENCE_SERVER_URL = "http://localhost:8001"
+COHERENCE_SERVER_URL = "http://localhost:10001"
 
 RewardFn = Callable[[DuplexAudioBlock, List[DuplexAudioBlock], bool], float]
 """
@@ -206,8 +206,8 @@ def coherence_reward(
 # Both fall back to ASR word-count heuristics when the server is unreachable.
 # ---------------------------------------------------------------------------
 
-_VAD_COMPLETE_URL = "http://localhost:8765/vad/complete"
-_VAD_OVERLAP_URL  = "http://localhost:8765/vad/overlap"
+_VAD_COMPLETE_URL = "http://localhost:10002/vad/complete"
+_VAD_OVERLAP_URL  = "http://localhost:10002/vad/overlap"
 _VAD_TIMEOUT_S    = 1.0   # generous — rewards are computed offline, not real-time
 _VAD_RETRY_AFTER  = 20    # skip N calls after a failure, then retry
 
@@ -280,20 +280,30 @@ def _vad_overlap(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional[bool]
         return None
 
 
+_RMS_SILENCE = 1e-4  # below this RMS on both channels → silence, skip pyannote
+
+
 def _user_speaking(block: DuplexAudioBlock) -> bool:
     """True if user and bot were speaking simultaneously (overlap detected).
 
-    Uses pyannote OSD when both mic and tts audio are available.
-    Falls back to ASR word-count heuristic otherwise.
+    Uses pyannote OSD when both channels are non-silent (production audio).
+    Falls back to ASR word-count heuristic in simulation (zero mic/tts audio)
+    and when the VAD server is unreachable.
     """
-    if (block.mic_audio is not None and len(block.mic_audio) > 0
-            and block.tts_audio is not None and len(block.tts_audio) > 0):
-        tts_f32 = block.tts_audio.astype(np.float32)
-        if block.tts_audio.dtype == np.int16:
+    mic = block.mic_audio
+    tts = block.tts_audio
+    if mic is not None and len(mic) > 0 and tts is not None and len(tts) > 0:
+        tts_f32 = tts.astype(np.float32)
+        if tts.dtype == np.int16:
             tts_f32 = tts_f32 / 32768.0
-        result = _vad_overlap(block.mic_audio, tts_f32)
-        if result is not None:
-            return result
+        mic_f32 = mic.astype(np.float32)
+        # Silence check — simulation fills both arrays with zeros; skip pyannote
+        # so the ASR word-count fallback below still fires during training.
+        if (np.sqrt(np.mean(mic_f32 ** 2)) > _RMS_SILENCE
+                or np.sqrt(np.mean(tts_f32 ** 2)) > _RMS_SILENCE):
+            result = _vad_overlap(mic_f32, tts_f32)
+            if result is not None:
+                return result
     return len((block.user_text or "").split()) > 2
 
 
