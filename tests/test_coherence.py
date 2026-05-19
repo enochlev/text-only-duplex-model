@@ -308,6 +308,85 @@ def test_coherence_pairs() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 9: Accumulated prefix divergence — reward decreases as bot talks longer
+#
+# All three calls use the *identical* proposed_next and last_user_message.
+# The only variable is last_bot_message, which grows from 1 → 2 → 3 prior
+# bot blocks (space-joined, exactly as coherence_reward() now builds it).
+#
+# Expected signal: the teacher model scores the proposed continuation lower
+# when the bot has already been speaking for more blocks, because a longer
+# prefix makes another continuation less likely (the bot should yield the
+# floor).  We assert strict divergence (all three scores differ by > epsilon)
+# and a soft monotone check (scores non-increasing) that prints a warning
+# without failing if the small teacher model doesn't capture the direction.
+# ---------------------------------------------------------------------------
+
+_BOT_BLOCK_1 = "Python is a high-level programming language."
+_BOT_BLOCK_2 = "It was created by Guido van Rossum in the early nineteen nineties."
+_BOT_BLOCK_3 = "Its design philosophy emphasises code readability and simplicity."
+_PROPOSED    = "It is also widely used in data science and machine learning."
+_LAST_USER   = "Can you tell me about Python?"
+
+_PREFIX_VARIANTS = [
+    ("1 prior bot block",  _BOT_BLOCK_1),
+    ("2 prior bot blocks", f"{_BOT_BLOCK_1} {_BOT_BLOCK_2}"),
+    ("3 prior bot blocks", f"{_BOT_BLOCK_1} {_BOT_BLOCK_2} {_BOT_BLOCK_3}"),
+]
+
+
+def test_accumulated_prefix_divergence() -> None:
+    print("\n" + "=" * 70)
+    print("TEST 9: Accumulated prefix divergence")
+    print("  Same proposed_next, same last_user_message.")
+    print("  last_bot_message grows: 1 → 2 → 3 prior bot blocks.")
+    print("  Expect: scores diverge (all distinct); ideally non-increasing.")
+    print("=" * 70)
+    print(f"  proposed_next   : {_PROPOSED!r}")
+    print(f"  last_user_message: {_LAST_USER!r}")
+    print()
+    print(f"  {'variant':<22}  {'reward':>10}  {'n_tokens':>8}  result")
+    print("  " + "-" * 55)
+
+    scores: list[float] = []
+    for label, prefix in _PREFIX_VARIANTS:
+        r = _reward(_PROPOSED, last_user=_LAST_USER, last_bot=prefix, timeout=30.0)
+        scores.append(r["reward"])
+        print(f"  {label:<22}  {r['reward']:>10.4f}  {r['n_tokens']:>8}")
+
+    print()
+
+    # All three scores must be distinct (non-degenerate signal).
+    score_1, score_2, score_3 = scores
+    all_distinct = (
+        abs(score_1 - score_2) > 1e-4
+        and abs(score_2 - score_3) > 1e-4
+        and abs(score_1 - score_3) > 1e-4
+    )
+    print(f"  All scores distinct (|diff| > 1e-4):  {'✓' if all_distinct else '✗'}")
+    assert all_distinct, (
+        f"Scores did not diverge: prefix_1={score_1:.6f}, "
+        f"prefix_2={score_2:.6f}, prefix_3={score_3:.6f}. "
+        "The accumulated prefix is not changing the teacher's scoring — "
+        "check that the server is receiving last_bot_message correctly."
+    )
+
+    # Soft monotone check: more prior speech → lower reward.
+    # Printed as a warning; not asserted because small teacher models may not
+    # reliably capture the "yield the floor" signal in every content setting.
+    monotone = score_1 >= score_2 >= score_3
+    if monotone:
+        print("  Scores non-increasing (1-block ≥ 2-block ≥ 3-block):  ✓")
+    else:
+        print(
+            "  WARNING: scores are not monotonically non-increasing "
+            f"({score_1:.4f}, {score_2:.4f}, {score_3:.4f}). "
+            "The teacher may not penalise longer monologues consistently at "
+            "this model size — consider a larger coherence model."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -321,6 +400,7 @@ def main() -> None:
     test_history_effect()
     test_prefix_effect()
     test_coherence_pairs()
+    test_accumulated_prefix_divergence()
     print("\nAll tests passed.\n")
 
 
