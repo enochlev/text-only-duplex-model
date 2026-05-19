@@ -20,6 +20,7 @@ from .rewards import (
     respond_after_user_reward,
     overlap_penalty,
     first_sentence_reward,
+    coherence_reward,
     interruption_penalty,
     silence_too_long_penalty,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "respond_after_user_reward",
     "overlap_penalty",
     "first_sentence_reward",
+    "coherence_reward",
     "interruption_penalty",
     "silence_too_long_penalty",
     # data_ingestion

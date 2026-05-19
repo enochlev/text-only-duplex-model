@@ -199,8 +199,13 @@ def llm_generate_train(
     outputs = vllm_engine.generate([full_prompt], sampling_params, use_tqdm=False)
     out = outputs[0].outputs[0]
 
-    _ROLE_RE = re.compile(r'<\|?(?:im_end|im_start|user|assistant|system)[|\s>][^>]*>?', re.I)
-    text = _ROLE_RE.sub("", out.text or "").strip()
+    _ROLE_RE = re.compile(
+        r'<\|?(?:im_end|im_start|user|assistant|system)[|\s>][^>]*>?'
+        r'|</?(?:AI|s|user|idle)>',
+        re.I,
+    )
+    text = _ROLE_RE.sub("", out.text or "")
+    text = text.replace("</s>", "").replace("<s>", "").strip()
 
     response_token_ids: List[int] = list(out.token_ids)
 

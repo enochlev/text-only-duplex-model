@@ -26,6 +26,7 @@ from trainer import (
     response_length_reward,
     respond_after_user_reward,
     first_sentence_reward,
+    coherence_reward,
     interruption_penalty,
     silence_too_long_penalty,
     make_default_data_pool,
@@ -95,8 +96,9 @@ def main() -> None:
         interruption_penalty,      # pyannote OSD (prod) / ASR word-count (sim)
         silence_too_long_penalty,  # Namo turn detector — tier 1
         silence_too_long_penalty,  # Namo turn detector — tier 2 (lighter weight)
+        coherence_reward,          # teacher LLM scoring; requires coherence server running
     ]
-    reward_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5]
+    reward_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0]
 
     config.reward_fn_weights = reward_weights
 

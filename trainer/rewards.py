@@ -96,7 +96,7 @@ def respond_after_user_reward(
     """
     if block.assistant_text or len(history) < 2:
         return 0.0
-    user_spoke_2ago = len((history[-2].user_text or "").split()) >= 1
+    user_spoke_2ago = _user_finished_in(history[-2])
     return -0.3 if user_spoke_2ago else 0.0
 
 
@@ -178,18 +178,21 @@ def coherence_reward(
     if _is_effectively_idle(proposed):
         return 0.0
 
-    # only applies while the user is silent (model is continuing its own turn)
-    prev_bot = next(
-        (b.assistant_text for b in reversed(history) if b.assistant_text),
-        None,
-    )
+    # Accumulate all consecutive bot blocks that preceded the most recent user
+    # turn. This gives the teacher full context on how long the model has been
+    # speaking, enabling it to score whether continuing is appropriate.
+    last_user = ""
+    bot_prefix_parts: list = []
+    for b in reversed(history):
+        if b.user_text:
+            last_user = b.user_text
+            break
+        if b.assistant_text:
+            bot_prefix_parts.insert(0, b.assistant_text)
+
+    prev_bot = " ".join(bot_prefix_parts).strip()
     if not prev_bot:
         return 0.0
-
-    last_user = next(
-        (b.user_text for b in reversed(history) if b.user_text),
-        "",
-    )
 
     payload = {
         "history": [
@@ -362,7 +365,7 @@ def interruption_penalty(
 
     prior_run = 0
     for prev in reversed(history):
-        if prev.assistant_text and len((prev.user_text or "").split()) > 2:
+        if prev.assistant_text and _user_speaking(prev):
             prior_run += 1
         else:
             break

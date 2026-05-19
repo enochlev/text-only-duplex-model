@@ -935,9 +935,9 @@ class DuplexAudioAgent:
                 return
 
             cleaned = self._normalize(raw).strip()
-            if cleaned.endswith("</s>"):
-                cleaned = cleaned[:-4].strip()
-            cleaned = cleaned.replace("<idle>", "").strip()
+            for _tok in ("</s>", "<AI>", "<user>", "<s>", "<idle>"):
+                cleaned = cleaned.replace(_tok, " ")
+            cleaned = cleaned.strip()
             model_tag = _last_used_model.split("/")[-1] if _last_used_model else "?"
             print(f"└─ LLM ← [{model_tag}]  {cleaned!r}  ({len(cleaned.split())} words, {llm_latency:.2f}s)")
             self.last_llm_error = None
