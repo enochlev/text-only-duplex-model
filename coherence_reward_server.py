@@ -35,7 +35,7 @@ load_dotenv()
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-MODEL_NAME = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-0.6B")
+MODEL_NAME = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3.5-4B")  # or "Qwen/Qwen2.5-Instruct"
 GAMMA      = float(os.getenv("COHERENCE_GAMMA", "0.9"))
 PORT       = int(os.getenv("COHERENCE_PORT", "10001"))
 # Normalize reward by subtracting the greedy log-prob at each position.
@@ -65,9 +65,10 @@ async def lifespan(_: FastAPI):
     dtype  = torch.float32 if device == "cpu" else torch.float16
     _model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map=device,
         trust_remote_code=True,
+        attn_implementation="eager",  # MPS can't handle GQA in fused kernels
     )
     _model.eval()
 
@@ -154,11 +155,15 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
         {"role": "assistant", "content": req.last_bot_message + req.proposed_next},
     ]
 
-    full_ids: torch.Tensor = _tokenizer.apply_chat_template(
+    _tmpl_out = _tokenizer.apply_chat_template(
         messages_full,
         add_generation_prompt=False,
         return_tensors="pt",
         enable_thinking=False,
+    )
+    # newer transformers returns BatchEncoding; older returns a plain tensor
+    full_ids: torch.Tensor = (
+        _tmpl_out.input_ids if hasattr(_tmpl_out, "input_ids") else _tmpl_out
     ).to(_model.device)  # [1, seq_len]
 
     # ── locate proposed_next tokens inside full_ids ───────────────────────────

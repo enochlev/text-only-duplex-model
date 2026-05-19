@@ -127,7 +127,7 @@ def test_empty_input() -> None:
     print("=" * 70)
     for label, proposed in [("empty string", ""), ("whitespace", "   ")]:
         r = _reward(proposed, last_user="Hello there.")
-        ok = r["reward"] == 0.0 and r["n_tokens"] == 0 and r["token_log_probs"] == []
+        ok = abs(r["reward"]) < 1e-9 and r["n_tokens"] == 0 and r["token_log_probs"] == []
         print(f"  {label:<18} reward={r['reward']}  n_tokens={r['n_tokens']}  {'✓' if ok else '✗'}")
         assert ok, f"expected zero reward for empty input, got {r}"
 
@@ -322,11 +322,17 @@ def test_coherence_pairs() -> None:
 # without failing if the small teacher model doesn't capture the direction.
 # ---------------------------------------------------------------------------
 
-_BOT_BLOCK_1 = "Python is a high-level programming language."
-_BOT_BLOCK_2 = "It was created by Guido van Rossum in the early nineteen nineties."
-_BOT_BLOCK_3 = "Its design philosophy emphasises code readability and simplicity."
-_PROPOSED    = "It is also widely used in data science and machine learning."
-_LAST_USER   = "Can you tell me about Python?"
+# Scenario: user asks one question; bot answers across 1, 2, or 3 blocks
+# before proposing a 4th continuation.  The proposed sentence is a self-
+# contained summary statement — it neither needs more prior context to be
+# coherent ("also" confound) nor becomes *more* appropriate with a longer
+# prefix.  A teacher model should score it lower the more the bot has
+# already said, because the question is fully answered after 1-2 blocks.
+_BOT_BLOCK_1 = "Sure. Python is a popular, readable programming language."
+_BOT_BLOCK_2 = "It runs on all major platforms and has a huge standard library."
+_BOT_BLOCK_3 = "Many developers choose it for its clean, beginner-friendly syntax."
+_PROPOSED    = "So that's the main story with Python."
+_LAST_USER   = "What can you tell me about Python?"
 
 _PREFIX_VARIANTS = [
     ("1 prior bot block",  _BOT_BLOCK_1),

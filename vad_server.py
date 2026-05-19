@@ -135,7 +135,7 @@ def _load_pyannote(hf_token: str) -> None:
         from pyannote.audio.pipelines import OverlappedSpeechDetection
         print("[vad_server] loading pyannote/segmentation-3.0 …")
         model       = Model.from_pretrained("pyannote/segmentation-3.0",
-                                            use_auth_token=hf_token)
+                                            token=hf_token)
         _osd_pipeline = OverlappedSpeechDetection(segmentation=model)
         _osd_pipeline.instantiate({"min_duration_on": 0.0, "min_duration_off": 0.0})
         torch.load  = _orig_load

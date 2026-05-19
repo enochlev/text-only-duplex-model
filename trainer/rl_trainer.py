@@ -518,7 +518,7 @@ class FullDuplexRLTrainer:
         print("[trainer] loading HuggingFace model for gradient updates")
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name_or_path,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         )
         self.model.to(config.device)
         self.model.train()
