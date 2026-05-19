@@ -102,7 +102,7 @@ def llm_generate_groq(system_prompt: str, user_message: str) -> str:
 # call local vllm. Not with caht but with completion
 def local_llm_generate(system_prompt: str, user_message: str) -> str:
     import requests
-    url = "http://localhost:8000/v1/completions"
+    url = f"http://localhost:{os.getenv('VLLM_PORT', '8000')}/v1/completions"
     headers = {"Content-Type": "application/json"}
     payload = {
         "model": "fd",

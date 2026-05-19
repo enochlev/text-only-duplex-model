@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import wave
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
@@ -10,7 +11,7 @@ import numpy as np
 
 from full_duplex import DuplexAudioAgent, DuplexAudioBlock
 
-DEFAULT_SERVER_PORT = 8998
+DEFAULT_SERVER_PORT = int(os.getenv("DUPLEX_SERVER_PORT", "8998"))
 DEFAULT_WS_PATH = "/ws"
 
 

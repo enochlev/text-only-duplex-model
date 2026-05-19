@@ -32,7 +32,7 @@ from transformers import AutoTokenizer, WhisperFeatureExtractor
 SR              = 16_000
 SMART_TURN_PATH = os.path.join(os.path.dirname(__file__), "voices", "smart_turn.onnx")
 NAMO_REPO       = "videosdk-live/Namo-Turn-Detector-v1-Multilingual"
-PORT            = 10002
+PORT            = int(os.getenv("VAD_PORT", "10002"))
 
 app = FastAPI()
 
