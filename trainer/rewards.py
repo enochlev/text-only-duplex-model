@@ -202,69 +202,112 @@ def coherence_reward(
 
 
 # ---------------------------------------------------------------------------
-# VAD client — calls the smart-turn server (vad_server.py) on localhost.
-# Falls back to ASR word-count heuristic when the server is unreachable.
+# VAD clients — call vad_server.py endpoints.
+# Both fall back to ASR word-count heuristics when the server is unreachable.
 # ---------------------------------------------------------------------------
 
-_VAD_URL = "http://localhost:8765/vad"
-_VAD_TIMEOUT_S = 0.5  # 500 ms — generous for CPU inference of 32 MB ONNX
-_VAD_SILENCE_RMS = 1e-4  # below this → treat audio as silence, skip VAD
-_vad_fail_count = 0
-_VAD_RETRY_AFTER = 20   # re-probe server after this many consecutive failures
+_VAD_COMPLETE_URL = "http://localhost:8765/vad/complete"
+_VAD_OVERLAP_URL  = "http://localhost:8765/vad/overlap"
+_VAD_TIMEOUT_S    = 1.0   # generous — rewards are computed offline, not real-time
+_VAD_RETRY_AFTER  = 20    # skip N calls after a failure, then retry
+
+_complete_fail_count = 0
+_overlap_fail_count  = 0
 
 
-def _vad_classify(mic_audio: np.ndarray) -> Optional[bool]:
-    """Return True if user's turn is complete, False if still talking, None on failure.
+def _post(url: str, payload: bytes, timeout: float) -> Optional[dict]:
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
 
-    Returns None (→ ASR fallback) when:
-      - audio RMS is below silence threshold (ScriptTTSSource zero-fills mic_audio)
-      - VAD server is unreachable (retried every _VAD_RETRY_AFTER failures)
+
+def _vad_turn_complete(
+    text: str, mic_audio: Optional[np.ndarray] = None
+) -> Optional[bool]:
+    """True if user utterance is a complete turn, False if not, None on failure.
+
+    Passes both text and audio_b64 so the server can route to whichever backend
+    is configured (Namo uses text; smart-turn uses audio_b64).
     """
-    global _vad_fail_count
-
-    # Skip VAD on near-silence — avoids false "complete" on zero-filled simulation audio
-    if float(np.sqrt(np.mean(mic_audio.astype(np.float32) ** 2))) < _VAD_SILENCE_RMS:
+    global _complete_fail_count
+    if not text or not text.strip():
         return None
-
-    if _vad_fail_count >= _VAD_RETRY_AFTER:
+    if _complete_fail_count >= _VAD_RETRY_AFTER:
         return None
-
-    audio_b64 = base64.b64encode(
-        np.clip(mic_audio, -1.0, 1.0).astype(np.float32).tobytes()
-    ).decode()
-    payload = json.dumps({"audio_b64": audio_b64, "sample_rate": 16_000}).encode()
-
+    payload: dict = {"text": text}
+    if mic_audio is not None and len(mic_audio) > 0:
+        payload["audio_b64"] = base64.b64encode(
+            np.clip(mic_audio, -1.0, 1.0).astype(np.float32).tobytes()
+        ).decode()
     try:
-        req = urllib.request.Request(
-            _VAD_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        data = _post(
+            _VAD_COMPLETE_URL,
+            json.dumps(payload).encode(),
+            _VAD_TIMEOUT_S,
         )
-        with urllib.request.urlopen(req, timeout=_VAD_TIMEOUT_S) as resp:
-            data = json.loads(resp.read())
-        _vad_fail_count = 0
+        _complete_fail_count = 0
         return bool(data["complete"])
     except Exception:
-        _vad_fail_count += 1
+        _complete_fail_count += 1
+        return None
+
+
+def _vad_overlap(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional[bool]:
+    """pyannote OSD: True if user and bot were speaking simultaneously, None on failure."""
+    global _overlap_fail_count
+    if _overlap_fail_count >= _VAD_RETRY_AFTER:
+        return None
+    mic_b64 = base64.b64encode(
+        np.clip(mic_audio, -1.0, 1.0).astype(np.float32).tobytes()
+    ).decode()
+    tts_b64 = base64.b64encode(
+        np.clip(tts_audio, -1.0, 1.0).astype(np.float32).tobytes()
+    ).decode()
+    try:
+        data = _post(
+            _VAD_OVERLAP_URL,
+            json.dumps({"mic_b64": mic_b64, "tts_b64": tts_b64, "sample_rate": 16_000}).encode(),
+            _VAD_TIMEOUT_S,
+        )
+        _overlap_fail_count = 0
+        return bool(data["overlap"])
+    except Exception:
+        _overlap_fail_count += 1
         return None
 
 
 def _user_speaking(block: DuplexAudioBlock) -> bool:
-    """True if user was mid-turn during this block (VAD preferred, ASR fallback)."""
-    if block.mic_audio is not None and len(block.mic_audio) > 0:
-        result = _vad_classify(block.mic_audio)
+    """True if user and bot were speaking simultaneously (overlap detected).
+
+    Uses pyannote OSD when both mic and tts audio are available.
+    Falls back to ASR word-count heuristic otherwise.
+    """
+    if (block.mic_audio is not None and len(block.mic_audio) > 0
+            and block.tts_audio is not None and len(block.tts_audio) > 0):
+        tts_f32 = block.tts_audio.astype(np.float32)
+        if block.tts_audio.dtype == np.int16:
+            tts_f32 = tts_f32 / 32768.0
+        result = _vad_overlap(block.mic_audio, tts_f32)
         if result is not None:
-            return not result  # complete=True means done, so not-complete = still speaking
+            return result
     return len((block.user_text or "").split()) > 2
 
 
 def _user_finished_in(block: DuplexAudioBlock) -> bool:
-    """True if user completed their turn during this block (VAD preferred, ASR fallback)."""
-    if block.mic_audio is not None and len(block.mic_audio) > 0:
-        result = _vad_classify(block.mic_audio)
-        if result is not None:
-            return result
+    """True if user's utterance in this block is a complete conversational turn.
+
+    Uses VAD server — passes both text and mic_audio so the server can route to
+    whichever backend is configured (Namo uses text; smart-turn uses audio_b64).
+    Falls back to ASR word-count heuristic when server is unreachable.
+    """
+    mic = block.mic_audio if (block.mic_audio is not None and len(block.mic_audio) > 0) else None
+    result = _vad_turn_complete(block.user_text or "", mic_audio=mic)
+    if result is not None:
+        return result
     return len((block.user_text or "").split()) >= 1
 
 

@@ -34,7 +34,7 @@ import uvicorn
 
 MODEL_NAME = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-0.6B")
 GAMMA      = float(os.getenv("COHERENCE_GAMMA", "0.9"))
-PORT       = int(os.getenv("COHERENCE_PORT", "8001"))
+PORT       = int(os.getenv("COHERENCE_PORT", "10001"))
 # Normalize reward by subtracting the greedy log-prob at each position.
 # reward_i = log P(proposed_i) - log P(greedy_i), always in (-inf, 0].
 # 0 = matched teacher's best choice; more negative = teacher preferred something else.
