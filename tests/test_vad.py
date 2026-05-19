@@ -78,7 +78,7 @@ def check_server() -> None:
 def synthesize(text: str) -> np.ndarray:
     """Return float32 PCM at 16 kHz using the project's Piper voice."""
     import os, sys
-    sys.path.insert(0, os.path.dirname(__file__))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from full_duplex import preload_piper_voice, TTS_MODEL
 
     voice = preload_piper_voice(tts_model=TTS_MODEL, device="cpu")
