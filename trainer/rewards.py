@@ -16,6 +16,16 @@ from full_duplex import DuplexAudioBlock
 
 COHERENCE_SERVER_URL = "http://localhost:10001"
 
+_IDLE_TOKENS: frozenset = frozenset({
+    "<idle>", "<|im_end|>", "<|endoftext|>", "</s>", "<eos>",
+})
+
+
+def _is_effectively_idle(text: str) -> bool:
+    stripped = text.strip()
+    return not stripped or stripped in _IDLE_TOKENS
+
+
 RewardFn = Callable[[DuplexAudioBlock, List[DuplexAudioBlock], bool], float]
 """
 Reward function signature.
@@ -74,20 +84,16 @@ def respond_after_user_reward(
     history: List[DuplexAudioBlock],
     is_terminal: bool,
 ) -> float:
-    """Penalise silence only when the user just finished speaking.
+    """Penalise silence when the user finished speaking more than 1 block ago.
 
-    Intentionally stacks with idle_penalty: idle_penalty is a constant floor
-    that discourages silence everywhere; this adds an extra −0.3 only when
-    silence is a missed turn-taking opportunity (user spoke in the last 2 blocks).
-    The combined −0.4 signal is stronger than either alone, which is the intent.
+    Lag=1 (respond in the block immediately after user finishes) is acceptable.
+    Only fires when the user spoke 2+ blocks back, signalling a missed
+    turn-taking opportunity that the model should correct.
     """
-    if block.assistant_text:
+    if block.assistant_text or len(history) < 2:
         return 0.0
-    recent = history[-2:]
-    user_just_spoke = any(
-        len((b.user_text or "").split()) >= 1 for b in recent
-    )
-    return -0.3 if user_just_spoke else 0.0
+    user_spoke_2ago = len((history[-2].user_text or "").split()) >= 1
+    return -0.3 if user_spoke_2ago else 0.0
 
 
 def overlap_penalty(
@@ -165,7 +171,7 @@ def coherence_reward(
     last_user_message.
     """
     proposed = (block.assistant_text or "").strip()
-    if not proposed:
+    if _is_effectively_idle(proposed):
         return 0.0
 
     # only applies while the user is silent (model is continuing its own turn)
@@ -304,7 +310,14 @@ def _user_speaking(block: DuplexAudioBlock) -> bool:
             result = _vad_overlap(mic_f32, tts_f32)
             if result is not None:
                 return result
-    return len((block.user_text or "").split()) > 2
+    # ASR fallback: user is interrupting only if they have words AND haven't
+    # finished their turn.  Namo is text-based so this works in simulation.
+    # Without the turn-complete check, complete short sentences (e.g. "My
+    # laptop keeps freezing.") would falsely trigger interruption_penalty.
+    words = (block.user_text or "").split()
+    if len(words) <= 2:
+        return False
+    return not _user_finished_in(block)
 
 
 def _user_finished_in(block: DuplexAudioBlock) -> bool:
@@ -364,31 +377,38 @@ def silence_too_long_penalty(
 ) -> float:
     """Penalise sustained silence after the user has finished their turn.
 
-    Checks whether the user's turn completed in the most recent history block.
-    Uses smart-turn audio VAD when available; falls back to ASR heuristic.
-    Escalates with consecutive silent blocks:
-      1 block  → -0.10
-      2 blocks → -0.25
-      3+ blocks → -0.50
+    Walks back through consecutive bot-silent blocks to find the most recent
+    user finish, then measures lag from there. Lag=1 (first silent block after
+    user finishes) is acceptable; penalty starts at lag=2.
 
-    Add this function twice to reward_fns with different weights to produce
-    two independently-tunable penalty tiers.
+    Escalates:
+      lag=2 → -0.10
+      lag=3 → -0.25
+      lag=4+ → -0.50
+
+    Register twice with different weights for two independently-tunable tiers.
     """
     if block.assistant_text or not history:
         return 0.0
 
-    if not _user_finished_in(history[-1]):
-        return 0.0
+    blocks_back = 0
+    user_finish_at: Optional[int] = None
 
-    prior_run = 0
     for prev in reversed(history):
         if prev.assistant_text:
             break
-        prior_run += 1
+        blocks_back += 1
+        if user_finish_at is None and _user_finished_in(prev):
+            user_finish_at = blocks_back
 
-    run_length = prior_run + 1
-    if run_length == 1:
+    if user_finish_at is None:
+        return 0.0
+
+    lag = user_finish_at  # 1 = user finished last block, this is first silent block
+    if lag <= 1:
+        return 0.0
+    if lag == 2:
         return -0.10
-    if run_length == 2:
+    if lag == 3:
         return -0.25
     return -0.50

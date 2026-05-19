@@ -51,7 +51,6 @@ app = FastAPI(title="Coherence Reward Server")
 _model: AutoModelForCausalLM | None = None
 _tokenizer: AutoTokenizer | None     = None
 _end_ids: set[int]                   = set()
-_debug: bool                         = False
 
 
 @contextlib.asynccontextmanager
@@ -76,24 +75,6 @@ async def lifespan(_: FastAPI):
         tid = _tokenizer.convert_tokens_to_ids(s)
         if tid is not None and tid != _tokenizer.unk_token_id:
             _end_ids.add(tid)
-
-    print(f"[coherence_reward_server] loaded {MODEL_NAME}  end_ids={_end_ids}")
-
-    # Warn if the chat template injects <think> blocks into assistant turns — Qwen3
-    # does this even with enable_thinking=False, which biases reward scores because
-    # the model evaluates proposed tokens in a post-thinking context.
-    _test = _tokenizer.apply_chat_template(
-        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
-        tokenize=False, add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    if "<think>" in _test:
-        print(
-            "[WARNING] This model's chat template inserts <think> blocks into assistant turns "
-            "even with enable_thinking=False. Reward scores will be slightly biased — the model "
-            "evaluates proposed_next in a post-thinking context. Not fixable without patching "
-            "the chat template or switching to a non-thinking model variant."
-        )
 
     yield
 
@@ -150,7 +131,7 @@ class RewardResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL_NAME}
+    return {"status": "ok", "model": MODEL_NAME, "eos_token_ids": sorted(_end_ids)}
 
 
 @app.post("/reward", response_model=RewardResponse)
@@ -176,17 +157,6 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
         return_tensors="pt",
         enable_thinking=False,
     ).to(_model.device)  # [1, seq_len]
-    if _debug:
-        rendered = _tokenizer.apply_chat_template(
-            messages_full,
-            add_generation_prompt=False,
-            tokenize=False,
-            enable_thinking=False,
-        )
-        sep = "─" * 60
-        print(f"\n{sep}  PROMPT  {sep}")
-        print(rendered)
-        print(f"{sep}  TOKEN COUNT: {full_ids.shape[1]}  {sep}\n")
 
     # ── locate proposed_next tokens inside full_ids ───────────────────────────
     #
@@ -255,15 +225,6 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
 
     reward = sum(req.gamma ** i * lp for i, lp in enumerate(token_log_probs))
 
-    if _debug:
-        sep = "─" * 60
-        print(f"{sep}  SCORES  {sep}")
-        for i, (lp, tok_pos) in enumerate(zip(token_log_probs, range(proposed_start, end_pos))):
-            tok_str = _tokenizer.decode([full_ids[0, tok_pos].item()])
-            print(f"  [{i:2d}]  γ^i={req.gamma**i:.3f}  logp={lp:7.3f}  weighted={req.gamma**i * lp:7.3f}  token={tok_str!r}")
-        print(f"  reward = {reward:.4f}  (n_tokens={len(token_log_probs)})")
-        print(f"{sep}\n")
-
     return RewardResponse(
         reward=reward,
         n_tokens=len(token_log_probs),
@@ -275,16 +236,8 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true", help="print full prompt and per-token scores on each request")
-    parser.add_argument("--port",  type=int, default=PORT)
+    parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
 
-    _debug = args.debug
-
-    uvicorn.run(
-        app,  # pass object directly — string form re-imports the module, losing _debug
-        host="0.0.0.0",
-        port=args.port,
-        log_level="info",
-    )
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
 
