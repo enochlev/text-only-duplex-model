@@ -100,7 +100,7 @@ def coherence_reward(
             bot_prefix_parts.insert(0, b.assistant_text)
 
     prev_bot = " ".join(bot_prefix_parts).strip()
-    if not prev_bot:
+    if not prev_bot and not last_user:
         return 0.0
 
     payload = {
@@ -242,6 +242,7 @@ def interruption_penalty(
     block: DuplexAudioBlock,
     history: List[DuplexAudioBlock],
     is_terminal: bool,
+    next_block: Optional[DuplexAudioBlock] = None,
 ) -> float:
     """Block-level crossover penalty — escalates when both parties speak simultaneously.
 
@@ -253,6 +254,11 @@ def interruption_penalty(
       2 blocks → -0.15
       3 blocks → -0.35
       4+ blocks → -0.65
+
+    Exception: isolated 1–2 word bot outputs (fillers like "right", "uh-huh")
+    are exempt when both the preceding and following blocks are completely
+    silent (no user or bot text), indicating a genuine backchannel rather than
+    a disruptive interruption.
     """
     if not block.assistant_text or not block.user_text:
         return 0.0
@@ -263,6 +269,13 @@ def interruption_penalty(
             run += 1
         else:
             break
+
+    if run == 1 and len(block.assistant_text.split()) <= 2:
+        prev_block = history[-1] if history else None
+        prev_silent = prev_block is None or (not prev_block.user_text and not prev_block.assistant_text)
+        next_silent = next_block is None or (not next_block.user_text and not next_block.assistant_text)
+        if prev_silent and next_silent:
+            return 0.0
 
     if run == 1:
         return -0.05

@@ -15,6 +15,7 @@ the conversation history between steps.
 
 from __future__ import annotations
 
+import concurrent.futures
 import csv
 import os
 import random
@@ -96,6 +97,9 @@ class StepRecord:
     reward: Optional[float] = None
     """Filled by compute_rewards()."""
 
+    reward_breakdown: Dict[str, float] = field(default_factory=dict)
+    """Weighted per-reward-function totals across blocks_covered. Filled by compute_rewards()."""
+
 
 @dataclass
 class Episode:
@@ -159,6 +163,10 @@ class TrainerConfig:
 
     debug_dir: str = "./debug"
     """Root directory for debug audio exports (created automatically)."""
+
+    reward_workers: int = 4
+    """Thread-pool size for parallel reward evaluation.
+    0 = auto (min(32, cpu_count)). Set to 1 to disable parallelism."""
 
     silence_inject_lambda_knob: float = 0.15
     """Probability applied to two exploration heuristics per LLM call:
@@ -359,7 +367,7 @@ class VirtualSimulationConnection:
         wpm = self.simulator.wpm
         max_episode_s = self.simulator.max_episode_s
 
-        agent = _make_training_agent(wpm, block_s, intercepted_llm_fn, self.tts_model, self.device)
+        agent = _make_training_agent(wpm, block_s, intercepted_llm_fn, self.tts_model, self.device, quiet=True)
         agent._now = lambda: sim_time[0]  # type: ignore[assignment]
 
         # Ground-truth ASR: override _seal_mic_block synchronously.
@@ -381,6 +389,8 @@ class VirtualSimulationConnection:
                     if abs(block.start_ts - start_ts) < 0.5:
                         if block.user_text != transcript:
                             block.user_text = transcript
+                            if block.assistant_text:
+                                block.assistant_text_stale = True
                             agent._latest_user_source_block_id = block.block_id
                             agent._invalidate_future_assistant_continuation()
                             agent._last_accepted_response_context_version = None
@@ -527,6 +537,7 @@ class RealTimeGPTEpisodeRunner:
             wpm, block_s, intercepted_llm_fn,
             tts_model=self.tts_model,
             device=self.device,
+            quiet=True,
         )
         # Do NOT override agent._now — it must use real time.time() so block
         # timestamps are wall-clock aligned with GPT transcript timestamps.
@@ -550,6 +561,8 @@ class RealTimeGPTEpisodeRunner:
                     if abs(block.start_ts - start_ts) < 0.5:
                         if block.user_text != transcript:
                             block.user_text = transcript
+                            if block.assistant_text:
+                                block.assistant_text_stale = True
                             agent._latest_user_source_block_id = block.block_id
                             agent._invalidate_future_assistant_continuation()
                             agent._last_accepted_response_context_version = None
@@ -603,6 +616,7 @@ def _make_training_agent(
     llm_generate_fn: Callable[[str, str], str],
     tts_model: str = "",
     device: Optional[str] = None,
+    quiet: bool = False,
 ) -> DuplexAudioAgent:
     """Create a training agent with real Piper TTS and no Parakeet ASR.
 
@@ -610,7 +624,7 @@ def _make_training_agent(
     overlap detection and smart-turn VAD in the reward models.
     _seal_mic_block is overridden by the caller (VirtualSimulationConnection).
     """
-    return _make_realtime_training_agent(wpm, block_s, llm_generate_fn, tts_model, device)
+    return _make_realtime_training_agent(wpm, block_s, llm_generate_fn, tts_model, device, quiet=quiet)
 
 
 def _make_realtime_training_agent(
@@ -619,6 +633,7 @@ def _make_realtime_training_agent(
     llm_generate_fn: Callable[[str, str], str],
     tts_model: str = "",
     device: Optional[str] = None,
+    quiet: bool = False,
 ) -> DuplexAudioAgent:
     """Create a DuplexAudioAgent with real Piper TTS for GPT Voice episodes.
 
@@ -641,6 +656,7 @@ def _make_realtime_training_agent(
         tts_model=resolved_tts,
         device=device,
     )
+    agent.quiet = quiet
     agent._get_piper_voice()  # warm from cache now rather than first block
     return agent
 
@@ -648,6 +664,22 @@ def _make_realtime_training_agent(
 # ---------------------------------------------------------------------------
 # Episode post-processing helpers
 # ---------------------------------------------------------------------------
+
+def _print_episode_summary(ep: "Episode") -> None:
+    """Print a compact block-by-block table for a just-completed episode."""
+    UW, BW = 38, 32
+    header = f"  {'#':>3}  {'user':<{UW}}  {'bot':<{BW}}"
+    print(header)
+    print(f"  {'─'*3}  {'─'*UW}  {'─'*BW}")
+    for i, blk in enumerate(ep.blocks, 1):
+        u = (blk.user_text or "-")
+        b = (blk.assistant_text or "-")
+        if len(u) > UW:
+            u = u[:UW - 1] + "…"
+        if len(b) > BW:
+            b = b[:BW - 1] + "…"
+        print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
+
 
 def _fill_blocks_covered(
     steps: List[StepRecord], blocks: List[DuplexAudioBlock]
@@ -846,6 +878,7 @@ class FullDuplexRLTrainer:
                     f"blocks={len(ep.blocks)}  ended={ep.terminated_reason}"
                     + (f"  src={src_id}" if src_id else "")
                 )
+                _print_episode_summary(ep)
             except Exception as exc:
                 print(f"[trainer] episode failed: {exc!r}")
         return episodes
@@ -910,6 +943,14 @@ class FullDuplexRLTrainer:
             user_snippet = (block.user_text or "<silence>")[:60]
             bot_snippet  = (block.assistant_text or "<idle>")[:60]
             print(f"\n  ┌─ Block {block.block_id[:8]}")
+            # Show last 4 history blocks as context before RM scores
+            ctx = history[-4:] if len(history) >= 4 else history
+            if ctx:
+                for ci, hb in enumerate(ctx):
+                    hu = ((hb.user_text or "-")[:32])
+                    ha = ((hb.assistant_text or "-")[:28])
+                    print(f"  │  B[{ci - len(ctx)}]  u={hu!r:<35}  ai={ha!r}")
+                print(f"  │  {'─'*60}")
             print(f"  │  user : {user_snippet!r}")
             print(f"  │  bot  : {bot_snippet!r}")
             if mic_path:
@@ -936,26 +977,64 @@ class FullDuplexRLTrainer:
         return total
 
     def compute_rewards(self, episode: Episode, ep_idx: int = 0) -> Episode:
-        """Fill StepRecord.reward using weighted sum of reward functions."""
+        """Fill StepRecord.reward using weighted sum of reward functions.
+
+        In non-debug mode, all steps are scored in parallel via a thread pool
+        so blocking HTTP calls (coherence server, VAD server) overlap instead
+        of stacking sequentially.
+        """
         fn_names = [fn.__name__ for fn in self.reward_fns]
+        n_steps = len(episode.steps)
 
-        for i, step in enumerate(episode.steps):
-            is_terminal = (i == len(episode.steps) - 1)
-            covered_ids = set(step.blocks_covered)
-            covered = [b for b in episode.blocks if b.block_id in covered_ids]
-            history = [b for b in episode.blocks if b.block_id not in covered_ids]
+        _block_idx = {b.block_id: i for i, b in enumerate(episode.blocks)}
 
-            if self.config.debug:
+        def _prior_history(covered_ids: set) -> List[DuplexAudioBlock]:
+            first = min(
+                (_block_idx[bid] for bid in covered_ids if bid in _block_idx),
+                default=len(episode.blocks),
+            )
+            return episode.blocks[:first]
+
+        def _call_fn(fn, block, hist, terminal):
+            if fn.__name__ == "interruption_penalty":
+                idx = _block_idx.get(block.block_id, -1)
+                nxt = episode.blocks[idx + 1] if 0 <= idx < len(episode.blocks) - 1 else None
+                return fn(block, hist, terminal, next_block=nxt)
+            return fn(block, hist, terminal)
+
+        if self.config.debug:
+            for i, step in enumerate(episode.steps):
+                is_terminal = (i == n_steps - 1)
+                covered_ids = set(step.blocks_covered)
+                covered = [b for b in episode.blocks if b.block_id in covered_ids]
+                history = _prior_history(covered_ids)
                 step.reward = self._debug_step(
                     self._step_count, ep_idx, i, step,
                     covered, history, is_terminal, fn_names,
                 )
-            else:
-                total = 0.0
-                for fn, w in zip(self.reward_fns, self.rm_weights):
-                    for block in covered:
-                        total += w * fn(block, history, is_terminal)
-                step.reward = total
+            return episode
+
+        def _score_step(i: int) -> Tuple[float, Dict[str, float]]:
+            step = episode.steps[i]
+            is_terminal = (i == n_steps - 1)
+            covered_ids = set(step.blocks_covered)
+            covered = [b for b in episode.blocks if b.block_id in covered_ids]
+            history = _prior_history(covered_ids)
+            total = 0.0
+            breakdown: Dict[str, float] = {}
+            for fn, w in zip(self.reward_fns, self.rm_weights):
+                fn_total = sum(w * _call_fn(fn, block, history, is_terminal) for block in covered)
+                breakdown[fn.__name__] = fn_total
+                total += fn_total
+            return total, breakdown
+
+        workers = self.config.reward_workers or min(32, os.cpu_count() or 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_score_step, range(n_steps)))
+
+        for step, (reward, breakdown) in zip(episode.steps, results):
+            step.reward = reward
+            step.reward_breakdown = breakdown
 
         return episode
 
@@ -1091,11 +1170,24 @@ class FullDuplexRLTrainer:
         torch.cuda.empty_cache()
 
         self._step_count += 1
-        all_rewards = [s.reward for e in episodes for s in e.steps if s.reward is not None]
-        metrics = {
+        all_steps = [s for e in episodes for s in e.steps if s.reward is not None]
+        all_rewards = [s.reward for s in all_steps]
+        n_scored = len(all_rewards)
+
+        # Per-reward-function averages across all scored steps
+        fn_totals: Dict[str, float] = {}
+        for s in all_steps:
+            for fn_name, val in s.reward_breakdown.items():
+                fn_totals[fn_name] = fn_totals.get(fn_name, 0.0) + val
+        fn_avgs: Dict[str, float] = {
+            k: v / n_scored for k, v in fn_totals.items()
+        } if n_scored else {}
+
+        metrics: Dict[str, float] = {
             "step": float(self._step_count),
             "loss": loss_val,
-            "avg_reward": float(sum(all_rewards) / len(all_rewards)) if all_rewards else 0.0,
+            "avg_reward": float(sum(all_rewards) / n_scored) if n_scored else 0.0,
+            **{f"avg_{k}": v for k, v in fn_avgs.items()},
             "baseline": self._baseline,
             "n_episodes": float(len(episodes)),
             "n_steps_total": float(sum(len(e.steps) for e in episodes)),
@@ -1103,10 +1195,12 @@ class FullDuplexRLTrainer:
                 sum(sum(1 for s in e.steps if not s.is_idle) for e in episodes)
             ),
         }
+        fn_str = "  ".join(f"{k}={v:+.3f}" for k, v in fn_avgs.items())
         print(
             f"[trainer] step={self._step_count}  loss={metrics['loss']:.4f}  "
-            f"baseline={metrics['baseline']:.3f}  "
+            f"avg_reward={metrics['avg_reward']:+.3f}  baseline={metrics['baseline']:.3f}  "
             f"non_idle={int(metrics['n_non_idle'])}/{int(metrics['n_steps_total'])}"
+            + (f"\n          {fn_str}" if fn_str else "")
         )
         return metrics
 

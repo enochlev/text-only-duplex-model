@@ -377,6 +377,9 @@ class DuplexAudioAgent:
         self._piper_voice = None
         self._audio_queue: queue.Queue[tuple] = queue.Queue()
 
+        # Logging
+        self.quiet: bool = False
+
         # Mic ASR
         self._asr_fn = asr_fn
         self._mic_rolling: List[tuple] = []
@@ -560,6 +563,10 @@ class DuplexAudioAgent:
     # TTS
     # ------------------------------------------------------------------
 
+    def _vlog(self, msg: str) -> None:
+        if not self.quiet:
+            print(msg)
+
     def _synthesize_piper_audio(self, voice, text: str) -> tuple[int, np.ndarray]:
         return piper_synthesize(voice, text)
 
@@ -572,7 +579,7 @@ class DuplexAudioAgent:
         voice = self._get_piper_voice()
         sr, arr = self._synthesize_piper_audio(voice, text)
         elapsed = time.perf_counter() - t0
-        print(f"[tts] {repr(text)} → {len(arr)/sr:.2f}s audio  (synthesized in {elapsed:.3f}s)")
+        self._vlog(f"[tts] {repr(text)} → {len(arr)/sr:.2f}s audio  (synthesized in {elapsed:.3f}s)")
         return sr, arr, elapsed
 
     # ------------------------------------------------------------------
@@ -887,7 +894,7 @@ class DuplexAudioAgent:
             self._committed_words.extend(to_commit)
             self._clear_pending_response_timing()
             pending_preview = " ".join(self._pending_words[:6]) + ("…" if len(self._pending_words) > 6 else "")
-            print(f"[commit ✓] {text!r}  pending={len(self._pending_words)} words  [{pending_preview}]")
+            self._vlog(f"[commit ✓] {text!r}  pending={len(self._pending_words)} words  [{pending_preview}]")
             # Words were consumed — allow LLM to continue generating the next chunk
             # regardless of whether context_version changed. Without this, the AI
             # goes silent after the first response until the user speaks again.
@@ -914,7 +921,7 @@ class DuplexAudioAgent:
         new_tail = proposal_tail_norm[mismatch_idx:]
         self._pending_words = retained + new_tail
         all_words = " ".join(self._pending_words[:10]) + ("…" if len(self._pending_words) > 10 else "")
-        print(f"[queue] kept={len(retained)} +new={len(new_tail)} → {len(self._pending_words)} pending  [{all_words}]")
+        self._vlog(f"[queue] kept={len(retained)} +new={len(new_tail)} → {len(self._pending_words)} pending  [{all_words}]")
 
     # ------------------------------------------------------------------
     # Prompt building
@@ -974,7 +981,7 @@ class DuplexAudioAgent:
             lines.append(f"│  ({len(self.blocks)} total blocks, showing last {len(_log_blocks)})")
             tail = user_message[-60:].replace("\n", "↵")
             lines.append(f"│  tail → …{tail}")
-            print("\n".join(lines))
+            self._vlog("\n".join(lines))
             llm_t0 = time.perf_counter()
             raw_response = self._llm_generate_fn(system_prompt, user_message)
             llm_latency = time.perf_counter() - llm_t0
@@ -982,7 +989,7 @@ class DuplexAudioAgent:
 
             if generation_context_version != self.context_version:
                 self._clear_pending_response_timing()
-                print(f"└─ LLM ← STALE (ctx {generation_context_version} → {self.context_version})  discarded {raw!r}")
+                self._vlog(f"└─ LLM ← STALE (ctx {generation_context_version} → {self.context_version})  discarded {raw!r}")
                 return
 
             cleaned = self._normalize(raw).strip()
@@ -990,7 +997,7 @@ class DuplexAudioAgent:
                 cleaned = cleaned.replace(_tok, " ")
             cleaned = cleaned.strip()
             model_tag = _last_used_model.split("/")[-1] if _last_used_model else "?"
-            print(f"└─ LLM ← [{model_tag}]  {cleaned!r}  ({len(cleaned.split())} words, {llm_latency:.2f}s)")
+            self._vlog(f"└─ LLM ← [{model_tag}]  {cleaned!r}  ({len(cleaned.split())} words, {llm_latency:.2f}s)")
             self.last_llm_error = None
 
             if not cleaned:
@@ -1094,7 +1101,7 @@ class DuplexAudioAgent:
         self.blocks.append(finalized)
         self._current_block = None
 
-        print(f"[poll] block#{len(self.blocks)} user={repr(finalized.user_text)} ai={repr(finalized.assistant_text)}")
+        self._vlog(f"[poll] block#{len(self.blocks)} user={repr(finalized.user_text)} ai={repr(finalized.assistant_text)}")
 
         if finalized.assistant_text:
             sr, playback_audio, tts_latency = self._generate_tts(finalized.assistant_text)
@@ -1106,14 +1113,14 @@ class DuplexAudioAgent:
             audio = playback_audio
             duration = len(playback_audio) / sr
             if duration > 4.0:
-                print(f"[tts] WARNING: block {duration:.2f}s > 4s for {repr(finalized.assistant_text)}")
+                self._vlog(f"[tts] WARNING: block {duration:.2f}s > 4s for {repr(finalized.assistant_text)}")
             elif duration < 1.0:
-                print(f"[tts] WARNING: block {duration:.2f}s < 1s for {repr(finalized.assistant_text)}")
+                self._vlog(f"[tts] WARNING: block {duration:.2f}s < 1s for {repr(finalized.assistant_text)}")
             if finalized.assistant_text[-1] in ".!?,;:" and duration < self._default_block_s:
                 padding = np.zeros(int((self._default_block_s - duration) * sr), dtype=np.int16)
                 audio = np.concatenate([audio, padding])
                 duration = self._default_block_s
-                print(f"[tts] padded to {duration:.2f}s (sentence boundary)")
+                self._vlog(f"[tts] padded to {duration:.2f}s (sentence boundary)")
             finalized.lead_silence_s = finalized.total_latency_s or 0.0
             if finalized.lead_silence_s > 0.0:
                 lead_silence = np.zeros(int(finalized.lead_silence_s * sr), dtype=np.int16)
@@ -1133,7 +1140,7 @@ class DuplexAudioAgent:
             self._clear_timeline_metadata(finalized)
 
         self._next_block_ts = now + duration
-        print(f"[poll] next_block_ts in {duration:.2f}s  queue_depth={self._audio_queue.qsize()}")
+        self._vlog(f"[poll] next_block_ts in {duration:.2f}s  queue_depth={self._audio_queue.qsize()}")
         self._enqueue_audio(sr, audio)
 
         self._seal_mic_block(finalized.start_ts, now)
