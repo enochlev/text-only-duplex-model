@@ -64,25 +64,6 @@ def respond_after_user_reward(
 
 
 
-def first_sentence_reward(
-    block: DuplexAudioBlock,
-    history: List[DuplexAudioBlock],
-    is_terminal: bool,
-) -> float:
-    """Penalise responses that continue past the first sentence boundary.
-
-    Trains the model to emit one crisp sentence per block and then yield
-    the floor. No penalty when the first punctuation mark is at (or near)
-    the end of the response.
-    """
-    text = (block.assistant_text or "").strip()
-    if not text:
-        return 0.0
-    m = re.search(r'[.!?]', text)
-    if m and m.end() < len(text) - 1:
-        return -0.2
-    return 0.0
-
 
 def coherence_reward(
     block: DuplexAudioBlock,

@@ -87,14 +87,13 @@ def main() -> None:
     # so the two instances give different gradient magnitudes per call site.
     reward_fns = [
         respond_after_user_reward,
-        first_sentence_reward,
         interruption_penalty,            # block-level crossover: both parties speaking simultaneously
         interruption_penalty_overlap,    # progressive VAD: -overlap_ratio; requires VAD server
         silence_too_long_penalty,        # Namo turn detector — tier 1
         silence_too_long_penalty,        # Namo turn detector — tier 2 (lighter weight)
         coherence_reward,                # teacher LLM scoring; requires coherence server running
     ]
-    reward_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0]
+    reward_weights = [1.0, 1.0, 1.0, 1.0, 0.5, 1.0]
 
     config.reward_fn_weights = reward_weights
 
