@@ -59,6 +59,11 @@ def main() -> None:
                         help="Print per-RM scores and export block audio each step")
     parser.add_argument("--debug-dir", default="./debug",
                         help="Directory for debug audio exports (default: ./debug)")
+    parser.add_argument(
+        "--silence-lambda", type=float, default=0.15,
+        help="Probability for silence-injection heuristics: truncate at punctuation "
+             "and force silence after sentence-ending bot blocks (default: 0.15, 0=off)",
+    )
     args = parser.parse_args()
 
     config = TrainerConfig(
@@ -75,6 +80,7 @@ def main() -> None:
         save_every_n_steps=args.save_every,
         debug=args.debug,
         debug_dir=args.debug_dir,
+        silence_inject_lambda_knob=args.silence_lambda,
     )
 
     data_pool = make_default_data_pool()

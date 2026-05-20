@@ -735,6 +735,187 @@ TRAINING_SCRIPTS: List[List[str]] = [
     ["Explain quantum entanglement simply.",
      "Can it be used for communication?",
      "Why not?"],
+
+    # Weather small talk
+    ["What's the weather like today?",
+     "Will it rain this weekend?",
+     "Should I bring an umbrella?"],
+
+    # Recipe / cooking
+    ["How do I make pasta carbonara?",
+     "Can I use bacon instead of pancetta?",
+     "What if I don't have parmesan?",
+     "How do I keep the eggs from scrambling?"],
+
+    # Fitness advice
+    ["I want to start working out but don't know where to begin.",
+     "I have about thirty minutes a day.",
+     "I don't have any gym equipment.",
+     "Is that enough to see results?"],
+
+    # Home improvement
+    ["How do I fix a leaky faucet?",
+     "I think it's the washer.",
+     "Do I need to turn off the main water supply?",
+     "Thanks, I'll try it."],
+
+    # Single very long rambling turn (tests chunking)
+    ["So I was talking to my friend earlier and she mentioned this new app that "
+     "supposedly helps you track your spending and set budgets and she says she's "
+     "saved like three hundred dollars a month since she started using it and I "
+     "was wondering if you've heard of anything like that and whether it's worth "
+     "actually trying one of those budgeting apps."],
+
+    # Book recommendation
+    ["Can you recommend a good book?",
+     "I like mysteries.",
+     "Something not too long.",
+     "Has it been adapted into a movie?"],
+
+    # Career advice
+    ["I'm thinking about switching careers.",
+     "I'm currently in accounting.",
+     "I'd like to get into software development.",
+     "Where should I start learning?"],
+
+    # Pet care
+    ["My dog keeps barking at night.",
+     "He's about two years old.",
+     "Could it be separation anxiety?",
+     "What can I do about it?"],
+
+    # Rapid back-and-forth debate (tests fast turn transitions)
+    ["Cats or dogs?",
+     "Dogs.",
+     "Cats are more independent.",
+     "Dogs are more loyal.",
+     "Fair.",
+     "Okay fine, both."],
+
+    # Language learning
+    ["How do I say hello in Japanese?",
+     "And thank you?",
+     "What about goodbye?",
+     "Can you teach me a simple phrase?"],
+
+    # Science facts
+    ["How hot is the sun?",
+     "What's it made of?",
+     "How long until it burns out?",
+     "Will Earth survive?"],
+
+    # History question
+    ["When did World War Two end?",
+     "What caused it?",
+     "Who were the main leaders?"],
+
+    # Philosophy / open-ended reflection
+    ["Do you think free will exists?",
+     "What's the strongest argument against it?",
+     "Does it even matter practically?"],
+
+    # Emotional — frustration venting
+    ["I'm so frustrated with my coworker.",
+     "He keeps taking credit for my ideas in meetings.",
+     "I don't want to start a conflict.",
+     "What would you do in my situation?"],
+
+    # Music recommendation
+    ["What's a good album to listen to while working?",
+     "Something without lyrics.",
+     "I like jazz but also electronic.",
+     "Perfect, thanks."],
+
+    # Movie recommendation
+    ["I want to watch a movie tonight.",
+     "Something thrilling but not gory.",
+     "I've already seen Inception.",
+     "Is that one on Netflix?"],
+
+    # Travel planning
+    ["I want to plan a trip to Europe.",
+     "I have two weeks and a moderate budget.",
+     "I've never been to Italy.",
+     "What cities are must-see?",
+     "How many days in Rome is enough?"],
+
+    # Parenting question
+    ["My toddler won't eat vegetables.",
+     "She's three years old.",
+     "I've tried hiding them in food.",
+     "Any other tricks?"],
+
+    # Sleep problems
+    ["I can't fall asleep at night.",
+     "I've tried no screens before bed.",
+     "I wake up around three a.m. too.",
+     "Could it be stress?"],
+
+    # Plant care
+    ["My houseplant leaves are turning yellow.",
+     "It's a pothos.",
+     "I water it twice a week.",
+     "Is that too much?"],
+
+    # Gaming discussion
+    ["What's a good game for someone who doesn't play much?",
+     "I like puzzles and story-driven games.",
+     "Nothing too violent.",
+     "Is it available on PC?"],
+
+    # Mindfulness / meditation
+    ["I want to try meditation but don't know how.",
+     "How long should I meditate each day?",
+     "Can I do it while lying down?",
+     "What if my mind keeps wandering?"],
+
+    # Shopping advice
+    ["I need to buy a new laptop.",
+     "My budget is around a thousand dollars.",
+     "I mostly use it for writing and video calls.",
+     "Do I need a Mac or is Windows fine?"],
+
+    # Car trouble
+    ["My car makes a clicking noise when I turn.",
+     "It's louder when I turn left.",
+     "The car is about seven years old.",
+     "Is it expensive to fix?"],
+
+    # News / current events style
+    ["What causes inflation?",
+     "How does raising interest rates help?",
+     "Does it always work?"],
+
+    # Creative writing help
+    ["Help me come up with a villain for my story.",
+     "The story is set in a futuristic city.",
+     "I want the villain to have a sympathetic motive.",
+     "Maybe something related to inequality?"],
+
+    # Interruptions with topic change
+    ["Actually wait, forget what I said.",
+     "I want to ask something different.",
+     "What time is it in London right now?",
+     "Thanks."],
+
+    # Step-by-step instructions
+    ["How do I set up a new iPhone?",
+     "Do I need my old phone nearby?",
+     "What if I forgot my Apple ID password?",
+     "Can I skip the iCloud restore?"],
+
+    # Minimalist acknowledgment turns (tests silence / short audio)
+    ["Sure.",
+     "Mm-hmm.",
+     "Right.",
+     "Got it.",
+     "Okay."],
+
+    # Finance budgeting
+    ["I spend more than I earn every month.",
+     "I make about four thousand dollars a month.",
+     "Rent is two thousand.",
+     "What's a realistic savings target?"],
 ]
 
 

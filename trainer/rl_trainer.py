@@ -15,7 +15,9 @@ the conversation history between steps.
 
 from __future__ import annotations
 
+import csv
 import os
+import random
 import re
 import time
 import uuid
@@ -51,6 +53,8 @@ from .rewards import RewardFn
 
 # OpenAI Realtime API uses 24 kHz PCM16 for both input and output audio.
 _GPT_SAMPLE_RATE = 24_000
+
+_PUNCT_RE = re.compile(r'[.!?,;:]')
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +159,13 @@ class TrainerConfig:
 
     debug_dir: str = "./debug"
     """Root directory for debug audio exports (created automatically)."""
+
+    silence_inject_lambda_knob: float = 0.15
+    """Probability applied to two exploration heuristics per LLM call:
+    1. Truncate generated text at its last punctuation mark.
+    2. Force silence when the previous bot block ended with a sentence-ending
+       punctuation (.!?), giving the user the floor.
+    Set to 0.0 to disable both."""
 
     tts_model: str = ""
     """Piper TTS model path used for GPTVoiceSimulator real-time episodes.
@@ -265,6 +276,7 @@ class VirtualSimulationConnection:
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
+        silence_inject_lambda_knob: float = 0.0,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -273,6 +285,7 @@ class VirtualSimulationConnection:
         self.vllm_temperature = vllm_temperature
         self.tts_model = tts_model
         self.device = device
+        self.silence_inject_lambda_knob = silence_inject_lambda_knob
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -288,6 +301,30 @@ class VirtualSimulationConnection:
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
             last_context_version[0] = agent.context_version
+            lam = self.silence_inject_lambda_knob
+
+            # Silence injection: if the last bot block ended at a sentence boundary,
+            # randomly yield the floor back to the user.
+            if lam > 0.0 and random.random() < lam:
+                last_bot = next(
+                    (b for b in reversed(agent.blocks) if b.assistant_text), None
+                )
+                if last_bot and last_bot.assistant_text.rstrip().endswith(('.', '!', '?')):
+                    ptok = self.tokenizer.encode(
+                        system_prompt + "\n\n" + user_message, add_special_tokens=False
+                    )
+                    steps.append(StepRecord(
+                        step_id=str(uuid.uuid4())[:8],
+                        prompt_text=system_prompt + "\n\n" + user_message,
+                        full_prompt_tokens=ptok,
+                        response_token_ids=[],
+                        log_probs=[],
+                        is_idle=True,
+                        source_block_id=agent._latest_user_source_block_id,
+                        user_spoke_before=user_spoke,
+                    ))
+                    return ""
+
             text, ptok, rtok, lps = llm_generate_train(
                 system_prompt,
                 user_message,
@@ -296,6 +333,16 @@ class VirtualSimulationConnection:
                 max_tokens=self.vllm_max_tokens,
                 temperature=self.vllm_temperature,
             )
+
+            # Punctuation truncation: cut text at its last punctuation mark.
+            if text and lam > 0.0 and random.random() < lam:
+                matches = list(_PUNCT_RE.finditer(text))
+                if matches:
+                    text = text[:matches[-1].end()]
+                    trunc_ids = self.tokenizer.encode(text, add_special_tokens=False)
+                    rtok = trunc_ids
+                    lps = lps[:len(trunc_ids)]
+
             steps.append(StepRecord(
                 step_id=str(uuid.uuid4())[:8],
                 prompt_text=system_prompt + "\n\n" + user_message,
@@ -303,7 +350,7 @@ class VirtualSimulationConnection:
                 response_token_ids=rtok,
                 log_probs=lps,
                 is_idle=(not text),
-                source_block_id=agent._latest_user_source_block_id,  # late binding ↓
+                source_block_id=agent._latest_user_source_block_id,
                 user_spoke_before=user_spoke,
             ))
             return text
@@ -397,6 +444,7 @@ class RealTimeGPTEpisodeRunner:
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
+        silence_inject_lambda_knob: float = 0.0,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -405,6 +453,7 @@ class RealTimeGPTEpisodeRunner:
         self.vllm_temperature = vllm_temperature
         self.tts_model = tts_model
         self.device = device
+        self.silence_inject_lambda_knob = silence_inject_lambda_knob
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -418,6 +467,28 @@ class RealTimeGPTEpisodeRunner:
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
             last_context_version[0] = agent.context_version
+            lam = self.silence_inject_lambda_knob
+
+            if lam > 0.0 and random.random() < lam:
+                last_bot = next(
+                    (b for b in reversed(agent.blocks) if b.assistant_text), None
+                )
+                if last_bot and last_bot.assistant_text.rstrip().endswith(('.', '!', '?')):
+                    ptok = self.tokenizer.encode(
+                        system_prompt + "\n\n" + user_message, add_special_tokens=False
+                    )
+                    steps.append(StepRecord(
+                        step_id=str(uuid.uuid4())[:8],
+                        prompt_text=system_prompt + "\n\n" + user_message,
+                        full_prompt_tokens=ptok,
+                        response_token_ids=[],
+                        log_probs=[],
+                        is_idle=True,
+                        source_block_id=agent._latest_user_source_block_id,
+                        user_spoke_before=user_spoke,
+                    ))
+                    return ""
+
             text, ptok, rtok, lps = llm_generate_train(
                 system_prompt,
                 user_message,
@@ -426,6 +497,15 @@ class RealTimeGPTEpisodeRunner:
                 max_tokens=self.vllm_max_tokens,
                 temperature=self.vllm_temperature,
             )
+
+            if text and lam > 0.0 and random.random() < lam:
+                matches = list(_PUNCT_RE.finditer(text))
+                if matches:
+                    text = text[:matches[-1].end()]
+                    trunc_ids = self.tokenizer.encode(text, add_special_tokens=False)
+                    rtok = trunc_ids
+                    lps = lps[:len(trunc_ids)]
+
             steps.append(StepRecord(
                 step_id=str(uuid.uuid4())[:8],
                 prompt_text=system_prompt + "\n\n" + user_message,
@@ -740,6 +820,7 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
+                    silence_inject_lambda_knob=self.config.silence_inject_lambda_knob,
                 )
             else:
                 runner = VirtualSimulationConnection(
@@ -750,6 +831,7 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
+                    silence_inject_lambda_knob=self.config.silence_inject_lambda_knob,
                 )
             try:
                 ep = runner.run_episode()
@@ -1009,9 +1091,11 @@ class FullDuplexRLTrainer:
         torch.cuda.empty_cache()
 
         self._step_count += 1
+        all_rewards = [s.reward for e in episodes for s in e.steps if s.reward is not None]
         metrics = {
             "step": float(self._step_count),
             "loss": loss_val,
+            "avg_reward": float(sum(all_rewards) / len(all_rewards)) if all_rewards else 0.0,
             "baseline": self._baseline,
             "n_episodes": float(len(episodes)),
             "n_steps_total": float(sum(len(e.steps) for e in episodes)),
@@ -1040,6 +1124,20 @@ class FullDuplexRLTrainer:
         print(f"[trainer] checkpoint saved → {save_path}")
         return save_path
 
+    def _export_rewards_csv(self, history: List[Dict[str, float]], filename: str = "rewards.csv") -> str:
+        """Write per-step metrics history to a CSV file in output_dir."""
+        path = os.path.join(self.config.output_dir, filename)
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        if not history:
+            return path
+        fieldnames = list(history[0].keys())
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(history)
+        print(f"[trainer] rewards CSV saved → {path}")
+        return path
+
     def train(self, num_steps: int) -> List[Dict[str, float]]:
         """Run num_steps REINFORCE updates (random sampling). Returns per-step metrics."""
         history: List[Dict[str, float]] = []
@@ -1049,6 +1147,7 @@ class FullDuplexRLTrainer:
             if n > 0 and self._step_count % n == 0:
                 self.save_checkpoint()
         self.save_checkpoint(tag="final")
+        self._export_rewards_csv(history)
         return history
 
     def train_epochs(self, num_epochs: int, shuffle: bool = True) -> List[Dict[str, float]]:
@@ -1069,6 +1168,7 @@ class FullDuplexRLTrainer:
                 if n > 0 and self._step_count % n == 0:
                     self.save_checkpoint()
         self.save_checkpoint(tag="final")
+        self._export_rewards_csv(history)
         return history
 
     # ------------------------------------------------------------------

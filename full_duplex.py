@@ -624,6 +624,34 @@ class DuplexAudioAgent:
                     break
         return " ".join(tokens)
 
+    def _strip_boundary_duplicates(self, n_rolling: int) -> None:
+        """Remove leading words from a block that duplicate the trailing word of the prior block.
+
+        Operates on self.blocks (historical text), not the windows dict, so it
+        catches cases where a frozen block kept a stale word that later drifted
+        into the mutable block that follows it.  Only scans the recent window to
+        keep this O(n_rolling).
+        """
+        start = max(0, len(self.blocks) - n_rolling - 1)
+        for i in range(start, len(self.blocks) - 1):
+            prev = self.blocks[i]
+            curr = self.blocks[i + 1]
+            if not prev.user_text or not curr.user_text:
+                continue
+            prev_words = prev.user_text.split()
+            curr_words = curr.user_text.split()
+            changed = False
+            while prev_words and curr_words and self._norm(prev_words[-1]) == self._norm(curr_words[0]):
+                curr_words.pop(0)
+                changed = True
+            if changed:
+                new_text = " ".join(curr_words)
+                print(
+                    f"[asr→dedup] block@{curr.start_ts:.1f} stripped leading duplicate "
+                    f"from {curr.user_text!r} → {new_text!r}"
+                )
+                curr.user_text = new_text
+
     def _deduplicate_block_boundary(self, windows: dict, n_rolling: int) -> None:
         """Drop first word of first-mutable block when it duplicates last word of frozen-boundary block.
 
@@ -794,6 +822,16 @@ class DuplexAudioAgent:
                             latest_changed_target = target
             else:
                 print(f"[asr] no matching block for start_ts={block_start_ts:.1f}")
+
+        # Fix D: strip duplicate boundary words from historical block text.
+        # When Parakeet's timestamp for a word drifts across a block boundary between
+        # ASR passes, the word ends up in BOTH the tail of the previous block and the
+        # head of the next block — the previous block keeps its stale text (because it
+        # may be frozen or guarded by _speech_frozen) while the new pass assigns the
+        # same word to the next block.  _deduplicate_block_boundary only covers the
+        # one frozen/mutable boundary in the windows dict; this pass covers all
+        # consecutive pairs in the actual historical block list.
+        self._strip_boundary_duplicates(n_rolling)
 
         # Fix B: suppress flush when user content is unchanged across rolling blocks.
         # Same words in different block slots (NeMo timestamp drift) must not restart the LLM.
