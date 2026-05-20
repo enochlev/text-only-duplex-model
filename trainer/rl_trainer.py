@@ -168,7 +168,7 @@ class TrainerConfig:
     """Thread-pool size for parallel reward evaluation.
     0 = auto (min(32, cpu_count)). Set to 1 to disable parallelism."""
 
-    silence_inject_lambda_knob: float = 0.15
+    silence_inject_lambda_knob: float = 0.25
     """Probability applied to two exploration heuristics per LLM call:
     1. Truncate generated text at its last punctuation mark.
     2. Force silence when the previous bot block ended with a sentence-ending

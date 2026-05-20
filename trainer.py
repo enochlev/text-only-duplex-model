@@ -60,9 +60,9 @@ def main() -> None:
     parser.add_argument("--debug-dir", default="./debug",
                         help="Directory for debug audio exports (default: ./debug)")
     parser.add_argument(
-        "--silence-lambda", type=float, default=0.15,
+        "--silence-lambda", type=float, default=0.25,
         help="Probability for silence-injection heuristics: truncate at punctuation "
-             "and force silence after sentence-ending bot blocks (default: 0.15, 0=off)",
+             "and force silence after sentence-ending bot blocks (default: 0.25 , 0=off)",
     )
     args = parser.parse_args()
 
@@ -74,7 +74,7 @@ def main() -> None:
         learning_rate=args.lr,
         kl_coeff=args.kl_coeff,
         episodes_per_train_step=args.episodes_per_step,
-        max_seq_len=712,
+        max_seq_len=812,
         device="cuda",
         output_dir=args.output_dir,
         save_every_n_steps=args.save_every,
