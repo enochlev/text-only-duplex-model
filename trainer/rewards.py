@@ -44,43 +44,6 @@ Returns:
 """
 
 
-def latency_reward(
-    block: DuplexAudioBlock,
-    history: List[DuplexAudioBlock],
-    is_terminal: bool,
-) -> float:
-    """Penalise high end-to-end (ASR-start → audio-ready) latency."""
-    if block.total_latency_s is not None and block.total_latency_s > 0:
-        return -block.total_latency_s
-    return 0.0
-
-
-def idle_penalty(
-    block: DuplexAudioBlock,
-    history: List[DuplexAudioBlock],
-    is_terminal: bool,
-) -> float:
-    """Small constant penalty for empty blocks — prevents always-silent policy."""
-    return -0.1 if not block.assistant_text else 0.0
-
-
-def response_length_reward(
-    block: DuplexAudioBlock,
-    history: List[DuplexAudioBlock],
-    is_terminal: bool,
-) -> float:
-    """Smooth penalty for deviation from the target response length.
-
-    Uses a quadratic bowl centred on TARGET_WORDS so the gradient always
-    points toward the sweet spot rather than a hard cliff.  Max penalty
-    is capped at -0.3 so it doesn't dominate turn-taking signals.
-    """
-    if not block.assistant_text:
-        return 0.0
-    TARGET_WORDS = 5
-    words = len(block.assistant_text.split())
-    penalty = -0.005 * (words - TARGET_WORDS) ** 2
-    return max(penalty, -0.3)
 
 
 def respond_after_user_reward(
@@ -99,41 +62,6 @@ def respond_after_user_reward(
     user_spoke_2ago = _user_finished_in(history[-2])
     return -0.3 if user_spoke_2ago else 0.0
 
-
-def overlap_penalty(
-    block: DuplexAudioBlock,
-    history: List[DuplexAudioBlock],
-    is_terminal: bool,
-) -> float:
-    """Penalise talking over the user in consecutive blocks.
-
-    A 'user block' is one where the user spoke more than 2 words.
-    If the bot has assistant_text while the user is actively speaking,
-    that is overlap. The penalty escalates with consecutive overlap length:
-      1 block  → -0.05  (hard to avoid in full-duplex, mild signal)
-      2 blocks → -0.20  (clearly talking over)
-      3+ blocks → -0.50  (sustained interruption, strong signal)
-    """
-    def _user_active(b: DuplexAudioBlock) -> bool:
-        return len((b.user_text or "").split()) > 2
-
-    if not block.assistant_text or not _user_active(block):
-        return 0.0
-
-    prior_run = 0
-    for prev in reversed(history):
-        if prev.assistant_text and _user_active(prev):
-            prior_run += 1
-        else:
-            break
-
-    run_length = prior_run + 1
-    if run_length == 1:
-        return -0.05
-    elif run_length == 2:
-        return -0.20
-    else:
-        return -0.50
 
 
 def first_sentence_reward(
@@ -272,6 +200,19 @@ def _vad_turn_complete(
 
 def _vad_overlap(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional[bool]:
     """pyannote OSD: True if user and bot were speaking simultaneously, None on failure."""
+    score = _vad_overlap_score(mic_audio, tts_audio)
+    if score is None:
+        return None
+    return score > 0.08
+
+
+def _vad_overlap_score(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional[float]:
+    """pyannote OSD: returns overlap_ratio (0.0–1.0) as soft product of top-2 speaker scores.
+
+    High value means both speakers were clearly active simultaneously.
+    Near-zero for backchannels or single-speaker audio.
+    Returns None on server failure.
+    """
     global _overlap_fail_count
     if _overlap_fail_count >= _VAD_RETRY_AFTER:
         return None
@@ -288,44 +229,13 @@ def _vad_overlap(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional[bool]
             _VAD_TIMEOUT_S,
         )
         _overlap_fail_count = 0
-        return bool(data["overlap"])
+        return float(data.get("overlap_ratio", 0.0))
     except Exception:
         _overlap_fail_count += 1
         return None
 
 
 _RMS_SILENCE = 1e-4  # below this RMS on both channels → silence, skip pyannote
-
-
-def _user_speaking(block: DuplexAudioBlock) -> bool:
-    """True if user and bot were speaking simultaneously (overlap detected).
-
-    Uses pyannote OSD when both channels are non-silent (production audio).
-    Falls back to ASR word-count heuristic in simulation (zero mic/tts audio)
-    and when the VAD server is unreachable.
-    """
-    mic = block.mic_audio
-    tts = block.tts_audio
-    if mic is not None and len(mic) > 0 and tts is not None and len(tts) > 0:
-        tts_f32 = tts.astype(np.float32)
-        if tts.dtype == np.int16:
-            tts_f32 = tts_f32 / 32768.0
-        mic_f32 = mic.astype(np.float32)
-        # Silence check — simulation fills both arrays with zeros; skip pyannote
-        # so the ASR word-count fallback below still fires during training.
-        if (np.sqrt(np.mean(mic_f32 ** 2)) > _RMS_SILENCE
-                or np.sqrt(np.mean(tts_f32 ** 2)) > _RMS_SILENCE):
-            result = _vad_overlap(mic_f32, tts_f32)
-            if result is not None:
-                return result
-    # ASR fallback: user is interrupting only if they have words AND haven't
-    # finished their turn.  Namo is text-based so this works in simulation.
-    # Without the turn-complete check, complete short sentences (e.g. "My
-    # laptop keeps freezing.") would falsely trigger interruption_penalty.
-    words = (block.user_text or "").split()
-    if len(words) <= 2:
-        return False
-    return not _user_finished_in(block)
 
 
 def _user_finished_in(block: DuplexAudioBlock) -> bool:
@@ -352,30 +262,75 @@ def interruption_penalty(
     history: List[DuplexAudioBlock],
     is_terminal: bool,
 ) -> float:
-    """Penalise speaking while the user's turn is still in progress.
+    """Block-level crossover penalty — escalates when both parties speak simultaneously.
 
-    Uses smart-turn audio VAD when available; falls back to ASR word count.
-    Escalates with consecutive interruption run length:
-      1 block  → -0.15
-      2 blocks → -0.35
-      3+ blocks → -0.65
+    Only fires when BOTH user and bot have text in the current block.
+    Does NOT penalise the bot for staying silent.
+
+    Consecutive simultaneous-speech run length:
+      1 block  → -0.05  (single overlap, may be unavoidable in full-duplex)
+      2 blocks → -0.15
+      3 blocks → -0.35
+      4+ blocks → -0.65
     """
-    if not block.assistant_text or not _user_speaking(block):
+    if not block.assistant_text or not block.user_text:
         return 0.0
 
-    prior_run = 0
+    run = 1
     for prev in reversed(history):
-        if prev.assistant_text and _user_speaking(prev):
-            prior_run += 1
+        if prev.user_text and prev.assistant_text:
+            run += 1
         else:
             break
 
-    run_length = prior_run + 1
-    if run_length == 1:
+    if run == 1:
+        return -0.05
+    if run == 2:
         return -0.15
-    if run_length == 2:
+    if run == 3:
         return -0.35
     return -0.65
+
+
+def interruption_penalty_overlap(
+    block: DuplexAudioBlock,
+    _history: List[DuplexAudioBlock],
+    is_terminal: bool,
+) -> float:
+    """Progressive VAD penalty proportional to the pyannote overlap ratio.
+
+    Trains the model to speak only when the VAD signal is low (user not
+    actively holding the floor). Uses the soft product of pyannote's top-2
+    per-frame speaker scores, so backchannels ("ya", "ok") produce near-zero
+    penalty while genuine floor-takes produce high penalty.
+
+    Only fires when BOTH user AND bot have text AND audio is non-silent.
+    Falls back to 0.0 when audio is zeroed (simulation) or server is down.
+
+    Penalty = -overlap_ratio  (range: 0.0 to -1.0)
+    """
+    if not block.assistant_text or not block.user_text:
+        return 0.0
+
+    mic = block.mic_audio
+    tts = block.tts_audio
+    if mic is None or len(mic) == 0 or tts is None or len(tts) == 0:
+        return 0.0
+
+    mic_f32 = mic.astype(np.float32)
+    tts_f32 = tts.astype(np.float32)
+    if tts.dtype == np.int16:
+        tts_f32 = tts_f32 / 32768.0
+
+    if (np.sqrt(np.mean(mic_f32 ** 2)) <= _RMS_SILENCE
+            and np.sqrt(np.mean(tts_f32 ** 2)) <= _RMS_SILENCE):
+        return 0.0
+
+    ratio = _vad_overlap_score(mic_f32, tts_f32)
+    if ratio is None:
+        return 0.0
+
+    return -ratio
 
 
 def silence_too_long_penalty(

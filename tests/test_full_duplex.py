@@ -219,6 +219,17 @@ def test_update_pending_queue_nonempty_strips_echo():
     assert agent._pending_words == ["what", "is", "up"]
 
 
+def test_update_pending_queue_strips_normalized_suffix_overlap():
+    """Queue empty: strip replayed committed suffix despite punctuation/case drift."""
+    agent = make_agent()
+    agent._committed_words = ["Yeah", "here."]
+    agent._pending_words = []
+
+    agent._update_pending_queue(["yeah", "here,", "what", "is", "up?"])
+
+    assert agent._pending_words == ["what", "is", "up?"]
+
+
 def test_update_pending_queue_nonempty_mismatch():
     """Queue non-empty: proposal diverges → replace from mismatch point."""
     agent = make_agent()

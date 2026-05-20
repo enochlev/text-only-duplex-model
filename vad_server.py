@@ -221,9 +221,15 @@ def vad_overlap(req: OverlapRequest):
     data     = np.squeeze(scores.data)             # (frames, speakers)
     if data.ndim == 1:
         data = data[:, np.newaxis]
-    overlap_frames = (data > 0.5).sum(axis=-1) >= 2
-    ratio    = float(overlap_frames.mean()) if len(overlap_frames) > 0 else 0.0
-    return {"overlap": ratio > 0.1, "overlap_ratio": round(ratio, 4)}
+    if data.shape[1] >= 2:
+        sorted_scores = np.sort(data, axis=-1)           # ascending per frame
+        s1 = sorted_scores[:, -1]                        # highest-confidence speaker
+        s2 = sorted_scores[:, -2]                        # second-highest speaker
+        soft_overlap = s1 * s2                           # near-zero unless both are active
+    else:
+        soft_overlap = np.zeros(data.shape[0], dtype=np.float32)
+    ratio    = float(soft_overlap.mean()) if len(soft_overlap) > 0 else 0.0
+    return {"overlap": ratio > 0.08, "overlap_ratio": round(ratio, 4)}
 
 
 # ---------------------------------------------------------------------------

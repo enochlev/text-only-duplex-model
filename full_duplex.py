@@ -538,6 +538,24 @@ class DuplexAudioAgent:
     def _norm(self, text: str) -> str:
         return self._normalize(text).strip()
 
+    def _queue_word_key(self, word: str) -> str:
+        normalized = self._normalize(word).lower().strip()
+        stripped = re.sub(r"^[^a-z0-9']+", "", normalized)
+        stripped = re.sub(r"[^a-z0-9']+$", "", stripped)
+        return stripped or normalized
+
+    def _shared_suffix_prefix_len(self, left: List[str], right: List[str]) -> int:
+        max_overlap = min(len(left), len(right))
+        if max_overlap == 0:
+            return 0
+
+        left_keys = [self._queue_word_key(word) for word in left]
+        right_keys = [self._queue_word_key(word) for word in right]
+        for size in range(max_overlap, 0, -1):
+            if left_keys[-size:] == right_keys[:size]:
+                return size
+        return 0
+
     # ------------------------------------------------------------------
     # TTS
     # ------------------------------------------------------------------
@@ -841,28 +859,15 @@ class DuplexAudioAgent:
     def _update_pending_queue(self, proposal_words: List[str]) -> None:
         committed = self._committed_words
 
-        if self._pending_words:
-            committed_overlap = 0
-            for cw, pw in zip(committed, proposal_words):
-                if self._norm(pw) == cw:
-                    committed_overlap += 1
-                else:
-                    break
-            proposal_tail = proposal_words[committed_overlap:]
-        else:
-            matched = 0
-            proposal_tail = []
-            for i, pw in enumerate(proposal_words):
-                if matched < len(committed) and self._norm(pw) == committed[matched]:
-                    matched += 1
-                else:
-                    proposal_tail = proposal_words[i:]
-                    break
+        committed_overlap = self._shared_suffix_prefix_len(committed, proposal_words)
+        proposal_tail = proposal_words[committed_overlap:]
 
         proposal_tail_norm = [self._norm(w) for w in proposal_tail]
+        pending_keys = [self._queue_word_key(word) for word in self._pending_words]
+        proposal_tail_keys = [self._queue_word_key(word) for word in proposal_tail_norm]
 
         mismatch_idx = min(len(self._pending_words), len(proposal_tail_norm))
-        for i, (qw, pw) in enumerate(zip(self._pending_words, proposal_tail_norm)):
+        for i, (qw, pw) in enumerate(zip(pending_keys, proposal_tail_keys)):
             if qw != pw:
                 mismatch_idx = i
                 break

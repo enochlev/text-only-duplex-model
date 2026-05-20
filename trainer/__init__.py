@@ -18,10 +18,10 @@ from .rewards import (
     idle_penalty,
     response_length_reward,
     respond_after_user_reward,
-    overlap_penalty,
     first_sentence_reward,
     coherence_reward,
     interruption_penalty,
+    interruption_penalty_overlap,
     silence_too_long_penalty,
 )
 from .data_ingestion import (
@@ -49,10 +49,10 @@ __all__ = [
     "idle_penalty",
     "response_length_reward",
     "respond_after_user_reward",
-    "overlap_penalty",
     "first_sentence_reward",
     "coherence_reward",
     "interruption_penalty",
+    "interruption_penalty_overlap",
     "silence_too_long_penalty",
     # data_ingestion
     "EpisodeData",
