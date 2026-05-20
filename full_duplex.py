@@ -17,7 +17,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 from dotenv import load_dotenv
