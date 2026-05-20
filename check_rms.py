@@ -29,7 +29,6 @@ from full_duplex import (
 )
 from trainer.rewards import (
     respond_after_user_reward,
-    first_sentence_reward,
     interruption_penalty,
     interruption_penalty_overlap,
     silence_too_long_penalty,
@@ -106,32 +105,6 @@ _check(
 _check(
     "not enough history → 0.0",
     respond_after_user_reward(_blk(bot=""), [_blk(user="Hi.")], False),
-    0.0,
-)
-
-# ---------------------------------------------------------------------------
-# 2. first_sentence_reward
-# ---------------------------------------------------------------------------
-_section("first_sentence_reward")
-
-_check(
-    "sentence boundary mid-text → -0.2",
-    first_sentence_reward(_blk(bot="Hello! How can I help?"), [], False),
-    -0.2,
-)
-_check(
-    "punctuation at end → 0.0",
-    first_sentence_reward(_blk(bot="How can I help you today?"), [], False),
-    0.0,
-)
-_check(
-    "single word with punctuation at end → 0.0",
-    first_sentence_reward(_blk(bot="Sure!"), [], False),
-    0.0,
-)
-_check(
-    "empty bot → 0.0",
-    first_sentence_reward(_blk(bot=""), [], False),
     0.0,
 )
 

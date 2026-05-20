@@ -14,9 +14,6 @@ from .rl_trainer import (
 )
 from .rewards import (
     RewardFn,
-    latency_reward,
-    idle_penalty,
-    response_length_reward,
     respond_after_user_reward,
     coherence_reward,
     interruption_penalty,
