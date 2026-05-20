@@ -287,6 +287,44 @@ def preload_duplex_models(
     preload_asr_model()
 
 
+def piper_synthesize(voice: Any, text: str) -> tuple:
+    """Synthesize text with a loaded PiperVoice. Returns (sample_rate, int16_array).
+
+    Handles all known Piper Python API variants (synthesize / synthesize_stream_raw
+    / synthesize_wav) so callers outside DuplexAudioAgent can reuse this logic.
+    """
+    if hasattr(voice, "synthesize"):
+        sample_rate = getattr(getattr(voice, "config", None), "sample_rate", TTS_SAMPLE_RATE)
+        audio_chunks: List[bytes] = []
+        for chunk in voice.synthesize(text):
+            chunk_rate = getattr(chunk, "sample_rate", None)
+            if chunk_rate:
+                sample_rate = chunk_rate
+            audio_bytes = getattr(chunk, "audio_int16_bytes", b"")
+            if audio_bytes:
+                audio_chunks.append(audio_bytes)
+        return sample_rate, np.frombuffer(b"".join(audio_chunks), dtype=np.int16)
+
+    if hasattr(voice, "synthesize_stream_raw"):
+        audio_bytes = b"".join(voice.synthesize_stream_raw(text))
+        sample_rate = getattr(getattr(voice, "config", None), "sample_rate", TTS_SAMPLE_RATE)
+        return sample_rate, np.frombuffer(audio_bytes, dtype=np.int16)
+
+    if hasattr(voice, "synthesize_wav"):
+        import io
+        import wave as _wave
+        wav_buffer = io.BytesIO()
+        with _wave.open(wav_buffer, "wb") as wav_file:
+            voice.synthesize_wav(text, wav_file)
+        wav_buffer.seek(0)
+        with _wave.open(wav_buffer, "rb") as wav_file:
+            sample_rate = wav_file.getframerate()
+            audio_bytes = wav_file.readframes(wav_file.getnframes())
+        return sample_rate, np.frombuffer(audio_bytes, dtype=np.int16)
+
+    raise RuntimeError("Unsupported PiperVoice API: no synthesize method available")
+
+
 # ---------------------------------------------------------------------------
 # DuplexAudioAgent  (audio-in / audio-out — Piper TTS + Parakeet ASR)
 # ---------------------------------------------------------------------------
@@ -505,37 +543,7 @@ class DuplexAudioAgent:
     # ------------------------------------------------------------------
 
     def _synthesize_piper_audio(self, voice, text: str) -> tuple[int, np.ndarray]:
-        if hasattr(voice, "synthesize"):
-            sample_rate = getattr(getattr(voice, "config", None), "sample_rate", TTS_SAMPLE_RATE)
-            audio_chunks: List[bytes] = []
-            for chunk in voice.synthesize(text):
-                chunk_rate = getattr(chunk, "sample_rate", None)
-                if chunk_rate:
-                    sample_rate = chunk_rate
-                audio_bytes = getattr(chunk, "audio_int16_bytes", b"")
-                if audio_bytes:
-                    audio_chunks.append(audio_bytes)
-            return sample_rate, np.frombuffer(b"".join(audio_chunks), dtype=np.int16)
-
-        if hasattr(voice, "synthesize_stream_raw"):
-            audio_bytes = b"".join(voice.synthesize_stream_raw(text))
-            sample_rate = getattr(getattr(voice, "config", None), "sample_rate", TTS_SAMPLE_RATE)
-            return sample_rate, np.frombuffer(audio_bytes, dtype=np.int16)
-
-        if hasattr(voice, "synthesize_wav"):
-            import io
-            import wave
-
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as wav_file:
-                voice.synthesize_wav(text, wav_file)
-            wav_buffer.seek(0)
-            with wave.open(wav_buffer, "rb") as wav_file:
-                sample_rate = wav_file.getframerate()
-                audio_bytes = wav_file.readframes(wav_file.getnframes())
-            return sample_rate, np.frombuffer(audio_bytes, dtype=np.int16)
-
-        raise RuntimeError("Unsupported PiperVoice API: no synthesize method available")
+        return piper_synthesize(voice, text)
 
     def _generate_tts(self, text: str) -> tuple:
         """Returns (sample_rate, audio_int16, latency_s)."""

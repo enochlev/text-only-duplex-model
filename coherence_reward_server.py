@@ -35,13 +35,17 @@ load_dotenv()
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-MODEL_NAME = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3.5-4B")  # or "Qwen/Qwen2.5-Instruct"
-GAMMA      = float(os.getenv("COHERENCE_GAMMA", "0.9"))
-PORT       = int(os.getenv("COHERENCE_PORT", "10001"))
+MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3.5-4B")  # or "Qwen/Qwen2.5-Instruct"
+GAMMA           = float(os.getenv("COHERENCE_GAMMA", "0.9"))
+PORT            = int(os.getenv("COHERENCE_PORT", "10001"))
 # Normalize reward by subtracting the greedy log-prob at each position.
 # reward_i = log P(proposed_i) - log P(greedy_i), always in (-inf, 0].
 # 0 = matched teacher's best choice; more negative = teacher preferred something else.
-NORMALIZE  = True
+NORMALIZE       = True
+# Scale factor applied after per-token averaging. Brings the mean per-token
+# advantage (typically -4..0) into the same range as the other reward signals
+# (capped at ~-0.5). Set via COHERENCE_SCALE env var to tune without code changes.
+REWARD_SCALE    = float(os.getenv("COHERENCE_SCALE", "0.2"))
 
 # Tokens the chat template appends after the assistant turn (stripped when
 # locating the proposed block inside the full token sequence).
@@ -56,17 +60,29 @@ _tokenizer: AutoTokenizer | None     = None
 _end_ids: set[int]                   = set()
 
 
+def _detect_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
     global _model, _tokenizer, _end_ids
 
+    device = _detect_device()
+    print(f"[coherence] device: {device}")
+    dtype      = torch.float32 if device == "cpu" else torch.float16
+    device_map = "auto" if device == "cuda" else device
+
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    device = os.getenv("COHERENCE_DEVICE", "auto")
-    dtype  = torch.float32 if device == "cpu" else torch.float16
     _model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         dtype=dtype,
-        device_map=device,
+        device_map=device_map,
         trust_remote_code=True,
         attn_implementation="eager",  # MPS can't handle GQA in fused kernels
     )
@@ -231,11 +247,15 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
             lp -= log_probs[p - 1].max().item()  # subtract greedy log-prob → advantage in (-inf, 0]
         token_log_probs.append(lp)
 
-    reward = sum(req.gamma ** i * lp for i, lp in enumerate(token_log_probs))
+    n_tokens = len(token_log_probs)
+    raw = sum(req.gamma ** i * lp for i, lp in enumerate(token_log_probs))
+    # Divide by n_tokens → mean per-token advantage (length-invariant, in (-inf, 0]).
+    # Then scale to match the magnitude of the other reward signals.
+    reward = (raw / n_tokens) * REWARD_SCALE if n_tokens > 0 else 0.0
 
     return RewardResponse(
         reward=reward,
-        n_tokens=len(token_log_probs),
+        n_tokens=n_tokens,
         token_log_probs=token_log_probs,
     )
 

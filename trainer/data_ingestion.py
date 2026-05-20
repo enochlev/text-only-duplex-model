@@ -26,7 +26,7 @@ from typing import Any, Iterator, List, Optional, Tuple
 
 import numpy as np
 
-from full_duplex import ASR_SAMPLE_RATE
+from full_duplex import ASR_SAMPLE_RATE, TTS_MODEL, preload_piper_voice, piper_synthesize, _resample
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +174,8 @@ class ScriptTTSSource:
         block_s: float = 2.0,
         wpm: int = 150,
         source_id: Optional[str] = None,
+        tts_model: str = "",
+        device: Optional[str] = None,
     ) -> None:
         self.script_lines = script_lines
         self.inter_turn_pause_s = inter_turn_pause_s
@@ -182,18 +184,27 @@ class ScriptTTSSource:
         self.block_s = block_s
         self.wpm = wpm
         self.source_id = source_id
+        self.tts_model = tts_model or TTS_MODEL
+        self.device = device
 
     def load(self) -> EpisodeData:
+        voice = preload_piper_voice(tts_model=self.tts_model, device=self.device)
         segments: List[np.ndarray] = []
         word_timestamps: List[Tuple[float, float, str]] = []
         t = 0.0
         for line in self.script_lines:
-            dur = _wpm_duration_s(line, self.wpm)
-            seg = np.zeros(int(dur * ASR_SAMPLE_RATE), dtype=np.float32)
-            word_timestamps.extend(_estimate_word_timestamps(line, t, t + dur, self.wpm))
-            segments.append(seg)
+            sr, audio_int16 = piper_synthesize(voice, line)
+            audio_f32 = audio_int16.astype(np.float32) / 32767.0
+            if sr != ASR_SAMPLE_RATE:
+                audio_f32 = _resample(audio_f32, sr, ASR_SAMPLE_RATE)
+            dur = len(audio_f32) / ASR_SAMPLE_RATE
+            # ±15% WPM jitter for word timestamp estimation.
+            jittered_wpm = max(60, int(self.wpm * random.uniform(0.85, 1.15)))
+            word_timestamps.extend(_estimate_word_timestamps(line, t, t + dur, jittered_wpm))
+            segments.append(audio_f32)
             t += dur
-            pause_s = self.inter_turn_pause_s
+            # ±40% pause jitter — trains the model on tight and loose turn windows.
+            pause_s = max(1.0, self.inter_turn_pause_s * random.uniform(0.6, 1.4))
             segments.append(np.zeros(int(pause_s * ASR_SAMPLE_RATE), dtype=np.float32))
             t += pause_s
         audio = np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
@@ -579,6 +590,8 @@ class DataPool:
         block_s: float = 2.0,
         wpm: int = 150,
         gpt_model: str = "gpt-4o-realtime-preview",
+        tts_model: str = "",
+        device: Optional[str] = None,
     ) -> "DataPool":
         """Build a DataPool from raw lists of scripts, WAV paths, and GPT prompts.
 
@@ -604,6 +617,8 @@ class DataPool:
                 block_s=block_s,
                 wpm=wpm,
                 source_id=f"script_{i:02d}",
+                tts_model=tts_model,
+                device=device,
             ))
             weights.append(script_weight / max(1, len(scripts or [])))
 
@@ -729,6 +744,8 @@ def make_default_data_pool(
     max_episode_s: float = 72.0,
     block_s: float = 2.0,
     wpm: int = 150,
+    tts_model: str = "",
+    device: Optional[str] = None,
 ) -> DataPool:
     """Build a DataPool from the built-in TRAINING_SCRIPTS."""
     sources = [
@@ -740,6 +757,8 @@ def make_default_data_pool(
             block_s=block_s,
             wpm=wpm,
             source_id=f"script_{i:02d}",
+            tts_model=tts_model,
+            device=device,
         )
         for i, lines in enumerate(TRAINING_SCRIPTS)
     ]

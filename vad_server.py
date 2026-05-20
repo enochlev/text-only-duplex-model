@@ -123,28 +123,16 @@ def _infer_smart_turn(audio: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 # pyannote OSD
 # ---------------------------------------------------------------------------
-_osd_pipeline = None
+_osd_inference = None
 
 
-def _load_pyannote(hf_token: str) -> None:
-    global _osd_pipeline
-    try:
-        _orig_load = torch.load
-        torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "weights_only": False})
-        from pyannote.audio import Model
-        from pyannote.audio.pipelines import OverlappedSpeechDetection
-        print("[vad_server] loading pyannote/segmentation-3.0 …")
-        model       = Model.from_pretrained("pyannote/segmentation-3.0",
-                                            token=hf_token)
-        _osd_pipeline = OverlappedSpeechDetection(segmentation=model)
-        _osd_pipeline.instantiate({"min_duration_on": 0.0, "min_duration_off": 0.0})
-        torch.load  = _orig_load
-        print("[vad_server] pyannote OSD ready")
-    except Exception as exc:
-        try: torch.load = _orig_load        # noqa: E701
-        except NameError: pass
-        print(f"[vad_server] pyannote OSD unavailable — {exc!r}")
-        print("[vad_server] /vad/overlap will return 503; ASR fallback active")
+def _load_pyannote() -> None:
+    global _osd_inference
+    from pyannote.audio import Model, Inference
+    print("[vad_server] loading pyannote/segmentation-3.0 …")
+    model = Model.from_pretrained("pyannote/segmentation-3.0")
+    _osd_inference = Inference(model, duration=10.0, step=2.5)
+    print("[vad_server] pyannote OSD ready")
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +207,7 @@ class OverlapRequest(BaseModel):
 
 @app.post("/vad/overlap")
 def vad_overlap(req: OverlapRequest):
-    if _osd_pipeline is None:
+    if _osd_inference is None:
         raise HTTPException(503, "pyannote OSD not loaded")
     mic = np.clip(_decode_audio(req.mic_b64), -1.0, 1.0)
     tts = np.clip(_decode_audio(req.tts_b64), -1.0, 1.0)
@@ -228,10 +216,13 @@ def vad_overlap(req: OverlapRequest):
     tts = np.pad(tts, (0, n - len(tts)))
     mixed    = np.clip(mic + tts, -1.0, 1.0)
     waveform = torch.tensor(mixed).float().unsqueeze(0)
-    osd      = _osd_pipeline({"waveform": waveform, "sample_rate": req.sample_rate})
-    total_s  = n / req.sample_rate
-    overlap_s = sum(seg.duration for seg in osd.get_timeline().support())
-    ratio    = overlap_s / total_s if total_s > 0 else 0.0
+    scores   = _osd_inference({"waveform": waveform, "sample_rate": req.sample_rate})
+    # scores.data: (frames, num_speakers) — overlap when ≥2 speakers exceed threshold
+    data     = np.squeeze(scores.data)             # (frames, speakers)
+    if data.ndim == 1:
+        data = data[:, np.newaxis]
+    overlap_frames = (data > 0.5).sum(axis=-1) >= 2
+    ratio    = float(overlap_frames.mean()) if len(overlap_frames) > 0 else 0.0
     return {"overlap": ratio > 0.1, "overlap_ratio": round(ratio, 4)}
 
 
@@ -248,7 +239,7 @@ def main() -> None:
 
     _load_namo()
     _load_smart_turn(args.smart_turn_model)
-    _load_pyannote(os.environ.get("HF_TOKEN", ""))
+    _load_pyannote()
 
     print(f"[vad_server] /vad/complete → backend={_BACKEND!r}")
     uvicorn.run(app, host=args.host, port=args.port)

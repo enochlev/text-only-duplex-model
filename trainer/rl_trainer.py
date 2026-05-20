@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -38,12 +39,18 @@ from full_duplex import (
     ASR_SAMPLE_RATE,
     MAX_MIC_BLOCKS,
     TTS_SAMPLE_RATE,
+    TTS_MODEL,
     DuplexAudioAgent,
     DuplexAudioBlock,
+    preload_piper_voice,
+    _resample,
 )
 
-from .data_ingestion import DataPool, _wpm_duration_s
+from .data_ingestion import DataPool, GPTVoiceSimulator, _wpm_duration_s
 from .rewards import RewardFn
+
+# OpenAI Realtime API uses 24 kHz PCM16 for both input and output audio.
+_GPT_SAMPLE_RATE = 24_000
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +156,10 @@ class TrainerConfig:
     debug_dir: str = "./debug"
     """Root directory for debug audio exports (created automatically)."""
 
+    tts_model: str = ""
+    """Piper TTS model path used for GPTVoiceSimulator real-time episodes.
+    Defaults to the full_duplex module default (en_US-danny-low) when empty."""
+
 
 # ---------------------------------------------------------------------------
 # vLLM generation with training metadata
@@ -252,12 +263,16 @@ class VirtualSimulationConnection:
         tokenizer: Any,
         vllm_max_tokens: int = 16,
         vllm_temperature: float = 1.0,
+        tts_model: str = "",
+        device: Optional[str] = None,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
         self.tokenizer = tokenizer
         self.vllm_max_tokens = vllm_max_tokens
         self.vllm_temperature = vllm_temperature
+        self.tts_model = tts_model
+        self.device = device
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -297,7 +312,7 @@ class VirtualSimulationConnection:
         wpm = self.simulator.wpm
         max_episode_s = self.simulator.max_episode_s
 
-        agent = _make_training_agent(wpm, block_s, intercepted_llm_fn)
+        agent = _make_training_agent(wpm, block_s, intercepted_llm_fn, self.tts_model, self.device)
         agent._now = lambda: sim_time[0]  # type: ignore[assignment]
 
         # Ground-truth ASR: override _seal_mic_block synchronously.
@@ -359,6 +374,146 @@ class VirtualSimulationConnection:
 
 
 # ---------------------------------------------------------------------------
+# RealTimeGPTEpisodeRunner — wall-clock episode runner for GPTVoiceSimulator
+# ---------------------------------------------------------------------------
+
+class RealTimeGPTEpisodeRunner:
+    """Drives a GPTVoiceSimulator episode at wall-clock speed with real Piper TTS.
+
+    Key differences from VirtualSimulationConnection:
+    - agent._now() uses real time.time() — block timestamps are absolute.
+    - Real Piper TTS so GPT hears actual speech (not silence).
+    - Both send and receive paths resample between Piper 16 kHz and GPT 24 kHz.
+    - get_transcript_at_time receives episode-relative timestamps (GPT's frame)
+      derived by subtracting simulator._episode_start_real from block timestamps.
+    """
+
+    def __init__(
+        self,
+        simulator: GPTVoiceSimulator,
+        vllm_engine: Any,
+        tokenizer: Any,
+        vllm_max_tokens: int = 16,
+        vllm_temperature: float = 1.0,
+        tts_model: str = "",
+        device: Optional[str] = None,
+    ) -> None:
+        self.simulator = simulator
+        self.vllm_engine = vllm_engine
+        self.tokenizer = tokenizer
+        self.vllm_max_tokens = vllm_max_tokens
+        self.vllm_temperature = vllm_temperature
+        self.tts_model = tts_model
+        self.device = device
+
+    def run_episode(self) -> Episode:
+        episode_id = str(uuid.uuid4())[:8]
+        self.simulator.reset()
+        # Capture the exact wall-clock reference GPT uses for transcript timestamps.
+        episode_start_real: float = self.simulator._episode_start_real
+
+        steps: List[StepRecord] = []
+        last_context_version: List[int] = [-1]
+
+        def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
+            user_spoke = (agent.context_version != last_context_version[0])
+            last_context_version[0] = agent.context_version
+            text, ptok, rtok, lps = llm_generate_train(
+                system_prompt,
+                user_message,
+                self.vllm_engine,
+                self.tokenizer,
+                max_tokens=self.vllm_max_tokens,
+                temperature=self.vllm_temperature,
+            )
+            steps.append(StepRecord(
+                step_id=str(uuid.uuid4())[:8],
+                prompt_text=system_prompt + "\n\n" + user_message,
+                full_prompt_tokens=ptok,
+                response_token_ids=rtok,
+                log_probs=lps,
+                is_idle=(not text),
+                source_block_id=agent._latest_user_source_block_id,
+                user_spoke_before=user_spoke,
+            ))
+            return text
+
+        wpm = self.simulator.wpm
+        block_s = self.simulator.block_s
+        max_episode_s = self.simulator.max_episode_s
+
+        # Real Piper TTS; Parakeet ASR skipped (overridden below).
+        agent = _make_realtime_training_agent(
+            wpm, block_s, intercepted_llm_fn,
+            tts_model=self.tts_model,
+            device=self.device,
+        )
+        # Do NOT override agent._now — it must use real time.time() so block
+        # timestamps are wall-clock aligned with GPT transcript timestamps.
+
+        def realtime_seal_mic_block(start_ts: float, end_ts: float) -> None:
+            sealed = agent._mic_current.copy()
+            agent._mic_current = np.zeros(0, dtype=np.float32)
+            agent._mic_rolling.append((start_ts, end_ts, sealed))
+            if len(agent._mic_rolling) > MAX_MIC_BLOCKS:
+                agent._mic_rolling.pop(0)
+            for block in reversed(agent.blocks):
+                if abs(block.start_ts - start_ts) < 0.5:
+                    block.mic_audio = sealed
+                    break
+            # Block timestamps are absolute; GPT timestamps are relative to episode start.
+            rel_start = start_ts - episode_start_real
+            rel_end = end_ts - episode_start_real
+            transcript = self.simulator.get_transcript_at_time(rel_start, rel_end)
+            if transcript:
+                for block in reversed(agent.blocks):
+                    if abs(block.start_ts - start_ts) < 0.5:
+                        if block.user_text != transcript:
+                            block.user_text = transcript
+                            agent._latest_user_source_block_id = block.block_id
+                            agent._invalidate_future_assistant_continuation()
+                            agent._last_accepted_response_context_version = None
+                            agent.context_version += 1
+                        break
+
+        agent._seal_mic_block = realtime_seal_mic_block  # type: ignore[method-assign]
+
+        chunk_samples = max(160, int(block_s * ASR_SAMPLE_RATE / 10))
+        terminated_reason = "max_duration"
+        episode_start = time.time()
+
+        while time.time() - episode_start < max_episode_s:
+            # GPT sends 24 kHz audio; tell the agent so it resamples to 16 kHz.
+            mic = self.simulator.get_audio_chunk(chunk_samples, ASR_SAMPLE_RATE)
+            if mic is None:
+                terminated_reason = "simulator_done"
+                break
+
+            agent.receive_mic_chunk(_GPT_SAMPLE_RATE, mic)
+
+            tts_out = agent.poll()
+            if tts_out is not None:
+                sr, tts_audio = tts_out
+                # Resample Piper 16 kHz → GPT 24 kHz so GPT hears correct-speed speech.
+                if sr != _GPT_SAMPLE_RATE:
+                    audio_f32 = tts_audio.astype(np.float32) / 32767.0
+                    audio_f32 = _resample(audio_f32, sr, _GPT_SAMPLE_RATE)
+                    tts_audio = (np.clip(audio_f32, -1.0, 1.0) * 32767).astype(np.int16)
+                    sr = _GPT_SAMPLE_RATE
+                self.simulator.on_agent_tts(sr, tts_audio)
+
+        _fill_blocks_covered(steps, list(agent.blocks))
+        steps = _merge_silent_runs(steps)
+
+        return Episode(
+            episode_id=episode_id,
+            steps=steps,
+            blocks=list(agent.blocks),
+            terminated_reason=terminated_reason,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Agent construction helper
 # ---------------------------------------------------------------------------
 
@@ -366,23 +521,48 @@ def _make_training_agent(
     wpm: int,
     block_s: float,
     llm_generate_fn: Callable[[str, str], str],
+    tts_model: str = "",
+    device: Optional[str] = None,
 ) -> DuplexAudioAgent:
-    """
-    Create a DuplexAudioAgent with:
-    - Mock TTS (silent audio of WPM-estimated duration) to skip Piper loading.
-    - No real ASR (_seal_mic_block is overridden by VirtualSimulationConnection).
-    """
-    def mock_tts(text: str) -> Tuple[int, np.ndarray]:
-        duration_s = _wpm_duration_s(text, wpm)
-        samples = max(1, int(duration_s * TTS_SAMPLE_RATE))
-        return TTS_SAMPLE_RATE, np.zeros(samples, dtype=np.int16)
+    """Create a training agent with real Piper TTS and no Parakeet ASR.
 
-    return DuplexAudioAgent(
+    Real TTS is required so block.tts_audio is non-silent, enabling pyannote
+    overlap detection and smart-turn VAD in the reward models.
+    _seal_mic_block is overridden by the caller (VirtualSimulationConnection).
+    """
+    return _make_realtime_training_agent(wpm, block_s, llm_generate_fn, tts_model, device)
+
+
+def _make_realtime_training_agent(
+    wpm: int,
+    block_s: float,
+    llm_generate_fn: Callable[[str, str], str],
+    tts_model: str = "",
+    device: Optional[str] = None,
+) -> DuplexAudioAgent:
+    """Create a DuplexAudioAgent with real Piper TTS for GPT Voice episodes.
+
+    Uses real Piper so GPT actually hears speech audio instead of silence.
+    Parakeet ASR is skipped — _seal_mic_block is overridden by the caller
+    to read transcripts directly from GPTVoiceSimulator.
+    """
+    resolved_tts = tts_model or TTS_MODEL
+    preload_piper_voice(tts_model=resolved_tts, device=device)
+
+    def _dummy_asr(rolling: list, agent: DuplexAudioAgent) -> None:
+        pass  # _seal_mic_block overridden; this path never executes
+
+    agent = DuplexAudioAgent(
         wpm=wpm,
         default_block_s=block_s,
         llm_generate_fn=llm_generate_fn,
-        tts_fn=mock_tts,
+        tts_fn=None,        # real Piper
+        asr_fn=_dummy_asr,  # suppresses Parakeet preload
+        tts_model=resolved_tts,
+        device=device,
     )
+    agent._get_piper_voice()  # warm from cache now rather than first block
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -551,21 +731,35 @@ class FullDuplexRLTrainer:
         """Run one episode per simulator (sequentially) and return all episodes."""
         episodes: List[Episode] = []
         for simulator in simulators:
-            conn = VirtualSimulationConnection(
-                simulator=simulator,
-                vllm_engine=self.vllm_engine,
-                tokenizer=self.tokenizer,
-                vllm_max_tokens=self.config.vllm_max_tokens,
-                vllm_temperature=self.config.vllm_temperature,
-            )
+            if isinstance(simulator, GPTVoiceSimulator):
+                runner: Any = RealTimeGPTEpisodeRunner(
+                    simulator=simulator,
+                    vllm_engine=self.vllm_engine,
+                    tokenizer=self.tokenizer,
+                    vllm_max_tokens=self.config.vllm_max_tokens,
+                    vllm_temperature=self.config.vllm_temperature,
+                    tts_model=self.config.tts_model,
+                    device=self.config.device,
+                )
+            else:
+                runner = VirtualSimulationConnection(
+                    simulator=simulator,
+                    vllm_engine=self.vllm_engine,
+                    tokenizer=self.tokenizer,
+                    vllm_max_tokens=self.config.vllm_max_tokens,
+                    vllm_temperature=self.config.vllm_temperature,
+                    tts_model=self.config.tts_model,
+                    device=self.config.device,
+                )
             try:
-                ep = conn.run_episode()
+                ep = runner.run_episode()
                 episodes.append(ep)
                 n_non_idle = sum(1 for s in ep.steps if not s.is_idle)
                 src = getattr(simulator, "_data", None)
                 src_id = getattr(src, "source_id", "") or getattr(simulator, "source_id", "")
+                mode = "realtime" if isinstance(simulator, GPTVoiceSimulator) else "sim"
                 print(
-                    f"[trainer] episode={ep.episode_id}  "
+                    f"[trainer] episode={ep.episode_id}  mode={mode}  "
                     f"steps={len(ep.steps)} (non-idle={n_non_idle})  "
                     f"blocks={len(ep.blocks)}  ended={ep.terminated_reason}"
                     + (f"  src={src_id}" if src_id else "")
