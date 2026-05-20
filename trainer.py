@@ -22,7 +22,6 @@ from trainer import (
     FullDuplexRLTrainer,
     TrainerConfig,
     respond_after_user_reward,
-    first_sentence_reward,
     coherence_reward,
     interruption_penalty,
     interruption_penalty_overlap,
