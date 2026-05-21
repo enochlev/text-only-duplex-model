@@ -385,6 +385,21 @@ class VirtualSimulationConnection:
                     break
             transcript = self.simulator.get_transcript_at_time(start_ts, end_ts)
             if transcript:
+                # Verify this text comes from the simulator's known script.
+                # If the simulator has word_timestamps, check that the returned
+                # words actually exist there; mismatches indicate a timing bug.
+                wts = getattr(getattr(self.simulator, "_data", None), "word_timestamps", None)
+                if wts is not None:
+                    known_words = {w for _, _, w in wts}
+                    transcript_words = transcript.split()
+                    unknown = [w for w in transcript_words if w not in known_words]
+                    if unknown:
+                        print(
+                            f"[sim_asr DEBUG] UNKNOWN WORDS in transcript for "
+                            f"t=[{start_ts:.2f}, {end_ts:.2f}]: {unknown!r}  "
+                            f"full transcript={transcript!r}"
+                        )
+                print(f"[sim_asr] t=[{start_ts:.2f}, {end_ts:.2f}]  transcript={transcript!r}")
                 for block in reversed(agent.blocks):
                     if abs(block.start_ts - start_ts) < 0.5:
                         if block.user_text != transcript:
@@ -698,7 +713,9 @@ def _fill_blocks_covered(
                 block.block_id
             )
     for step in steps:
-        if step.source_block_id:
+        # Idle steps produced no speech — don't assign them blocks that belong
+        # to a speech step sharing the same source_block_id.
+        if step.source_block_id and not step.is_idle:
             step.blocks_covered = source_to_blocks.get(step.source_block_id, [])
 
 

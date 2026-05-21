@@ -118,8 +118,21 @@ def coherence_reward(
         url = (server_url or COHERENCE_SERVER_URL) + "/reward"
         resp = httpx.post(url, json=payload, timeout=timeout)
         resp.raise_for_status()
-        return float(resp.json()["reward"])
-    except Exception:
+        data = resp.json()
+        reward = float(data["reward"])
+        if abs(reward) > 1.0:
+            lps = data.get("token_log_probs", [])
+            print(
+                f"[coherence DEBUG] large reward={reward:.4f}  "
+                f"n_tokens={data.get('n_tokens')}  "
+                f"proposed={proposed!r}  "
+                f"last_user={last_user!r}  "
+                f"prev_bot={prev_bot!r}  "
+                f"logprobs={lps}"
+            )
+        return reward
+    except Exception as exc:
+        print(f"[coherence DEBUG] request failed: {exc!r}  proposed={proposed!r}")
         return 0.0
 
 
@@ -369,3 +382,75 @@ def silence_too_long_penalty(
     if lag == 3:
         return -0.25
     return -0.50
+
+
+# ---------------------------------------------------------------------------
+# Startup server health check
+# ---------------------------------------------------------------------------
+
+def check_rm_servers(
+    coherence_url: Optional[str] = None,
+    vad_url: Optional[str] = None,
+) -> None:
+    """Assert all reward-model servers are reachable and returning valid responses.
+
+    Raises RuntimeError on the first discovered problem so training fails fast
+    instead of silently falling back to zero rewards.
+    """
+    c_url = (coherence_url or COHERENCE_SERVER_URL).rstrip("/")
+    v_url = (vad_url or _VAD_BASE_URL).rstrip("/")
+    errors: list = []
+
+    # 1 — coherence server /health
+    try:
+        resp = httpx.get(f"{c_url}/health", timeout=5.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "ok":
+            errors.append(f"coherence /health returned unexpected body: {data}")
+    except Exception as exc:
+        errors.append(f"coherence server unreachable at {c_url}  ({exc})")
+
+    # 2 — VAD server /vad/complete
+    try:
+        resp = httpx.post(
+            f"{v_url}/vad/complete",
+            json={"text": "hello there"},
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "complete" not in data:
+            errors.append(f"VAD /vad/complete missing 'complete' key: {data}")
+    except Exception as exc:
+        errors.append(f"VAD server /vad/complete unreachable at {v_url}  ({exc})")
+
+    # 3 — VAD server /vad/overlap (10 ms of silence — just tests the endpoint)
+    try:
+        silent = np.zeros(160, dtype=np.float32)  # 160 samples @ 16 kHz = 10 ms
+        b64 = base64.b64encode(silent.tobytes()).decode()
+        resp = httpx.post(
+            f"{v_url}/vad/overlap",
+            json={"mic_b64": b64, "tts_b64": b64, "sample_rate": 16_000},
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "overlap_ratio" not in data:
+            errors.append(f"VAD /vad/overlap missing 'overlap_ratio' key: {data}")
+    except Exception as exc:
+        errors.append(f"VAD server /vad/overlap unreachable at {v_url}  ({exc})")
+
+    if errors:
+        bullets = "\n".join(f"  • {e}" for e in errors)
+        raise RuntimeError(
+            f"\n[check_rm] {len(errors)} server(s) failed pre-flight check:\n"
+            f"{bullets}\n\n"
+            f"Start coherence_reward_server.py (port {COHERENCE_SERVER_URL.rsplit(':', 1)[-1]}) "
+            f"and vad_server.py (port {_VAD_BASE_URL.rsplit(':', 1)[-1]}) before training."
+        )
+
+    print(
+        f"[check_rm] all servers OK  "
+        f"(coherence={c_url}  vad={v_url})"
+    )

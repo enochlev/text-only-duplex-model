@@ -275,11 +275,11 @@ class PlaybackSimulator:
         return None
 
     def get_transcript_at_time(self, t_start: float, t_end: float) -> str:
-        # Overlapping interval: include any word that touches the window,
-        # not just words entirely contained within it.
+        # Include words whose MIDPOINT falls inside the window so each word
+        # is assigned to exactly one block (no bleed-across-boundary doubling).
         return " ".join(
             w for ws, we, w in self._data.word_timestamps
-            if ws < t_end and we > t_start
+            if t_start <= (ws + we) / 2 < t_end
         )
 
     def on_agent_tts(self, sample_rate: int, audio: np.ndarray) -> None:

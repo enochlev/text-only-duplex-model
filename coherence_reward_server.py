@@ -232,6 +232,16 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
     if proposed_start <= 0:
         raise HTTPException(400, "proposed_next longer than full sequence — check inputs")
 
+    decoded_proposed = _tokenizer.decode(full_ids[0, proposed_start:end_pos].tolist())
+    if decoded_proposed.strip() != req.proposed_next.strip():
+        print(
+            f"[coherence SERVER] token-alignment mismatch!  "
+            f"proposed_next={req.proposed_next!r}  "
+            f"decoded_from_ids={decoded_proposed!r}  "
+            f"seq_len={seq_len}  n_proposed={n_proposed}  "
+            f"proposed_start={proposed_start}  end_pos={end_pos}"
+        )
+
     # ── forward pass ──────────────────────────────────────────────────────────
 
     with torch.no_grad():

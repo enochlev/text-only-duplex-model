@@ -27,6 +27,7 @@ from trainer import (
     interruption_penalty_overlap,
     silence_too_long_penalty,
     make_default_data_pool,
+    check_rm_servers,
 )
 
 
@@ -82,6 +83,8 @@ def main() -> None:
         debug_dir=args.debug_dir,
         silence_inject_lambda_knob=args.silence_lambda,
     )
+
+    check_rm_servers()
 
     data_pool = make_default_data_pool()
 
