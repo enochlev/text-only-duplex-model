@@ -36,12 +36,12 @@ load_dotenv()
 # ── config ────────────────────────────────────────────────────────────────────
 
 MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3.5-4B")  # or "Qwen/Qwen2.5-Instruct"
-MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-14B-AWQ")  # --- IGNORE ---
+MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-14B-FP8")  # --- IGNORE ---
 
-_IS_AWQ = "awq" in MODEL_NAME.lower()
-if _IS_AWQ:
-    # transformers 4.45+ has native AWQ support — no autoawq package needed
-    assert torch.cuda.is_available(), f"AWQ model '{MODEL_NAME}' requires CUDA, but no GPU is available"
+_IS_QUANTIZED = any(tag in MODEL_NAME.lower() for tag in ("awq", "fp8", "gptq", "gguf"))
+if _IS_QUANTIZED:
+    # Quantized models need CUDA; FP8 also needs compressed-tensors: pip install compressed-tensors
+    assert torch.cuda.is_available(), f"Quantized model '{MODEL_NAME}' requires CUDA, but no GPU is available"
 
 GAMMA           = float(os.getenv("COHERENCE_GAMMA", "0.9"))
 PORT            = int(os.getenv("COHERENCE_PORT", "10001"))
@@ -81,11 +81,11 @@ async def lifespan(_: FastAPI):
     global _model, _tokenizer, _end_ids
 
     device = _detect_device()
-    print(f"[coherence] device: {device}  awq={_IS_AWQ}")
+    print(f"[coherence] device: {device}  quantized={_IS_QUANTIZED}")
 
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    if _IS_AWQ:
-        # autoawq owns weight dtype; activations stay float16; sdpa works on CUDA
+    if _IS_QUANTIZED:
+        # quantization config in the model drives dtype; sdpa works on CUDA/Ada FP8 cores
         _model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             device_map="auto",
