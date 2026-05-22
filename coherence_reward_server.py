@@ -127,6 +127,7 @@ app.router.lifespan_context = lifespan
 _SYSTEM_TMPL = """\
 You are a full-duplex conversational agent. You respond to the user appropriately \
 and continue naturally through interruptions. Responses are thoughtful yet concise.
+Avoid repeats and converse naturally. If conversation history is suffering from repeats, do the best you can to break the cycle and move the conversation forward consince, to the point, natural and helpful.
 
 Conversation so far:
 {history}
