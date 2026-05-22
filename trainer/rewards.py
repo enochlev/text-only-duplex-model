@@ -85,8 +85,10 @@ def coherence_reward(
     last_user_message.
     """
     proposed = (block.assistant_text or "").strip()
-    if _is_effectively_idle(proposed):
-        return 0.0
+    is_silent = _is_effectively_idle(proposed)
+    # Use a sentinel so the coherence server can score whether silence was
+    # contextually appropriate, not just skip it.
+    effective_proposed = "<silence>" if is_silent else proposed
 
     # Accumulate all consecutive bot blocks that preceded the most recent user
     # turn. This gives the teacher full context on how long the model has been
@@ -111,7 +113,7 @@ def coherence_reward(
         ],
         "last_user_message": last_user,
         "last_bot_message": prev_bot,
-        "proposed_next": proposed,
+        "proposed_next": effective_proposed,
         "gamma": gamma,
     }
 
@@ -126,7 +128,7 @@ def coherence_reward(
             print(
                 f"[coherence DEBUG] large reward={reward:.4f}  "
                 f"n_tokens={data.get('n_tokens')}  "
-                f"proposed={proposed!r}  "
+                f"proposed={effective_proposed!r}  "
                 f"last_user={last_user!r}  "
                 f"prev_bot={prev_bot!r}  "
                 f"logprobs={lps}"

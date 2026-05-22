@@ -782,7 +782,7 @@ def make_default_data_pool(
         is_backchannel = max(len(l.split()) for l in lines) <= 3
         weights.append(0.2 if is_backchannel else 1.0)
 
-    # Use ultra chat
+    # Give UltraChat the same total weight as all scripts combined → ~50% sampling.
     sources.append(UltraChatTTSSource(
         silence_after_s=24.0,
         inter_turn_pause_s=12.0,
@@ -793,6 +793,6 @@ def make_default_data_pool(
         tts_model=tts_model,
         device=device,
     ))
-    weights.append(1.0)
+    weights.append(sum(weights) * 5)
 
     return DataPool(sources, weights=weights)
