@@ -36,6 +36,18 @@ load_dotenv()
 # ── config ────────────────────────────────────────────────────────────────────
 
 MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3.5-4B")  # or "Qwen/Qwen2.5-Instruct"
+MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-14B-AWQ")  # --- IGNORE ---
+
+_IS_AWQ = "awq" in MODEL_NAME.lower()
+if _IS_AWQ:
+    assert torch.cuda.is_available(), f"AWQ model '{MODEL_NAME}' requires CUDA, but no GPU is available"
+    try:
+        import awq  # noqa: F401  — autoawq registers its backend with transformers on import
+    except ImportError as exc:
+        raise ImportError(
+            f"AWQ model '{MODEL_NAME}' requires autoawq: pip install autoawq"
+        ) from exc
+
 GAMMA           = float(os.getenv("COHERENCE_GAMMA", "0.9"))
 PORT            = int(os.getenv("COHERENCE_PORT", "10001"))
 # Normalize reward by subtracting the greedy log-prob at each position.
@@ -74,18 +86,27 @@ async def lifespan(_: FastAPI):
     global _model, _tokenizer, _end_ids
 
     device = _detect_device()
-    print(f"[coherence] device: {device}")
-    dtype      = torch.float32 if device == "cpu" else torch.float16
-    device_map = "auto" if device == "cuda" else device
+    print(f"[coherence] device: {device}  awq={_IS_AWQ}")
 
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    _model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True,
-        attn_implementation="eager",  # MPS can't handle GQA in fused kernels
-    )
+    if _IS_AWQ:
+        # autoawq owns weight dtype; activations stay float16; sdpa works on CUDA
+        _model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+        )
+    else:
+        dtype      = torch.float32 if device == "cpu" else torch.float16
+        device_map = "auto" if device == "cuda" else device
+        _model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            dtype=dtype,
+            device_map=device_map,
+            trust_remote_code=True,
+            attn_implementation="eager",  # MPS can't handle GQA in fused kernels
+        )
     _model.eval()
 
     # collect all plausible end-of-turn token ids for this tokenizer
