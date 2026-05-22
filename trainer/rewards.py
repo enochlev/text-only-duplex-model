@@ -384,6 +384,41 @@ def silence_too_long_penalty(
     return -0.50
 
 
+def monologue_too_long_penalty(
+    block: DuplexAudioBlock,
+    history: List[DuplexAudioBlock],
+    _is_terminal: bool,
+) -> float:
+    """Penalise extended bot monologues where the user has been completely silent.
+
+    Counts the current block plus consecutive preceding blocks where the bot
+    spoke and the user was silent. Runs ≤ 3 are acceptable continuation;
+    penalty starts at run 4.
+
+    Escalation:
+      run 4-5  → -0.10
+      run 6-7  → -0.20
+      run 8+   → -0.40
+    """
+    if not block.assistant_text:
+        return 0.0
+
+    run = 1
+    for prev in reversed(history):
+        if prev.assistant_text and not prev.user_text:
+            run += 1
+        else:
+            break
+
+    if run <= 3:
+        return 0.0
+    if run <= 5:
+        return -0.10
+    if run <= 7:
+        return -0.20
+    return -0.40
+
+
 # ---------------------------------------------------------------------------
 # Startup server health check
 # ---------------------------------------------------------------------------

@@ -50,7 +50,7 @@ from full_duplex import (
 )
 
 from .data_ingestion import DataPool, GPTVoiceSimulator, _wpm_duration_s
-from .rewards import RewardFn
+from .rewards import RewardFn, _user_finished_in
 
 # OpenAI Realtime API uses 24 kHz PCM16 for both input and output audio.
 _GPT_SAMPLE_RATE = 24_000
@@ -126,7 +126,7 @@ class TrainerConfig:
     vllm_temperature: float = 1.0
     """Sampling temperature. Must be > 0 for REINFORCE exploration."""
 
-    vllm_gpu_memory_utilization: float = 0.35
+    vllm_gpu_memory_utilization: float = 0.2
     """Fraction of GPU memory reserved for vLLM KV cache.
     Keep low enough to leave room for the HF training model + optimizer states."""
 
@@ -1019,9 +1019,43 @@ class FullDuplexRLTrainer:
                 return fn(block, hist, terminal, next_block=nxt)
             return fn(block, hist, terminal)
 
+        def _idle_rm1_reward(step: "StepRecord") -> Tuple[float, Dict[str, float]]:
+            """Apply respond_after_user_reward directly to an idle step.
+
+            Silence has no token output so REINFORCE can't compute a gradient
+            for this step, but setting its reward propagates back through
+            _compute_returns and reduces the advantage of preceding speech steps.
+            """
+            pos = (
+                _block_idx[step.source_block_id] + 1
+                if step.source_block_id and step.source_block_id in _block_idx
+                else len(episode.blocks)
+            )
+            hist = episode.blocks[:pos]
+            if len(hist) < 2:
+                return 0.0, {}
+            rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
+            if _user_finished_in(hist[-2]):
+                penalty = rm1_w * (-0.3)
+                return penalty, {"respond_after_user_reward": penalty}
+            return 0.0, {}
+
         if self.config.debug:
             for i, step in enumerate(episode.steps):
                 is_terminal = (i == n_steps - 1)
+                if step.is_idle:
+                    reward, breakdown = _idle_rm1_reward(step)
+                    if reward:
+                        print(f"\n{'═'*70}")
+                        print(f"  Step {self._step_count:04d}  |  ep={ep_idx}  step_idx={i}"
+                              f"  {'TERMINAL' if is_terminal else ''}")
+                        print("  Action : <idle>  [RM1 direct]")
+                        print(f"  RM1  respond_after_user_reward  raw=-0.3000  "
+                              f"w={self.rm_weights[0]:.2f}  → {reward:+.4f}  ▼")
+                        print(f"  STEP REWARD : {reward:+.4f}")
+                    step.reward = reward
+                    step.reward_breakdown = breakdown
+                    continue
                 covered_ids = set(step.blocks_covered)
                 covered = [b for b in episode.blocks if b.block_id in covered_ids]
                 history = _prior_history(covered_ids)
@@ -1033,6 +1067,8 @@ class FullDuplexRLTrainer:
 
         def _score_step(i: int) -> Tuple[float, Dict[str, float]]:
             step = episode.steps[i]
+            if step.is_idle:
+                return _idle_rm1_reward(step)
             is_terminal = (i == n_steps - 1)
             covered_ids = set(step.blocks_covered)
             covered = [b for b in episode.blocks if b.block_id in covered_ids]

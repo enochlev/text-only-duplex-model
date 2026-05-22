@@ -168,7 +168,7 @@ class ScriptTTSSource:
     def __init__(
         self,
         script_lines: List[str],
-        inter_turn_pause_s: float = 8.0,
+        inter_turn_pause_s: float = 9.0,
         silence_after_s: float = 8.0,
         max_episode_s: float = 72.0,
         block_s: float = 2.0,
@@ -191,7 +191,11 @@ class ScriptTTSSource:
         voice = preload_piper_voice(tts_model=self.tts_model, device=self.device)
         segments: List[np.ndarray] = []
         word_timestamps: List[Tuple[float, float, str]] = []
-        t = 0.0
+        # 0.5 s leading silence ensures the first word's midpoint clears the
+        # first block window (~0 – block_s), which has no matching agent block yet.
+        _LEAD_S = 0.5
+        segments.append(np.zeros(int(_LEAD_S * ASR_SAMPLE_RATE), dtype=np.float32))
+        t = _LEAD_S
         for line in self.script_lines:
             sr, audio_int16 = piper_synthesize(voice, line)
             audio_f32 = audio_int16.astype(np.float32) / 32767.0
@@ -584,7 +588,7 @@ class DataPool:
         wav_weight: float = 1.0,
         gpt_weight: float = 1.0,
         # episode defaults applied to all constructed sources
-        inter_turn_pause_s: float = 6.0,
+        inter_turn_pause_s: float = 7.0,
         silence_after_s: float = 8.0,
         max_episode_s: float = 72.0,
         block_s: float = 2.0,
@@ -654,274 +658,18 @@ class DataPool:
 # Built-in training scripts
 # ---------------------------------------------------------------------------
 
-TRAINING_SCRIPTS: List[List[str]] = [
-    # Casual small talk
-    ["Hey, how's it going?",
-     "Not bad. What have you been up to lately?",
-     "That sounds fun. Do you have any weekend plans?"],
+def _load_training_scripts() -> List[List[str]]:
+    json_path = os.path.join(os.path.dirname(__file__), "training_scripts.json")
+    with open(json_path) as f:
+        return json.load(f)
 
-    # Question-and-answer factual
-    ["What's the capital of France?",
-     "How far is it from London?",
-     "Is there a fast train between them?"],
 
-    # Short follow-ups (tests barge-in handling)
-    ["Tell me a joke.",
-     "Another one.",
-     "Okay that's enough."],
-
-    # Task-oriented
-    ["Can you help me write a grocery list?",
-     "I need milk, eggs, and bread.",
-     "Also some coffee and maybe some fruit.",
-     "That's all, thanks."],
-
-    # Opinion / open-ended
-    ["What do you think about remote work?",
-     "Do you think it's better for productivity?",
-     "What about collaboration?"],
-
-    # Tech support
-    ["My laptop keeps freezing.",
-     "It happens when I open too many browser tabs.",
-     "I have eight gigabytes of RAM.",
-     "Should I upgrade?"],
-
-    # Number / calculation (short answers expected)
-    ["What's fifteen percent of two hundred?",
-     "How about twenty percent?",
-     "And a thirty dollar tip on a hundred fifty dollar bill?"],
-
-    # Storytelling / longer context
-    ["Tell me a short story about a cat.",
-     "Make it funnier.",
-     "Give it a surprise ending."],
-
-    # Interruption simulation — very short prompts back-to-back
-    ["Wait.",
-     "Sorry, go on.",
-     "Actually never mind.",
-     "Okay I'm ready now.",
-     "What were you saying?"],
-
-    # Single long user turn (tests truncation handling)
-    ["I went to the store this morning and they were completely out of the "
-     "brand of coffee I normally buy, so I had to try a different one, and "
-     "honestly I don't think it's as good. What would you recommend instead?"],
-
-    # Multi-language mix (names / places)
-    ["I'm visiting Tokyo next month.",
-     "What neighborhoods should I explore?",
-     "Any food recommendations?"],
-
-    # Emotional / supportive
-    ["I've been really stressed lately.",
-     "Work has been overwhelming.",
-     "Do you have any tips for managing stress?"],
-
-    # Silence-heavy: very short turns force idle decisions
-    ["Hi.",
-     "Yeah.",
-     "Okay.",
-     "Bye."],
-
-    # Debate-style back-and-forth
-    ["Is coffee better than tea?",
-     "But tea has so many varieties.",
-     "Coffee has espresso though.",
-     "Fair point."],
-
-    # Follow-up clarification
-    ["Explain quantum entanglement simply.",
-     "Can it be used for communication?",
-     "Why not?"],
-
-    # Weather small talk
-    ["What's the weather like today?",
-     "Will it rain this weekend?",
-     "Should I bring an umbrella?"],
-
-    # Recipe / cooking
-    ["How do I make pasta carbonara?",
-     "Can I use bacon instead of pancetta?",
-     "What if I don't have parmesan?",
-     "How do I keep the eggs from scrambling?"],
-
-    # Fitness advice
-    ["I want to start working out but don't know where to begin.",
-     "I have about thirty minutes a day.",
-     "I don't have any gym equipment.",
-     "Is that enough to see results?"],
-
-    # Home improvement
-    ["How do I fix a leaky faucet?",
-     "I think it's the washer.",
-     "Do I need to turn off the main water supply?",
-     "Thanks, I'll try it."],
-
-    # Single very long rambling turn (tests chunking)
-    ["So I was talking to my friend earlier and she mentioned this new app that "
-     "supposedly helps you track your spending and set budgets and she says she's "
-     "saved like three hundred dollars a month since she started using it and I "
-     "was wondering if you've heard of anything like that and whether it's worth "
-     "actually trying one of those budgeting apps."],
-
-    # Book recommendation
-    ["Can you recommend a good book?",
-     "I like mysteries.",
-     "Something not too long.",
-     "Has it been adapted into a movie?"],
-
-    # Career advice
-    ["I'm thinking about switching careers.",
-     "I'm currently in accounting.",
-     "I'd like to get into software development.",
-     "Where should I start learning?"],
-
-    # Pet care
-    ["My dog keeps barking at night.",
-     "He's about two years old.",
-     "Could it be separation anxiety?",
-     "What can I do about it?"],
-
-    # Rapid back-and-forth debate (tests fast turn transitions)
-    ["Cats or dogs?",
-     "Dogs.",
-     "Cats are more independent.",
-     "Dogs are more loyal.",
-     "Fair.",
-     "Okay fine, both."],
-
-    # Language learning
-    ["How do I say hello in Japanese?",
-     "And thank you?",
-     "What about goodbye?",
-     "Can you teach me a simple phrase?"],
-
-    # Science facts
-    ["How hot is the sun?",
-     "What's it made of?",
-     "How long until it burns out?",
-     "Will Earth survive?"],
-
-    # History question
-    ["When did World War Two end?",
-     "What caused it?",
-     "Who were the main leaders?"],
-
-    # Philosophy / open-ended reflection
-    ["Do you think free will exists?",
-     "What's the strongest argument against it?",
-     "Does it even matter practically?"],
-
-    # Emotional — frustration venting
-    ["I'm so frustrated with my coworker.",
-     "He keeps taking credit for my ideas in meetings.",
-     "I don't want to start a conflict.",
-     "What would you do in my situation?"],
-
-    # Music recommendation
-    ["What's a good album to listen to while working?",
-     "Something without lyrics.",
-     "I like jazz but also electronic.",
-     "Perfect, thanks."],
-
-    # Movie recommendation
-    ["I want to watch a movie tonight.",
-     "Something thrilling but not gory.",
-     "I've already seen Inception.",
-     "Is that one on Netflix?"],
-
-    # Travel planning
-    ["I want to plan a trip to Europe.",
-     "I have two weeks and a moderate budget.",
-     "I've never been to Italy.",
-     "What cities are must-see?",
-     "How many days in Rome is enough?"],
-
-    # Parenting question
-    ["My toddler won't eat vegetables.",
-     "She's three years old.",
-     "I've tried hiding them in food.",
-     "Any other tricks?"],
-
-    # Sleep problems
-    ["I can't fall asleep at night.",
-     "I've tried no screens before bed.",
-     "I wake up around three a.m. too.",
-     "Could it be stress?"],
-
-    # Plant care
-    ["My houseplant leaves are turning yellow.",
-     "It's a pothos.",
-     "I water it twice a week.",
-     "Is that too much?"],
-
-    # Gaming discussion
-    ["What's a good game for someone who doesn't play much?",
-     "I like puzzles and story-driven games.",
-     "Nothing too violent.",
-     "Is it available on PC?"],
-
-    # Mindfulness / meditation
-    ["I want to try meditation but don't know how.",
-     "How long should I meditate each day?",
-     "Can I do it while lying down?",
-     "What if my mind keeps wandering?"],
-
-    # Shopping advice
-    ["I need to buy a new laptop.",
-     "My budget is around a thousand dollars.",
-     "I mostly use it for writing and video calls.",
-     "Do I need a Mac or is Windows fine?"],
-
-    # Car trouble
-    ["My car makes a clicking noise when I turn.",
-     "It's louder when I turn left.",
-     "The car is about seven years old.",
-     "Is it expensive to fix?"],
-
-    # News / current events style
-    ["What causes inflation?",
-     "How does raising interest rates help?",
-     "Does it always work?"],
-
-    # Creative writing help
-    ["Help me come up with a villain for my story.",
-     "The story is set in a futuristic city.",
-     "I want the villain to have a sympathetic motive.",
-     "Maybe something related to inequality?"],
-
-    # Interruptions with topic change
-    ["Actually wait, forget what I said.",
-     "I want to ask something different.",
-     "What time is it in London right now?",
-     "Thanks."],
-
-    # Step-by-step instructions
-    ["How do I set up a new iPhone?",
-     "Do I need my old phone nearby?",
-     "What if I forgot my Apple ID password?",
-     "Can I skip the iCloud restore?"],
-
-    # Minimalist acknowledgment turns (tests silence / short audio)
-    ["Sure.",
-     "Mm-hmm.",
-     "Right.",
-     "Got it.",
-     "Okay."],
-
-    # Finance budgeting
-    ["I spend more than I earn every month.",
-     "I make about four thousand dollars a month.",
-     "Rent is two thousand.",
-     "What's a realistic savings target?"],
-]
+TRAINING_SCRIPTS: List[List[str]] = _load_training_scripts()
 
 
 def make_default_data_pool(
     silence_after_s: float = 8.0,
-    inter_turn_pause_s: float = 6.0,
+    inter_turn_pause_s: float = 7.0,
     max_episode_s: float = 72.0,
     block_s: float = 2.0,
     wpm: int = 150,
@@ -929,8 +677,10 @@ def make_default_data_pool(
     device: Optional[str] = None,
 ) -> DataPool:
     """Build a DataPool from the built-in TRAINING_SCRIPTS."""
-    sources = [
-        ScriptTTSSource(
+    sources = []
+    weights = []
+    for i, lines in enumerate(TRAINING_SCRIPTS):
+        sources.append(ScriptTTSSource(
             script_lines=lines,
             inter_turn_pause_s=inter_turn_pause_s,
             silence_after_s=silence_after_s,
@@ -940,7 +690,7 @@ def make_default_data_pool(
             source_id=f"script_{i:02d}",
             tts_model=tts_model,
             device=device,
-        )
-        for i, lines in enumerate(TRAINING_SCRIPTS)
-    ]
-    return DataPool(sources)
+        ))
+        is_backchannel = max(len(l.split()) for l in lines) <= 3
+        weights.append(0.2 if is_backchannel else 1.0)
+    return DataPool(sources, weights=weights)

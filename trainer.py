@@ -26,6 +26,7 @@ from trainer import (
     interruption_penalty,
     interruption_penalty_overlap,
     silence_too_long_penalty,
+    monologue_too_long_penalty,
     make_default_data_pool,
     check_rm_servers,
 )
@@ -47,7 +48,7 @@ def main() -> None:
         help="Max new tokens per LLM generation call",
     )
     parser.add_argument(
-        "--gpu-mem", type=float, default=0.25,
+        "--gpu-mem", type=float, default=0.2,
         help="vLLM GPU memory utilisation (0–1). "
              "Tip: export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
              "to reduce fragmentation on the training model.",
@@ -100,8 +101,9 @@ def main() -> None:
         silence_too_long_penalty,        # Namo turn detector — tier 1
         silence_too_long_penalty,        # Namo turn detector — tier 2 (lighter weight)
         coherence_reward,                # teacher LLM scoring; requires coherence server running
+        monologue_too_long_penalty,      # escalating penalty for bot monologues > 3 consecutive blocks
     ]
-    reward_weights = [1.0, 1.0, 1.0, 1.0, 0.5, 1.0]
+    reward_weights = [1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0]
 
     config.reward_fn_weights = reward_weights
 
