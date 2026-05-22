@@ -40,13 +40,8 @@ MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-14B-AWQ")  # --- IGNO
 
 _IS_AWQ = "awq" in MODEL_NAME.lower()
 if _IS_AWQ:
+    # transformers 4.45+ has native AWQ support — no autoawq package needed
     assert torch.cuda.is_available(), f"AWQ model '{MODEL_NAME}' requires CUDA, but no GPU is available"
-    try:
-        import awq  # noqa: F401  — autoawq registers its backend with transformers on import
-    except ImportError as exc:
-        raise ImportError(
-            f"AWQ model '{MODEL_NAME}' requires autoawq: pip install autoawq"
-        ) from exc
 
 GAMMA           = float(os.getenv("COHERENCE_GAMMA", "0.9"))
 PORT            = int(os.getenv("COHERENCE_PORT", "10001"))
