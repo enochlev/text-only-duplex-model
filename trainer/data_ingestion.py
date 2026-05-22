@@ -168,7 +168,7 @@ class ScriptTTSSource:
     def __init__(
         self,
         script_lines: List[str],
-        inter_turn_pause_s: float = 9.0,
+        inter_turn_pause_s: float = 12.0,
         silence_after_s: float = 8.0,
         max_episode_s: float = 72.0,
         block_s: float = 2.0,
@@ -221,6 +221,94 @@ class ScriptTTSSource:
             wpm=self.wpm,
             source_id=self.source_id or "",
         )
+
+    def make_simulator(self) -> "PlaybackSimulator":
+        return PlaybackSimulator(self.load())
+
+
+# ---------------------------------------------------------------------------
+# UltraChatTTSSource — single-question episodes from UltraChat 200k
+# ---------------------------------------------------------------------------
+
+_ULTRACHAT_PROMPTS: Optional[List[str]] = None
+_ULTRACHAT_MAX_CACHE = 20_000
+
+
+def _load_ultrachat_prompts(max_prompts: int = _ULTRACHAT_MAX_CACHE) -> List[str]:
+    """Load and cache short first-turn user prompts from UltraChat 200k.
+
+    Filters to messages with fewer than 20 words from the first user turn.
+    Results are cached at module level so the dataset is streamed only once.
+    """
+    global _ULTRACHAT_PROMPTS
+    if _ULTRACHAT_PROMPTS is not None:
+        return _ULTRACHAT_PROMPTS
+    try:
+        from datasets import load_dataset  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "UltraChatTTSSource requires 'datasets'. pip install datasets"
+        )
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
+    prompts: List[str] = []
+    for example in ds:
+        messages = example.get("messages") or []
+        if not messages:
+            continue
+        first = messages[0]
+        if first.get("role") != "user":
+            continue
+        text = (first.get("content") or "").strip()
+        if text and len(text.split()) < 20:
+            prompts.append(text)
+            if len(prompts) >= max_prompts:
+                break
+    _ULTRACHAT_PROMPTS = prompts
+    print(f"[UltraChatTTSSource] cached {len(prompts)} prompts from ultrachat_200k")
+    return _ULTRACHAT_PROMPTS
+
+
+class UltraChatTTSSource:
+    """Single-question episode source drawn from UltraChat 200k.
+
+    Picks one random first-turn user message (< 20 words) per episode.
+    silence_after_s defaults to 3× the ScriptTTSSource value (24 s) so
+    the model has an extended window to answer a standalone question.
+    """
+
+    def __init__(
+        self,
+        silence_after_s: float = 24.0,
+        inter_turn_pause_s: float = 12.0,
+        max_episode_s: float = 72.0,
+        block_s: float = 2.0,
+        wpm: int = 150,
+        source_id: Optional[str] = None,
+        tts_model: str = "",
+        device: Optional[str] = None,
+    ) -> None:
+        self.silence_after_s = silence_after_s
+        self.inter_turn_pause_s = inter_turn_pause_s
+        self.max_episode_s = max_episode_s
+        self.block_s = block_s
+        self.wpm = wpm
+        self.source_id = source_id
+        self.tts_model = tts_model or TTS_MODEL
+        self.device = device
+
+    def load(self) -> EpisodeData:
+        question = random.choice(_load_ultrachat_prompts())
+        return ScriptTTSSource(
+            script_lines=[question],
+            inter_turn_pause_s=self.inter_turn_pause_s,
+            silence_after_s=self.silence_after_s,
+            max_episode_s=self.max_episode_s,
+            block_s=self.block_s,
+            wpm=self.wpm,
+            source_id=self.source_id or "ultrachat",
+            tts_model=self.tts_model,
+            device=self.device,
+        ).load()
 
     def make_simulator(self) -> "PlaybackSimulator":
         return PlaybackSimulator(self.load())
@@ -693,4 +781,17 @@ def make_default_data_pool(
         ))
         is_backchannel = max(len(l.split()) for l in lines) <= 3
         weights.append(0.2 if is_backchannel else 1.0)
+
+    # Use ultra chat
+    sources.append(UltraChatTTSSource(
+        silence_after_s=24.0,
+        inter_turn_pause_s=12.0,
+        max_episode_s=max_episode_s,
+        block_s=block_s,
+        wpm=wpm,
+        source_id="ultrachat",
+        tts_model=tts_model,
+        device=device,
+    ))
+
     return DataPool(sources, weights=weights)

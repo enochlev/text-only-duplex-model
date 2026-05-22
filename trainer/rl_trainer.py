@@ -175,6 +175,10 @@ class TrainerConfig:
        punctuation (.!?), giving the user the floor.
     Set to 0.0 to disable both."""
 
+    silence_inject_start_episode: int = 0
+    """Total episodes to collect before silence injection activates.
+    0 = on from the start. Use e.g. 40 to let the model learn to speak first."""
+
     tts_model: str = ""
     """Piper TTS model path used for GPTVoiceSimulator real-time episodes.
     Defaults to the full_duplex module default (en_US-danny-low) when empty."""
@@ -851,6 +855,7 @@ class FullDuplexRLTrainer:
         )
         self._baseline: float = 0.0
         self._step_count: int = 0
+        self._total_episodes: int = 0
 
     # ------------------------------------------------------------------
     # Rollout collection
@@ -858,6 +863,11 @@ class FullDuplexRLTrainer:
 
     def collect_rollouts(self, simulators: List[Any]) -> List[Episode]:
         """Run one episode per simulator (sequentially) and return all episodes."""
+        effective_lambda = (
+            self.config.silence_inject_lambda_knob
+            if self._total_episodes >= self.config.silence_inject_start_episode
+            else 0.0
+        )
         episodes: List[Episode] = []
         for simulator in simulators:
             if isinstance(simulator, GPTVoiceSimulator):
@@ -869,7 +879,7 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
-                    silence_inject_lambda_knob=self.config.silence_inject_lambda_knob,
+                    silence_inject_lambda_knob=effective_lambda,
                 )
             else:
                 runner = VirtualSimulationConnection(
@@ -880,10 +890,11 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
-                    silence_inject_lambda_knob=self.config.silence_inject_lambda_knob,
+                    silence_inject_lambda_knob=effective_lambda,
                 )
             try:
                 ep = runner.run_episode()
+                self._total_episodes += 1
                 episodes.append(ep)
                 n_non_idle = sum(1 for s in ep.steps if not s.is_idle)
                 src = getattr(simulator, "_data", None)
@@ -894,6 +905,7 @@ class FullDuplexRLTrainer:
                     f"steps={len(ep.steps)} (non-idle={n_non_idle})  "
                     f"blocks={len(ep.blocks)}  ended={ep.terminated_reason}"
                     + (f"  src={src_id}" if src_id else "")
+                    + (f"  silence_λ={effective_lambda:.2f}" if effective_lambda else "  silence_λ=off")
                 )
                 _print_episode_summary(ep)
             except Exception as exc:

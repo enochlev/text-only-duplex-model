@@ -66,6 +66,11 @@ def main() -> None:
         help="Probability for silence-injection heuristics: truncate at punctuation "
              "and force silence after sentence-ending bot blocks (default: 0.25 , 0=off)",
     )
+    parser.add_argument(
+        "--silence-lambda-delay", type=int, default=0,
+        help="Episodes to collect before silence injection activates (default: 0 = on immediately). "
+             "Use e.g. 40 to let the model learn to speak before silence pressure begins.",
+    )
     args = parser.parse_args()
 
     config = TrainerConfig(
@@ -83,6 +88,7 @@ def main() -> None:
         debug=args.debug,
         debug_dir=args.debug_dir,
         silence_inject_lambda_knob=args.silence_lambda,
+        silence_inject_start_episode=args.silence_lambda_delay,
     )
 
     check_rm_servers()

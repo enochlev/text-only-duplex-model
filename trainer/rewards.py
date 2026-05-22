@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import traceback
 import urllib.error
 import urllib.request
 from typing import Callable, List, Optional
@@ -132,7 +133,8 @@ def coherence_reward(
             )
         return reward
     except Exception as exc:
-        print(f"[coherence DEBUG] request failed: {exc!r}  proposed={proposed!r}")
+        print(f"[coherence] request failed: {exc!r}  proposed={proposed!r}")
+        traceback.print_exc()
         return 0.0
 
 
@@ -188,6 +190,9 @@ def _vad_turn_complete(
         _complete_fail_count = 0
         return bool(data["complete"])
     except Exception:
+        if _complete_fail_count == 0:
+            print("[VAD /complete] server error (further failures silenced):")
+            traceback.print_exc()
         _complete_fail_count += 1
         return None
 
@@ -225,6 +230,9 @@ def _vad_overlap_score(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional
         _overlap_fail_count = 0
         return float(data.get("overlap_ratio", 0.0))
     except Exception:
+        if _overlap_fail_count == 0:
+            print("[VAD /overlap] server error (further failures silenced):")
+            traceback.print_exc()
         _overlap_fail_count += 1
         return None
 
