@@ -71,7 +71,7 @@ def coherence_reward(
     history: List[DuplexAudioBlock],
     is_terminal: bool,
     gamma: float = 0.9,
-    timeout: float = 5.0,
+    timeout: float = 10.0,
     server_url: Optional[str] = None,
 ) -> float:
     """Score the block against the teacher LLM via the coherence reward server.
