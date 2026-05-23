@@ -184,7 +184,7 @@ def backchannel_loop_penalty(
 
     if run <= 1:
         return 0.0
-    return -0.5 * (run - 1)
+    return -1.0 * (run - 1)
 
 
 # ---------------------------------------------------------------------------
