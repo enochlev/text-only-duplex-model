@@ -231,7 +231,12 @@ class ScriptTTSSource:
 # ---------------------------------------------------------------------------
 
 _ULTRACHAT_PROMPTS: Optional[List[str]] = None
-_ULTRACHAT_MAX_CACHE = 20_000
+_ULTRACHAT_EMBEDDINGS: Optional["np.ndarray"] = None  # shape (N, D), L2-normalised
+_ULTRACHAT_MAX_CACHE = 100_000
+_ULTRACHAT_SIM_TOP_K = 100
+_ULTRACHAT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Use sentence-transformers<3.0 to avoid pulling in a newer torch:
+#   pip install "sentence-transformers<3.0"
 
 
 def _load_ultrachat_prompts(max_prompts: int = _ULTRACHAT_MAX_CACHE) -> List[str]:
@@ -268,12 +273,68 @@ def _load_ultrachat_prompts(max_prompts: int = _ULTRACHAT_MAX_CACHE) -> List[str
     return _ULTRACHAT_PROMPTS
 
 
-class UltraChatTTSSource:
-    """Single-question episode source drawn from UltraChat 200k.
+def _get_ultrachat_embeddings() -> "np.ndarray":
+    """Lazily encode all cached prompts and return L2-normalised embeddings."""
+    global _ULTRACHAT_EMBEDDINGS
+    if _ULTRACHAT_EMBEDDINGS is not None:
+        return _ULTRACHAT_EMBEDDINGS
+    import numpy as _np
+    prompts = _load_ultrachat_prompts()
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "Similarity sampling requires sentence-transformers. "
+            "pip install 'sentence-transformers<3.0'"
+        )
+    print(f"[UltraChatTTSSource] encoding {len(prompts)} sentences with {_ULTRACHAT_EMBED_MODEL} …")
+    model = SentenceTransformer(_ULTRACHAT_EMBED_MODEL)
+    emb = model.encode(
+        prompts,
+        batch_size=512,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    _ULTRACHAT_EMBEDDINGS = emb.astype(_np.float32)
+    print(f"[UltraChatTTSSource] embeddings ready  shape={_ULTRACHAT_EMBEDDINGS.shape}")
+    return _ULTRACHAT_EMBEDDINGS
 
-    Picks one random first-turn user message (< 20 words) per episode.
+
+def _sample_similar_idx(
+    anchor_idx: int,
+    k: int = _ULTRACHAT_SIM_TOP_K,
+    temperature: float = 0.1,
+) -> int:
+    """Return an index sampled from the top-k most similar prompts to anchor_idx.
+
+    Cosine similarities (embeddings are pre-normalised, so this is a dot
+    product) are converted to a probability distribution via temperature-scaled
+    softmax.  Lower temperature → samples cluster near the top-1 neighbour.
+    """
+    import numpy as _np
+    emb = _get_ultrachat_embeddings()
+    scores = emb @ emb[anchor_idx]          # (N,) cosine similarities
+    scores[anchor_idx] = -2.0               # exclude self
+    top_idx = _np.argpartition(scores, -k)[-k:]
+    top_scores = scores[top_idx] / temperature
+    top_scores -= top_scores.max()          # numerical stability
+    probs = _np.exp(top_scores)
+    probs /= probs.sum()
+    return int(_np.random.choice(top_idx, p=probs))
+
+
+class UltraChatTTSSource:
+    """Multi-turn episode source drawn from UltraChat 200k.
+
+    Episode structure:
+      line 1 — random prompt from the corpus
+      line 2 — sampled from the top-100 most similar prompts to line 1
+                (probability ∝ softmax of cosine similarity)
+      line 3 — 50 % chance: same similarity sampling seeded from line 2
+
     silence_after_s defaults to 3× the ScriptTTSSource value (24 s) so
-    the model has an extended window to answer a standalone question.
+    the model has an extended window to answer each question.
     """
 
     def __init__(
@@ -286,6 +347,7 @@ class UltraChatTTSSource:
         source_id: Optional[str] = None,
         tts_model: str = "",
         device: Optional[str] = None,
+        similarity_temperature: float = 0.1,
     ) -> None:
         self.silence_after_s = silence_after_s
         self.inter_turn_pause_s = inter_turn_pause_s
@@ -295,11 +357,18 @@ class UltraChatTTSSource:
         self.source_id = source_id
         self.tts_model = tts_model or TTS_MODEL
         self.device = device
+        self.similarity_temperature = similarity_temperature
 
     def load(self) -> EpisodeData:
-        question = random.choice(_load_ultrachat_prompts())
+        prompts = _load_ultrachat_prompts()
+        idx1 = random.randrange(len(prompts))
+        idx2 = _sample_similar_idx(idx1, temperature=self.similarity_temperature)
+        lines = [prompts[idx1], prompts[idx2]]
+        if random.random() < 0.5:
+            idx3 = _sample_similar_idx(idx2, temperature=self.similarity_temperature)
+            lines.append(prompts[idx3])
         return ScriptTTSSource(
-            script_lines=[question],
+            script_lines=lines,
             inter_turn_pause_s=self.inter_turn_pause_s,
             silence_after_s=self.silence_after_s,
             max_episode_s=self.max_episode_s,
