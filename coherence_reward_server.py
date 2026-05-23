@@ -201,12 +201,11 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
 
     # ── locate proposed_next tokens inside full_ids ───────────────────────────
     #
-    # We CANNOT encode proposed_next in isolation to get n_proposed — BPE
-    # tokenizers are context-sensitive at boundaries, so isolated encoding can
-    # yield a different token count than the in-context tokenization in full_ids.
-    # (e.g. "Magical" alone → ['M','agical'] but after a space → [' Magical']).
-    # Instead, build the prefix sequence with the same chat template and derive
-    # proposed_start from the prefix length; n_proposed follows from that.
+    # We cannot encode proposed_next in isolation OR build a prefix template —
+    # BPE merges tokens across BOTH the last_bot_message/proposed_next boundary
+    # AND the proposed_next/end-token boundary. The only reliable method is to
+    # scan backwards through full_ids itself: find the shortest suffix of the
+    # pre-end-token region that decodes to proposed_next.
 
     seq_len = full_ids.shape[1]
 
@@ -219,29 +218,27 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
     while end_pos > 0 and full_ids[0, end_pos - 1].item() in _strippable:
         end_pos -= 1
 
-    # Build the prefix (everything up to but not including proposed_next) using
-    # the same chat template so the boundary tokenization matches full_ids.
-    messages_prefix = [
-        {"role": "system",    "content": system_content},
-        {"role": "user",      "content": req.last_user_message},
-        {"role": "assistant", "content": req.last_bot_message},
-    ]
-    _prefix_out = _tokenizer.apply_chat_template(
-        messages_prefix,
-        add_generation_prompt=False,
-        return_tensors="pt",
-        enable_thinking=False,
-    )
-    prefix_ids: torch.Tensor = (
-        _prefix_out.input_ids if hasattr(_prefix_out, "input_ids") else _prefix_out
-    )
-    # Strip end tokens from the prefix tail to find the exact boundary
-    prefix_end = prefix_ids.shape[1]
-    while prefix_end > 0 and prefix_ids[0, prefix_end - 1].item() in _strippable:
-        prefix_end -= 1
-    proposed_start = prefix_end
+    proposed_text = req.proposed_next.strip()
+    proposed_start: int | None = None
+    n_proposed = 0
+    # Upper bound: generous token estimate — one token per 2 chars plus slack.
+    max_scan = min(end_pos, max(len(req.proposed_next) // 2 + 20, 40))
+    for n in range(1, max_scan + 1):
+        start = end_pos - n
+        if start < 0:
+            break
+        if _tokenizer.decode(full_ids[0, start:end_pos].tolist()).strip() == proposed_text:
+            proposed_start = start
+            n_proposed = n
+            break
 
-    n_proposed = end_pos - proposed_start
+    if proposed_start is None:
+        # Fallback for cases where the text doesn't round-trip cleanly through
+        # the tokenizer (e.g. special tokens like </think> that decode differently).
+        fallback_ids = _tokenizer.encode(req.proposed_next, add_special_tokens=False)
+        n_proposed = len(fallback_ids)
+        proposed_start = end_pos - n_proposed
+
     if n_proposed <= 0:
         return RewardResponse(reward=0.0, n_tokens=0, token_log_probs=[])
     if proposed_start <= 0:
