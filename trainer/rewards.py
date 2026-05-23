@@ -15,11 +15,26 @@ import numpy as np
 
 from full_duplex import DuplexAudioBlock
 
+import threading as _threading
 import os as _os
 from dotenv import load_dotenv as _load_dotenv
 _load_dotenv()
 
 COHERENCE_SERVER_URL = f"http://localhost:{_os.getenv('COHERENCE_PORT', '10001')}"
+
+_reward_tokenizer      = None
+_reward_tokenizer_lock = _threading.Lock()
+
+def _get_reward_tokenizer():
+    global _reward_tokenizer
+    if _reward_tokenizer is not None:
+        return _reward_tokenizer
+    with _reward_tokenizer_lock:
+        if _reward_tokenizer is None:
+            from transformers import AutoTokenizer
+            model = _os.getenv("TOKENIZER_MODEL", _os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-1.7B"))
+            _reward_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    return _reward_tokenizer
 
 _IDLE_TOKENS: frozenset = frozenset({
     "<idle>", "<|im_end|>", "<|endoftext|>", "</s>", "<eos>",
@@ -109,6 +124,12 @@ def coherence_reward(
     if not prev_bot and not last_user:
         return 0.0
 
+    try:
+        tok = _get_reward_tokenizer()
+        n_proposed_tokens = len(tok.encode(effective_proposed, add_special_tokens=False))
+    except Exception:
+        n_proposed_tokens = None
+
     payload = {
         "history": [
             {"user": b.user_text or "", "bot": b.assistant_text or ""}
@@ -118,6 +139,7 @@ def coherence_reward(
         "last_bot_message": prev_bot,
         "proposed_next": effective_proposed,
         "gamma": gamma,
+        "n_proposed_tokens": n_proposed_tokens,
     }
 
     try:

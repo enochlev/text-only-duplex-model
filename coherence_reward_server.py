@@ -156,6 +156,7 @@ class RewardRequest(BaseModel):
     last_bot_message:  str          # text the model already emitted this turn (prefix)
     proposed_next:     str          # new block text to score
     gamma:             float = GAMMA
+    n_proposed_tokens: Optional[int] = None  # pre-computed token count; skips server scan when set
 
 
 class RewardResponse(BaseModel):
@@ -218,41 +219,43 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
     while end_pos > 0 and full_ids[0, end_pos - 1].item() in _strippable:
         end_pos -= 1
 
-    proposed_text = req.proposed_next.strip()
-    proposed_start: int | None = None
-    n_proposed = 0
-    # Upper bound: generous token estimate — one token per 2 chars plus slack.
-    max_scan = min(end_pos, max(len(req.proposed_next) // 2 + 20, 40))
-    for n in range(1, max_scan + 1):
-        start = end_pos - n
-        if start < 0:
-            break
-        if _tokenizer.decode(full_ids[0, start:end_pos].tolist()).strip() == proposed_text:
-            proposed_start = start
-            n_proposed = n
-            break
-
-    if proposed_start is None:
-        # Fallback for cases where the text doesn't round-trip cleanly through
-        # the tokenizer (e.g. special tokens like </think> that decode differently).
-        fallback_ids = _tokenizer.encode(req.proposed_next, add_special_tokens=False)
-        n_proposed = len(fallback_ids)
+    if req.n_proposed_tokens is not None and req.n_proposed_tokens > 0:
+        n_proposed    = req.n_proposed_tokens
         proposed_start = end_pos - n_proposed
+    else:
+        # Fallback scan for callers that don't pre-compute the token count.
+        # BPE tokenizers are context-sensitive at boundaries, so isolated
+        # encoding of proposed_next can differ from in-context tokenization.
+        proposed_text  = req.proposed_next.strip()
+        proposed_start = None
+        n_proposed     = 0
+        max_scan       = min(end_pos, max(len(req.proposed_next) // 2 + 20, 40))
+        for n in range(1, max_scan + 1):
+            start = end_pos - n
+            if start < 0:
+                break
+            if _tokenizer.decode(full_ids[0, start:end_pos].tolist()).strip() == proposed_text:
+                proposed_start = start
+                n_proposed     = n
+                break
+        if proposed_start is None:
+            ids = _tokenizer.encode(req.proposed_next, add_special_tokens=False)
+            n_proposed     = len(ids)
+            proposed_start = end_pos - n_proposed
+        decoded = _tokenizer.decode(full_ids[0, proposed_start:end_pos].tolist())
+        if decoded.strip() != req.proposed_next.strip():
+            print(
+                f"[coherence SERVER] token-alignment mismatch!  "
+                f"proposed_next={req.proposed_next!r}  "
+                f"decoded_from_ids={decoded!r}  "
+                f"seq_len={seq_len}  n_proposed={n_proposed}  "
+                f"proposed_start={proposed_start}  end_pos={end_pos}"
+            )
 
     if n_proposed <= 0:
         return RewardResponse(reward=0.0, n_tokens=0, token_log_probs=[])
     if proposed_start <= 0:
         raise HTTPException(400, "proposed_next longer than full sequence — check inputs")
-
-    decoded_proposed = _tokenizer.decode(full_ids[0, proposed_start:end_pos].tolist())
-    if decoded_proposed.strip() != req.proposed_next.strip():
-        print(
-            f"[coherence SERVER] token-alignment mismatch!  "
-            f"proposed_next={req.proposed_next!r}  "
-            f"decoded_from_ids={decoded_proposed!r}  "
-            f"seq_len={seq_len}  n_proposed={n_proposed}  "
-            f"proposed_start={proposed_start}  end_pos={end_pos}"
-        )
 
     # ── forward pass ──────────────────────────────────────────────────────────
 
