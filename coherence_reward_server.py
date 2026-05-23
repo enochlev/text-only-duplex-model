@@ -434,7 +434,10 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
             system_content, req.last_user_message
         )
 
-    assistant_full = req.last_bot_message + req.proposed_next
+    # Space separator prevents BPE from fusing the last char of last_bot_message
+    # with the first char of proposed_next into a single boundary-spanning token.
+    sep = " " if req.last_bot_message else ""
+    assistant_full = req.last_bot_message + sep + req.proposed_next
     proposed_score, token_log_probs, n_proposed = _forward_score(
         system_content, req.last_user_message, assistant_full,
         req.proposed_next, req.n_proposed_tokens, req.gamma, nl_ids, _NORMALIZE_PER_TOKEN,
@@ -446,7 +449,7 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
 
     greedy_score = 0.0
     if USE_REFERENCE and greedy_new_ids:
-        greedy_assistant = req.last_bot_message + greedy_text
+        greedy_assistant = req.last_bot_message + sep + greedy_text
         greedy_score, _, _ = _forward_score(
             system_content, req.last_user_message, greedy_assistant,
             greedy_text, None, req.gamma, nl_ids, normalize=False,
