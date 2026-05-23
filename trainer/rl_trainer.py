@@ -1220,6 +1220,17 @@ class FullDuplexRLTrainer:
                 step.reward = (step.reward or 0.0) + penalty
                 step.reward_breakdown["kl_coherence"] = penalty
 
+                if self.config.debug:
+                    if penalty > 0:
+                        marker = "▲ "
+                    elif penalty < 0:
+                        marker = "▼ "
+                    else:
+                        marker = "  "
+                    print(f"  KL   kl_coherence               "
+                          f"mean_kl={mean_kl:+.4f}  coeff={self.config.kl_ref_coeff}"
+                          f"  → {penalty:+.4f}  {marker}")
+
         return episodes
 
     # ------------------------------------------------------------------

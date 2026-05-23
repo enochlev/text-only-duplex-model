@@ -24,6 +24,7 @@ from trainer import (
     respond_after_user_reward,
     interruption_penalty,
     interruption_penalty_overlap,
+    backchannel_loop_penalty,
     make_default_data_pool,
     check_rm_servers,
 )
@@ -96,8 +97,9 @@ def main() -> None:
         respond_after_user_reward,    # penalise silence after user finishes
         interruption_penalty,         # penalise talking over the user
         interruption_penalty_overlap, # VAD-based overlap penalty
+        backchannel_loop_penalty,     # penalise consecutive backchannel loops
     ]
-    reward_weights = [1.0, 1.0, 1.0]
+    reward_weights = [1.0, 1.0, 1.0, 1.0]
 
     config.reward_fn_weights = reward_weights
 
