@@ -207,8 +207,8 @@ class ScriptTTSSource:
             word_timestamps.extend(_estimate_word_timestamps(line, t, t + dur, jittered_wpm))
             segments.append(audio_f32)
             t += dur
-            # ±40% pause jitter — trains the model on tight and loose turn windows.
-            pause_s = max(1.0, self.inter_turn_pause_s * random.uniform(0.6, 1.4))
+            # 4–8 block gap (8–16 s at block_s=2.0) between user turns.
+            pause_s = random.uniform(8.0, 16.0)
             segments.append(np.zeros(int(pause_s * ASR_SAMPLE_RATE), dtype=np.float32))
             t += pause_s
         audio = np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
