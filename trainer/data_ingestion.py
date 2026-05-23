@@ -296,6 +296,10 @@ def _get_ultrachat_embeddings() -> "np.ndarray":
         convert_to_numpy=True,
         normalize_embeddings=True,
     )
+    del model
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _torch.cuda.empty_cache()
     _ULTRACHAT_EMBEDDINGS = emb.astype(_np.float32)
     print(f"[UltraChatTTSSource] embeddings ready  shape={_ULTRACHAT_EMBEDDINGS.shape}")
     return _ULTRACHAT_EMBEDDINGS

@@ -183,6 +183,12 @@ class TrainerConfig:
     """Piper TTS model path used for GPTVoiceSimulator real-time episodes.
     Defaults to the full_duplex module default (en_US-danny-low) when empty."""
 
+    vllm_device: Optional[str] = None
+    """Pin the vLLM inference engine to a specific GPU, e.g. 'cuda:3'.
+    When set, vLLM and the training model run on separate GPUs so each can
+    maximise its memory budget independently.  Defaults to None (vLLM shares
+    the same device as config.device)."""
+
 
 # ---------------------------------------------------------------------------
 # vLLM generation with training metadata
@@ -785,6 +791,60 @@ def _compute_returns(rewards: List[float], gamma: float) -> List[float]:
 # FullDuplexRLTrainer
 # ---------------------------------------------------------------------------
 
+def _create_vllm_engine(
+    model_path: str,
+    gpu_memory_utilization: float,
+    max_model_len: int,
+    dtype: str,
+    local_rank: int = 0,
+) -> Any:
+    """Instantiate a vLLM LLM engine, optionally pinned to a specific GPU.
+
+    vLLM V0 (GPUExecutor) always passes local_rank=0 to its single worker,
+    which hard-wires the model onto cuda:0.  When local_rank != 0 we
+    monkey-patch _create_worker for the duration of the LLM constructor so
+    the engine lands on the requested device instead.
+    """
+    if not HAS_VLLM:
+        raise RuntimeError("vLLM is required for FullDuplexRLTrainer. pip install vllm")
+
+    if local_rank == 0:
+        return LLM(
+            model=model_path,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            dtype=dtype,
+        )
+
+    try:
+        from vllm.executor.gpu_executor import GPUExecutor as _GPUExec  # type: ignore
+        _orig_create = _GPUExec._create_worker
+
+        def _pinned_create(self, local_rank=0, rank=0, **kw):  # type: ignore[override]
+            return _orig_create(self, local_rank=local_rank, rank=rank, **kw)
+
+        # Bind the target rank into the closure via a default arg.
+        _pinned_create.__defaults__ = (local_rank, 0)
+        _GPUExec._create_worker = _pinned_create
+        print(f"[trainer] vLLM pinned to cuda:{local_rank} via GPUExecutor patch")
+    except Exception as exc:
+        print(f"[trainer] WARNING: could not pin vLLM to cuda:{local_rank} — {exc!r}")
+        _orig_create = None
+
+    try:
+        engine = LLM(
+            model=model_path,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            dtype=dtype,
+        )
+    finally:
+        if _orig_create is not None:
+            _GPUExec._create_worker = _orig_create  # always restore
+
+    return engine
+
+
 class FullDuplexRLTrainer:
     """
     REINFORCE trainer for full-duplex conversational policies.
@@ -839,15 +899,25 @@ class FullDuplexRLTrainer:
         # Trades ~30% extra compute for a large reduction in activation memory.
         self.model.gradient_checkpointing_enable()
 
-        print("[trainer] loading vLLM engine for rollout inference")
+        vllm_local_rank = 0
+        if config.vllm_device:
+            try:
+                vllm_local_rank = int(config.vllm_device.split(":")[-1])
+            except (ValueError, IndexError):
+                print(f"[trainer] WARNING: could not parse vllm_device={config.vllm_device!r}, "
+                      "falling back to default GPU")
+
+        _vllm_loc = f" (cuda:{vllm_local_rank})" if vllm_local_rank else ""
+        print(f"[trainer] loading vLLM engine for rollout inference{_vllm_loc}")
         # Force legacy V0 engine — V1 (default in 0.8+) runs the model in a
         # subprocess, making direct weight access for sync impossible.
         os.environ["VLLM_USE_V1"] = "0"
-        self.vllm_engine = LLM(
-            model=config.model_name_or_path,
+        self.vllm_engine = _create_vllm_engine(
+            model_path=config.model_name_or_path,
             gpu_memory_utilization=config.vllm_gpu_memory_utilization,
             max_model_len=config.max_seq_len,
             dtype="bfloat16",
+            local_rank=vllm_local_rank,
         )
 
         self.optimizer = torch.optim.AdamW(

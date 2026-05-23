@@ -93,7 +93,7 @@ async def lifespan(_: FastAPI):
             attn_implementation="sdpa",
         )
     else:
-        dtype      = torch.float32 if device == "cpu" else torch.float16
+        dtype      = torch.float32 if device == "cpu" else torch.bfloat16
         device_map = "auto" if device == "cuda" else device
         _model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
@@ -261,17 +261,24 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
 
     # ── forward pass ──────────────────────────────────────────────────────────
 
-    with torch.no_grad():
-        logits = _model(full_ids).logits[0]          # [seq_len, vocab]
-    log_probs = F.log_softmax(logits, dim=-1)        # [seq_len, vocab]
+    with torch.inference_mode():
+        full_logits = _model(full_ids).logits[0]          # [seq_len, vocab]
+        # Slice only the positions that predict proposed tokens before log_softmax.
+        # logits[p-1] predicts token at position p, so we need [proposed_start-1 : end_pos-1].
+        needed_logits = full_logits[proposed_start - 1 : end_pos - 1].clone()  # [n_proposed, vocab]
+        del full_logits
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # logits[p-1] predicts the token at position p
+    log_probs = F.log_softmax(needed_logits, dim=-1)  # [n_proposed, vocab]
+    del needed_logits
+
     token_log_probs: list[float] = []
-    for p in range(proposed_start, end_pos):
+    for i, p in enumerate(range(proposed_start, end_pos)):
         tok_id  = full_ids[0, p].item()
-        lp      = log_probs[p - 1, tok_id].item()
+        lp      = log_probs[i, tok_id].item()
         if NORMALIZE:
-            lp -= log_probs[p - 1].max().item()  # subtract greedy log-prob → advantage in (-inf, 0]
+            lp -= log_probs[i].max().item()  # subtract greedy log-prob → advantage in (-inf, 0]
         token_log_probs.append(lp)
 
     n_tokens = len(token_log_probs)

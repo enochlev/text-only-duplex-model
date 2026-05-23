@@ -71,6 +71,12 @@ def main() -> None:
         help="Episodes to collect before silence injection activates (default: 0 = on immediately). "
              "Use e.g. 40 to let the model learn to speak before silence pressure begins.",
     )
+    parser.add_argument(
+        "--vllm-device", default=None,
+        help="Pin the vLLM rollout engine to a specific GPU, e.g. 'cuda:3'. "
+             "When set, vLLM and the training model run on separate GPUs. "
+             "Default: same GPU as the training model.",
+    )
     args = parser.parse_args()
 
     config = TrainerConfig(
@@ -89,6 +95,7 @@ def main() -> None:
         debug_dir=args.debug_dir,
         silence_inject_lambda_knob=args.silence_lambda,
         silence_inject_start_episode=args.silence_lambda_delay,
+        vllm_device=args.vllm_device,
     )
 
     check_rm_servers()
