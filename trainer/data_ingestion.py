@@ -340,7 +340,7 @@ class UltraChatTTSSource:
     def __init__(
         self,
         silence_after_s: float = 24.0,
-        inter_turn_pause_s: float = 12.0,
+        inter_turn_pause_s: float = 20.0,
         max_episode_s: float = 72.0,
         block_s: float = 2.0,
         wpm: int = 150,

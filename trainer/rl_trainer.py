@@ -900,14 +900,18 @@ class FullDuplexRLTrainer:
                 src = getattr(simulator, "_data", None)
                 src_id = getattr(src, "source_id", "") or getattr(simulator, "source_id", "")
                 mode = "realtime" if isinstance(simulator, GPTVoiceSimulator) else "sim"
+                last_prompt_tok = len(ep.steps[-1].full_prompt_tokens) if ep.steps else 0
                 print(
                     f"[trainer] episode={ep.episode_id}  mode={mode}  "
                     f"steps={len(ep.steps)} (non-idle={n_non_idle})  "
                     f"blocks={len(ep.blocks)}  ended={ep.terminated_reason}"
                     + (f"  src={src_id}" if src_id else "")
                     + (f"  silence_λ={effective_lambda:.2f}" if effective_lambda else "  silence_λ=off")
+                    + f"  last_prompt_tok={last_prompt_tok}"
                 )
+                print()
                 _print_episode_summary(ep)
+                print()
             except Exception as exc:
                 print(f"[trainer] episode failed: {exc!r}")
         return episodes
@@ -954,7 +958,12 @@ class FullDuplexRLTrainer:
         for block in covered:
             user_snippet = (block.user_text or "<silence>")[:60]
             bot_snippet  = (block.assistant_text or "<idle>")[:60]
-            print(f"\n  ┌─ Block {block.block_id[:8]}")
+            bot_toks = len(
+                self.tokenizer.encode(
+                    block.assistant_text or "", add_special_tokens=False
+                )
+            )
+            print(f"\n  ┌─ Block {block.block_id[:8]}  [bot_toks={bot_toks}]")
             # Show last 4 history blocks as context before RM scores
             ctx = history[-4:] if len(history) >= 4 else history
             if ctx:
@@ -981,11 +990,7 @@ class FullDuplexRLTrainer:
             total += blk_total
             print(f"  └─ block total : {blk_total:+.4f}")
 
-        n_prompt   = len(step.full_prompt_tokens)
-        n_response = len(step.response_token_ids)
-        print(f"  STEP REWARD : {total:+.4f}"
-              f"    [tokens  prompt={n_prompt}  response={n_response}"
-              f"  total={n_prompt + n_response}]")
+        print(f"  STEP REWARD : {total:+.4f}")
         return total
 
     def compute_rewards(self, episode: Episode, ep_idx: int = 0) -> Episode:
