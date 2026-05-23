@@ -82,8 +82,6 @@ def main() -> None:
         save_every_n_steps=args.save_every,
         debug=args.debug,
         debug_dir=args.debug_dir,
-        silence_inject_lambda_knob=args.silence_lambda,
-        silence_inject_start_episode=args.silence_lambda_delay,
         vllm_device=args.vllm_device,
     )
 
