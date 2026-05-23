@@ -19,6 +19,7 @@ in trainer/rewards.py (idle_penalty).
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import contextlib
 from typing import Optional
@@ -54,9 +55,24 @@ NORMALIZE       = True
 # (capped at ~-0.5). Set via COHERENCE_SCALE env var to tune without code changes.
 REWARD_SCALE    = float(os.getenv("COHERENCE_SCALE", "0.2"))
 
+# Nonlinear shaping: map the "good zone" [SHAPE_THRESHOLD, 0] → [SHAPE_OUT_LO, SHAPE_OUT_HI]
+# using a convex (t^2) curve so near-perfect responses receive the steepest positive gradient.
+# Scores below SHAPE_THRESHOLD pass through unchanged (remain negative).
+_SHAPE_THRESHOLD = float(os.getenv("COHERENCE_SHAPE_THRESHOLD", "-0.25"))
+_SHAPE_OUT_LO    = float(os.getenv("COHERENCE_SHAPE_OUT_LO",    "0.25"))
+_SHAPE_OUT_HI    = float(os.getenv("COHERENCE_SHAPE_OUT_HI",    "1.0"))
+
 # Tokens the chat template appends after the assistant turn (stripped when
 # locating the proposed block inside the full token sequence).
 _END_STRINGS = ["<|im_end|>", "<|endoftext|>", "<|end_of_text|>", "</s>"]
+
+
+def _shape_reward(r: float) -> float:
+    if r >= _SHAPE_THRESHOLD:
+        t = (r - _SHAPE_THRESHOLD) / (0.0 - _SHAPE_THRESHOLD)  # 0 at threshold, 1 at 0
+        return _SHAPE_OUT_LO + (_SHAPE_OUT_HI - _SHAPE_OUT_LO) * t ** 2
+    return r
+
 
 # ── server ────────────────────────────────────────────────────────────────────
 
@@ -281,9 +297,9 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
 
     n_tokens = len(token_log_probs)
     raw = sum(req.gamma ** i * lp for i, lp in enumerate(token_log_probs))
-    # Divide by n_tokens → mean per-token advantage (length-invariant, in (-inf, 0]).
-    # Then scale to match the magnitude of the other reward signals.
-    reward = (raw / n_tokens) * REWARD_SCALE if n_tokens > 0 else 0.0
+    # Divide by sqrt(n_tokens) so longer consistently-good responses score higher than
+    # short fillers, then apply nonlinear shaping to reward near-perfect scores positively.
+    reward = _shape_reward((raw / math.sqrt(n_tokens)) * REWARD_SCALE) if n_tokens > 0 else 0.0
 
     return RewardResponse(
         reward=reward,

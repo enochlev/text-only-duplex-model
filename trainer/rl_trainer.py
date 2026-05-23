@@ -276,7 +276,8 @@ def llm_generate_train(
 
     text_clean = text.replace("<idle>", "").strip()
     if not text_clean:
-        return "", prompt_token_ids, [], []
+        # Keep tokens so REINFORCE can push against idle/EOS generation when penalised.
+        return "", prompt_token_ids, response_token_ids, log_probs
 
     return text_clean, prompt_token_ids, response_token_ids, log_probs
 
@@ -1139,7 +1140,7 @@ class FullDuplexRLTrainer:
                 return 0.0, {}
             rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
             if _user_finished_in(hist[-2]):
-                penalty = rm1_w * (-1.5)
+                penalty = rm1_w * (-2.0)
                 return penalty, {"respond_after_user_reward": penalty}
             return 0.0, {}
 
@@ -1217,7 +1218,7 @@ class FullDuplexRLTrainer:
         total = 0
         for episode in episodes:
             for step in episode.steps:
-                if step.is_idle or not step.response_token_ids:
+                if not step.response_token_ids:
                     continue
                 n_resp = len(step.response_token_ids)
                 if self.config.max_seq_len - n_resp - 1 < 1:
@@ -1251,7 +1252,7 @@ class FullDuplexRLTrainer:
             returns = _compute_returns(rewards, self.config.gamma)
 
             for step, G in zip(episode.steps, returns):
-                if step.is_idle or not step.response_token_ids:
+                if not step.response_token_ids:
                     continue
 
                 n_resp = len(step.response_token_ids)

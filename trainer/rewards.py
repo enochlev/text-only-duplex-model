@@ -8,7 +8,7 @@ import re
 import traceback
 import urllib.error
 import urllib.request
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import httpx
 import numpy as np
@@ -62,21 +62,65 @@ Returns:
 
 
 
+_MIN_RESPONSE_WORDS = 6    # cumulative bot-word target after user finishes
+_BLOCK_WORD_CAP     = 4    # assumed per-block generation cap (first block grace)
+_MAX_SHORT_PENALTY  = -0.5 # penalty at 0 cumulative words (tapers to 0 at target)
+
+
+def _words_since_user_finished(history: List[DuplexAudioBlock]) -> Tuple[int, bool]:
+    """Sum bot words in all history blocks after the most recent user turn-complete.
+
+    Returns (word_count, True) when a completed user turn is found in history,
+    (0, False) when the user has never finished talking.
+    """
+    for i in range(len(history) - 1, -1, -1):
+        if _user_finished_in(history[i]):
+            words = sum(len((b.assistant_text or "").split()) for b in history[i + 1:])
+            return words, True
+    return 0, False
+
+
 def respond_after_user_reward(
     block: DuplexAudioBlock,
     history: List[DuplexAudioBlock],
     is_terminal: bool,
 ) -> float:
-    """Penalise silence when the user finished speaking more than 1 block ago.
+    """Penalise (1) silence and (2) too-short responses after the user finishes speaking.
 
-    Lag=1 (respond in the block immediately after user finishes) is acceptable.
-    Only fires when the user spoke 2+ blocks back, signalling a missed
-    turn-taking opportunity that the model should correct.
+    Silence penalty  : -2.0 when bot output is empty and user finished 2+ blocks ago.
+    Min-length penalty: convex growing penalty when cumulative bot words since user
+                        finished < _MIN_RESPONSE_WORDS, unless this block hit the
+                        per-block word cap (bot is generating at full rate).
+    Both penalties are cancelled when the user is currently speaking.
     """
-    if block.assistant_text or len(history) < 2:
+    # User is actively speaking → no penalty
+    if block.user_text:
         return 0.0
-    user_spoke_2ago = _user_finished_in(history[-2])
-    return -1.5 if user_spoke_2ago else 0.0
+
+    if not block.assistant_text:
+        # Silence path: penalise only after a full lag of 2 blocks
+        if len(history) < 2:
+            return 0.0
+        return -2.0 if _user_finished_in(history[-2]) else 0.0
+
+    # Bot spoke — apply min-response-length check
+    words_this_block = len(block.assistant_text.split())
+
+    # Bot hit per-block cap → generating at full rate, no penalty
+    if words_this_block >= _BLOCK_WORD_CAP:
+        return 0.0
+
+    cumulative_words, user_finished = _words_since_user_finished(history)
+    if not user_finished:
+        return 0.0
+
+    cumulative_words += words_this_block
+    if cumulative_words >= _MIN_RESPONSE_WORDS:
+        return 0.0
+
+    # Convex curve: steeply penalises near-zero counts, tapers to 0 at target
+    fraction = cumulative_words / _MIN_RESPONSE_WORDS  # in [0, 1)
+    return _MAX_SHORT_PENALTY * (1.0 - fraction) ** 2
 
 
 
