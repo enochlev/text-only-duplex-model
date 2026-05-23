@@ -952,23 +952,6 @@ class FullDuplexRLTrainer:
 
         total = 0.0
         for block in covered:
-            blk_dir = os.path.join(
-                self.config.debug_dir,
-                f"step{step_num:04d}",
-                f"ep{ep_idx:02d}",
-            )
-            blk_stem = f"blk_{block.block_id[:8]}"
-
-            # Export audio
-            mic_path = tts_path = None
-            if block.mic_audio is not None and len(block.mic_audio) > 0:
-                mic_path = os.path.join(blk_dir, f"{blk_stem}_mic.wav")
-                self._save_wav(mic_path, block.mic_audio, ASR_SAMPLE_RATE)
-            if block.tts_audio is not None and len(block.tts_audio) > 0:
-                tts_path = os.path.join(blk_dir, f"{blk_stem}_tts.wav")
-                self._save_wav(tts_path, block.tts_audio,
-                               getattr(block, "tts_sr", TTS_SAMPLE_RATE))
-
             user_snippet = (block.user_text or "<silence>")[:60]
             bot_snippet  = (block.assistant_text or "<idle>")[:60]
             print(f"\n  ┌─ Block {block.block_id[:8]}")
@@ -982,11 +965,7 @@ class FullDuplexRLTrainer:
                 print(f"  │  {'─'*60}")
             print(f"  │  user : {user_snippet!r}")
             print(f"  │  bot  : {bot_snippet!r}")
-            if mic_path:
-                print(f"  │  mic  → {mic_path}")
-            if tts_path:
-                print(f"  │  tts  → {tts_path}")
-            print(f"  │")
+            print("  │")
 
             blk_total = 0.0
             for rm_idx, (fn, w, name) in enumerate(
@@ -1002,7 +981,11 @@ class FullDuplexRLTrainer:
             total += blk_total
             print(f"  └─ block total : {blk_total:+.4f}")
 
-        print(f"  STEP REWARD : {total:+.4f}")
+        n_prompt   = len(step.full_prompt_tokens)
+        n_response = len(step.response_token_ids)
+        print(f"  STEP REWARD : {total:+.4f}"
+              f"    [tokens  prompt={n_prompt}  response={n_response}"
+              f"  total={n_prompt + n_response}]")
         return total
 
     def compute_rewards(self, episode: Episode, ep_idx: int = 0) -> Episode:
@@ -1075,6 +1058,21 @@ class FullDuplexRLTrainer:
                     self._step_count, ep_idx, i, step,
                     covered, history, is_terminal, fn_names,
                 )
+
+            # ── Episode token summary ──────────────────────────────────────
+            ep_prompt_total    = sum(len(s.full_prompt_tokens)  for s in episode.steps)
+            ep_response_total  = sum(len(s.response_token_ids)  for s in episode.steps)
+            trainable_steps    = sum(
+                1 for s in episode.steps
+                if not s.is_idle and s.response_token_ids
+            )
+            print(f"\n{'─'*70}")
+            print(f"  Episode token summary  (ep={ep_idx}  steps={n_steps}"
+                  f"  trainable={trainable_steps})")
+            print(f"    prompt   tokens : {ep_prompt_total:>8,}")
+            print(f"    response tokens : {ep_response_total:>8,}")
+            print(f"    total    tokens : {ep_prompt_total + ep_response_total:>8,}")
+            print(f"{'─'*70}")
             return episode
 
         def _score_step(i: int) -> Tuple[float, Dict[str, float]]:
