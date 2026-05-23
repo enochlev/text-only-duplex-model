@@ -98,10 +98,15 @@ def respond_after_user_reward(
         return 0.0
 
     if not block.assistant_text:
-        # Silence path: penalise only after a full lag of 2 blocks
-        if len(history) < 2:
+        if not history:
             return 0.0
-        return -2.0 if _user_finished_in(history[-2]) else 0.0
+        # First silent block after user finishes: must respond immediately
+        if _user_finished_in(history[-1]):
+            return -10.0
+        # Second block still silent
+        if len(history) >= 2 and _user_finished_in(history[-2]):
+            return -2.0
+        return 0.0
 
     # Bot spoke — apply min-response-length check
     words_this_block = len(block.assistant_text.split())
