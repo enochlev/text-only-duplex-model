@@ -215,7 +215,7 @@ def llm_generate_train(
         ]
         try:
             full_prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
         except Exception:
             full_prompt = f"{system_prompt}\n\n{user_message}"
