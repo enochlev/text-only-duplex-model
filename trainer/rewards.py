@@ -67,6 +67,21 @@ _BLOCK_WORD_CAP     = 4    # assumed per-block generation cap (first block grace
 _MAX_SHORT_PENALTY  = -0.5 # penalty at 0 cumulative words (tapers to 0 at target)
 
 
+def _blocks_since_user_finished(history: List[DuplexAudioBlock]) -> Optional[int]:
+    """Blocks of consecutive bot-silence since the most recent user turn-complete.
+
+    Returns None if the user hasn't finished or the bot already responded.
+    Returns 1 if the user finished in the immediately preceding block, 2 for the
+    block before that, etc.
+    """
+    for lag, b in enumerate(reversed(history), start=1):
+        if b.assistant_text:
+            return None  # bot spoke since user finished — silence is intentional
+        if _user_finished_in(b):
+            return lag
+    return None
+
+
 def _words_since_user_finished(history: List[DuplexAudioBlock]) -> Tuple[int, bool]:
     """Sum bot words in all history blocks after the most recent user turn-complete.
 
@@ -98,15 +113,12 @@ def respond_after_user_reward(
         return 0.0
 
     if not block.assistant_text:
-        if not history:
+        lag = _blocks_since_user_finished(history)
+        if lag is None:
             return 0.0
-        # First silent block after user finishes: must respond immediately
-        if _user_finished_in(history[-1]):
-            return -10.0
-        # Second block still silent
-        if len(history) >= 2 and _user_finished_in(history[-2]):
-            return -2.0
-        return 0.0
+        if lag == 1:
+            return -8.0  # first block after user finishes: respond now
+        return -3.0       # every subsequent block of sustained non-response
 
     # Bot spoke — apply min-response-length check
     words_this_block = len(block.assistant_text.split())
@@ -462,10 +474,10 @@ def silence_too_long_penalty(
     if lag <= 1:
         return 0.0
     if lag == 2:
-        return -0.10
+        return -0.5
     if lag == 3:
-        return -0.25
-    return -0.50
+        return -1.0
+    return -2.0
 
 
 def monologue_too_long_penalty(
