@@ -1,12 +1,18 @@
 """test_coherence_behavior.py — edge-case behavioral tests for the coherence server.
 
-Focused on failure modes and recent fixes:
+Covers:
   - backchannel loop reward hacking (history stripping)
   - BPE boundary token catastrophic first-token penalty
   - off-topic / repetition penalties
   - rambling after EOS
   - silence token handling
   - first-response with no prior context
+  - mid-sentence continuations
+  - token-hint consistency
+  - long monologue context
+  - student_emitted_eos scoring
+  - question-back-to-user
+  - empty user context
 
 Run with pytest (server must be up first):
     python coherence_reward_server.py &
@@ -48,8 +54,9 @@ def _reward(
     last_bot: str = "",
     prev_block_was_eos: bool = False,
     student_emitted_eos: bool = False,
+    n_proposed_tokens: int | None = None,
 ) -> dict:
-    return _post("/reward", {
+    body: dict = {
         "history":            history or [],
         "last_user_message":  last_user,
         "last_bot_message":   last_bot,
@@ -57,7 +64,10 @@ def _reward(
         "gamma":              0.9,
         "prev_block_was_eos": prev_block_was_eos,
         "student_emitted_eos": student_emitted_eos,
-    })
+    }
+    if n_proposed_tokens is not None:
+        body["n_proposed_tokens"] = n_proposed_tokens
+    return _post("/reward", body)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -257,5 +267,134 @@ def test_first_response_no_context():
         f"Coherent first response ({r_coherent['reward']:.4f}) should beat "
         f"incoherent ({r_incoherent['reward']:.4f})"
     )
-    # Also verify the server doesn't crash with empty context
     assert r_coherent["n_tokens"] > 0
+
+
+# ── 9. Mid-sentence continuation scores well ─────────────────────────────────
+
+def test_mid_sentence_continuation():
+    """When prev_bot is a sentence fragment, a natural completion should score
+    better than an unrelated continuation."""
+    user     = "What's the best way to learn programming?"
+    fragment = "I'd recommend starting with Python because"
+
+    r_natural = _reward(
+        "it has clean syntax and a large community of learners.",
+        last_user=user, last_bot=fragment,
+    )
+    r_abrupt = _reward(
+        "the weather in Tokyo is nice in spring.",
+        last_user=user, last_bot=fragment,
+    )
+    assert r_natural["reward"] > r_abrupt["reward"], (
+        f"Natural completion ({r_natural['reward']:.4f}) should beat "
+        f"unrelated continuation ({r_abrupt['reward']:.4f})"
+    )
+
+
+# ── 10. n_proposed_tokens hint doesn't break scoring ─────────────────────────
+
+def test_token_hint_consistency():
+    """Providing n_proposed_tokens should return the same reward as not providing it.
+    The hint only speeds up token location — it must not change the score."""
+    proposed = "That's a great question about renewable energy."
+    user     = "What do you think about solar power?"
+
+    r_no_hint   = _reward(proposed, last_user=user)
+    r_with_hint = _reward(proposed, last_user=user,
+                          n_proposed_tokens=r_no_hint["n_tokens"])
+
+    diff = abs(r_no_hint["reward"] - r_with_hint["reward"])
+    assert diff < 0.05, (
+        f"Hint changed reward by {diff:.4f} — "
+        f"no_hint={r_no_hint['reward']:.4f}  with_hint={r_with_hint['reward']:.4f}"
+    )
+    assert r_no_hint["n_tokens"] == r_with_hint["n_tokens"], (
+        f"n_tokens differs: {r_no_hint['n_tokens']} vs {r_with_hint['n_tokens']}"
+    )
+
+
+# ── 11. Long monologue prefix reduces score for continuing ───────────────────
+
+def test_long_monologue_scores_lower_than_short():
+    """After the bot has already given a long answer, proposing more content
+    should score lower than proposing the same content after a short prefix.
+
+    The teacher should penalise over-talking — the bot should yield the floor.
+    """
+    user      = "Can you explain photosynthesis?"
+    proposed  = "So that's the basic process in a nutshell."
+    short_bot = "Photosynthesis converts sunlight into glucose."
+    long_bot  = (
+        "Photosynthesis converts sunlight into glucose. "
+        "This happens in the chloroplasts of plant cells. "
+        "The process requires carbon dioxide and water. "
+        "Oxygen is released as a byproduct. "
+        "It's the foundation of almost all food chains on Earth."
+    )
+
+    r_short = _reward(proposed, last_user=user, last_bot=short_bot)
+    r_long  = _reward(proposed, last_user=user, last_bot=long_bot)
+
+    assert r_short["reward"] >= r_long["reward"], (
+        f"After short prefix ({r_short['reward']:.4f}) should score ≥ "
+        f"after long monologue ({r_long['reward']:.4f})"
+    )
+
+
+# ── 12. student_emitted_eos changes n_tokens ─────────────────────────────────
+
+def test_student_emitted_eos_increases_token_count():
+    """When student_emitted_eos=True, the EOS token is appended to the scoring
+    window, so n_tokens should be one higher than without it."""
+    proposed = "Sure, I can help with that."
+    user     = "Can you assist me?"
+
+    r_no_eos  = _reward(proposed, last_user=user, student_emitted_eos=False)
+    r_with_eos = _reward(proposed, last_user=user, student_emitted_eos=True)
+
+    assert r_with_eos["n_tokens"] >= r_no_eos["n_tokens"], (
+        f"EOS path should have ≥ tokens: no_eos={r_no_eos['n_tokens']} "
+        f"with_eos={r_with_eos['n_tokens']}"
+    )
+
+
+# ── 13. Asking a follow-up question scores well ───────────────────────────────
+
+def test_question_back_to_user_scores_well():
+    """When the user gives a short ambiguous message, the bot asking a
+    clarifying question should score better than a random statement."""
+    user = "I need help with something."
+
+    r_question  = _reward("Of course — what is it you're working on?", last_user=user)
+    r_unrelated = _reward("The mitochondria is the powerhouse of the cell.", last_user=user)
+
+    assert r_question["reward"] > r_unrelated["reward"], (
+        f"Clarifying question ({r_question['reward']:.4f}) should beat "
+        f"unrelated statement ({r_unrelated['reward']:.4f})"
+    )
+
+
+# ── 14. Empty last_user_message doesn't crash server ─────────────────────────
+
+def test_empty_user_message_handled():
+    """Server should return a valid scored response even when last_user_message
+    is empty (bot is mid-monologue with no active user turn)."""
+    r = _reward(
+        "and that's why the algorithm runs in O(n log n) time.",
+        last_user="",
+        last_bot="Let me walk you through the complexity analysis.",
+    )
+    assert isinstance(r["reward"], float)
+    assert r["n_tokens"] > 0
+
+
+# ── 15. Single-word response is scored without crashing ──────────────────────
+
+def test_single_word_response():
+    """Very short proposed text (one word) should be scored without errors."""
+    cases = ["Yes.", "No.", "Okay.", "Right."]
+    for word in cases:
+        r = _reward(word, last_user="Do you understand?")
+        assert isinstance(r["reward"], float), f"expected float reward for {word!r}"
+        assert r["n_tokens"] >= 1, f"expected ≥1 token for {word!r}"
