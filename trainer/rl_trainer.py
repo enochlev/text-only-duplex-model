@@ -261,6 +261,10 @@ def llm_generate_train(
     )
     text = _ROLE_RE.sub("", out.text or "")
     text = text.replace("</s>", "").replace("<s>", "").strip()
+    # Strip Qwen3 thinking blocks: <think>...</think> and any orphaned tags.
+    # vLLM's skip_special_tokens removes <think> (special token) but not </think>.
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'</?think>', '', text).strip()
 
     response_token_ids: List[int] = list(out.token_ids)
 
@@ -376,9 +380,16 @@ class VirtualSimulationConnection:
                 tokens_per_block = max(1, self.vllm_max_tokens // 4)
                 n_keep = random.randint(1, 4) * tokens_per_block
                 if n_keep < len(rtok):
-                    rtok = rtok[:n_keep]
-                    lps = lps[:n_keep]
-                    text = self.tokenizer.decode(rtok, skip_special_tokens=True).strip()
+                    candidate = self.tokenizer.decode(rtok[:n_keep], skip_special_tokens=True).strip()
+                    # Snap to last word boundary to avoid partial-word fragments.
+                    # Only apply truncation when the result has enough content.
+                    last_space = candidate.rfind(' ')
+                    if last_space > 0:
+                        candidate = candidate[:last_space]
+                    if len(candidate.split()) >= 3:
+                        rtok = self.tokenizer.encode(candidate, add_special_tokens=False)
+                        lps = lps[:len(rtok)]
+                        text = candidate
 
             # Punctuation truncation: cut text at its last punctuation mark.
             if text and lam > 0.0 and random.random() < lam:
@@ -567,9 +578,14 @@ class RealTimeGPTEpisodeRunner:
                 tokens_per_block = max(1, self.vllm_max_tokens // 4)
                 n_keep = random.randint(1, 4) * tokens_per_block
                 if n_keep < len(rtok):
-                    rtok = rtok[:n_keep]
-                    lps = lps[:n_keep]
-                    text = self.tokenizer.decode(rtok, skip_special_tokens=True).strip()
+                    candidate = self.tokenizer.decode(rtok[:n_keep], skip_special_tokens=True).strip()
+                    last_space = candidate.rfind(' ')
+                    if last_space > 0:
+                        candidate = candidate[:last_space]
+                    if len(candidate.split()) >= 3:
+                        rtok = self.tokenizer.encode(candidate, add_special_tokens=False)
+                        lps = lps[:len(rtok)]
+                        text = candidate
 
             if text and lam > 0.0 and random.random() < lam:
                 matches = list(_PUNCT_RE.finditer(text))

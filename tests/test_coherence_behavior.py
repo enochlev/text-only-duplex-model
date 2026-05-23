@@ -314,31 +314,37 @@ def test_token_hint_consistency():
     )
 
 
-# ── 11. Long monologue prefix reduces score for continuing ───────────────────
+# ── 11. Continuation fits short prefix better than long ──────────────────────
 
-def test_long_monologue_scores_lower_than_short():
-    """After the bot has already given a long answer, proposing more content
-    should score lower than proposing the same content after a short prefix.
+def test_continuation_fits_short_prefix_better():
+    """A mid-thought continuation should score better when the prefix is short
+    (still mid-explanation) than when the prefix is already a complete answer.
 
-    The teacher should penalise over-talking — the bot should yield the floor.
+    After a long prefix that fully answers the question, adding more detail
+    scores lower because the teacher has moved on — a continuation is redundant.
+    After a short prefix, the same detail is a natural next step.
+
+    Note: over-talking length is penalised by monologue_too_long_penalty, not
+    the coherence reward. This test checks content-fit, not talk-time.
     """
     user      = "Can you explain photosynthesis?"
-    proposed  = "So that's the basic process in a nutshell."
-    short_bot = "Photosynthesis converts sunlight into glucose."
+    proposed  = "The process also requires water drawn up from the roots."
+    short_bot = "Photosynthesis converts sunlight into glucose using carbon dioxide."
     long_bot  = (
-        "Photosynthesis converts sunlight into glucose. "
-        "This happens in the chloroplasts of plant cells. "
-        "The process requires carbon dioxide and water. "
-        "Oxygen is released as a byproduct. "
-        "It's the foundation of almost all food chains on Earth."
+        "Photosynthesis converts sunlight into glucose using carbon dioxide. "
+        "The process also requires water drawn up from the roots. "
+        "Oxygen is released as a byproduct into the atmosphere. "
+        "It all happens in the chloroplasts inside plant cells."
     )
 
     r_short = _reward(proposed, last_user=user, last_bot=short_bot)
     r_long  = _reward(proposed, last_user=user, last_bot=long_bot)
 
+    # After the long prefix, proposed is already contained in prev_bot — redundant.
+    # After the short prefix, it's the natural next sentence.
     assert r_short["reward"] >= r_long["reward"], (
         f"After short prefix ({r_short['reward']:.4f}) should score ≥ "
-        f"after long monologue ({r_long['reward']:.4f})"
+        f"after long prefix that already said the same thing ({r_long['reward']:.4f})"
     )
 
 
