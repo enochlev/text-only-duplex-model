@@ -37,7 +37,7 @@ load_dotenv()
 # ── config ────────────────────────────────────────────────────────────────────
 
 MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3.5-4B")  # or "Qwen/Qwen2.5-Instruct"
-MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-14B-FP8")  # --- IGNORE ---
+MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-8B-FP8")  # --- IGNORE ---
 
 _IS_QUANTIZED = any(tag in MODEL_NAME.lower() for tag in ("awq", "fp8", "gptq", "gguf"))
 if _IS_QUANTIZED:
@@ -84,18 +84,22 @@ _SENTENCE_TERMINALS = frozenset('.?!:;')
 
 
 def _frame_user_msg(text: str) -> str:
-    """Reframe the user message as reported speech with an explicit turn boundary.
+    """Add syntactic distance between the user's live speech and the assistant turn.
 
-    Two defenses against sentence-completion bleed:
-    - '[User said]:' prefix  — teacher reads this as a quoted utterance to
-      respond TO, not an open prompt to continue.
-    - ' ...'  suffix        — appended when the message has no terminal
-      punctuation, signalling the speaker was cut off mid-stream.
+    Without framing, the teacher may treat the assistant's opening tokens as a
+    direct sentence-completion of the user's trailing words (e.g. user ends with
+    "machine learning", assistant opens with "and..." → teacher assigns p≈1).
+
+    Two defenses:
+    - '[User]:' prefix — role label inside the content breaks the open-sentence
+      surface so the teacher reads this as a discrete turn to respond TO.
+    - ' ...' suffix   — appended when the message has no terminal punctuation,
+      signalling the user is still speaking (duplex: user and bot overlap in time).
     """
     stripped = text.rstrip()
     if stripped and stripped[-1] not in _SENTENCE_TERMINALS:
         stripped += " ..."
-    return f"[User said]: {stripped}"
+    return f"[User]: {stripped}"
 
 
 def _shape_reward(r: float) -> float:
@@ -314,7 +318,7 @@ def _build_assistant_ids(
     """Tokenize a complete chat turn and return input_ids on the model device."""
     messages = [
         {"role": "system",    "content": system_content},
-        {"role": "user",      "content": last_user},
+        {"role": "user",      "content": _frame_user_msg(last_user)},
         {"role": "assistant", "content": assistant_text},
     ]
     out = _tokenizer.apply_chat_template(
@@ -355,7 +359,7 @@ def _generate_greedy_reference(
     """Greedily generate a teacher reference response. Returns (text, token_ids)."""
     messages_prefix = [
         {"role": "system", "content": system_content},
-        {"role": "user",   "content": last_user},
+        {"role": "user",   "content": _frame_user_msg(last_user)},
     ]
     pfx_out = _tokenizer.apply_chat_template(
         messages_prefix, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
