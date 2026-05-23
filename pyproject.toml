@@ -32,6 +32,7 @@ train = [
     "accelerate>=0.29.0",
     # Audio loading for StaticAudioSimulator (MP3 support)
     "librosa>=0.10.0",
+    "wandb>=0.16.0",
 ]
 
 [tool.pytest.ini_options]

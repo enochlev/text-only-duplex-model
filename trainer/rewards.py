@@ -98,6 +98,9 @@ def coherence_reward(
     for b in reversed(history):
         if b.user_text:
             last_user = b.user_text
+            # Duplex block: bot also spoke in the same window — include it as prefix.
+            if b.assistant_text:
+                bot_prefix_parts.insert(0, b.assistant_text)
             break
         if b.assistant_text:
             bot_prefix_parts.insert(0, b.assistant_text)

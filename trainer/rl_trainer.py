@@ -25,6 +25,16 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv()
+
+try:
+    import wandb as _wandb
+    HAS_WANDB = True
+except ImportError:
+    _wandb = None  # type: ignore
+    HAS_WANDB = False
+
 import numpy as np
 import torch
 
@@ -927,6 +937,29 @@ class FullDuplexRLTrainer:
         self._step_count: int = 0
         self._total_episodes: int = 0
 
+        if HAS_WANDB and os.getenv("WANDB_API_KEY"):
+            _wandb.init(
+                project=os.getenv("WANDB_PROJECT", "full-duplex-text"),
+                name=os.getenv("WANDB_RUN_NAME"),
+                config={
+                    "model": config.model_name_or_path,
+                    "learning_rate": config.learning_rate,
+                    "kl_coeff": config.kl_coeff,
+                    "episodes_per_train_step": config.episodes_per_train_step,
+                    "vllm_max_tokens": config.vllm_max_tokens,
+                    "vllm_temperature": config.vllm_temperature,
+                    "gamma": config.gamma,
+                    "baseline_ema_alpha": config.baseline_ema_alpha,
+                    "gradient_clip": config.gradient_clip,
+                    "silence_inject_lambda": config.silence_inject_lambda_knob,
+                },
+            )
+            print(f"[trainer] wandb run initialised: {_wandb.run.name}")
+        elif not HAS_WANDB:
+            print("[trainer] wandb not installed — metrics will not be logged remotely")
+        else:
+            print("[trainer] WANDB_API_KEY not set — skipping wandb init")
+
     # ------------------------------------------------------------------
     # Rollout collection
     # ------------------------------------------------------------------
@@ -1333,13 +1366,23 @@ class FullDuplexRLTrainer:
                 sum(sum(1 for s in e.steps if not s.is_idle) for e in episodes)
             ),
         }
-        fn_str = "  ".join(f"{k}={v:+.3f}" for k, v in fn_avgs.items())
+        width = 70
+        print(f"\n{'━'*width}")
         print(
-            f"[trainer] step={self._step_count}  loss={metrics['loss']:.4f}  "
-            f"avg_reward={metrics['avg_reward']:+.3f}  baseline={metrics['baseline']:.3f}  "
+            f"  Step {self._step_count:04d}  |  "
+            f"loss={metrics['loss']:.4f}  "
+            f"baseline={metrics['baseline']:.3f}  "
             f"non_idle={int(metrics['n_non_idle'])}/{int(metrics['n_steps_total'])}"
-            + (f"\n          {fn_str}" if fn_str else "")
         )
+        print(f"  {'─'*width}")
+        print(f"  {'avg_total_reward':32s}  {metrics['avg_reward']:+.4f}")
+        for fn_name, avg_val in fn_avgs.items():
+            print(f"  {'avg_' + fn_name:32s}  {avg_val:+.4f}")
+        print(f"{'━'*width}\n")
+
+        if HAS_WANDB and _wandb.run is not None:
+            _wandb.log(metrics, step=self._step_count)
+
         return metrics
 
     # ------------------------------------------------------------------
@@ -1380,6 +1423,8 @@ class FullDuplexRLTrainer:
                 self.save_checkpoint()
         self.save_checkpoint(tag="final")
         self._export_rewards_csv(history)
+        if HAS_WANDB and _wandb.run is not None:
+            _wandb.finish()
         return history
 
     def train_epochs(self, num_epochs: int, shuffle: bool = True) -> List[Dict[str, float]]:
@@ -1401,6 +1446,8 @@ class FullDuplexRLTrainer:
                     self.save_checkpoint()
         self.save_checkpoint(tag="final")
         self._export_rewards_csv(history)
+        if HAS_WANDB and _wandb.run is not None:
+            _wandb.finish()
         return history
 
     # ------------------------------------------------------------------
