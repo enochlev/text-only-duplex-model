@@ -36,36 +36,22 @@ load_dotenv()
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3.5-4B")  # or "Qwen/Qwen2.5-Instruct"
-MODEL_NAME      = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-8B-FP8")  # --- IGNORE ---
+MODEL_NAME = os.getenv("COHERENCE_MODEL", "Qwen/Qwen3-8B-FP8")
 
 _IS_QUANTIZED = any(tag in MODEL_NAME.lower() for tag in ("awq", "fp8", "gptq", "gguf"))
 if _IS_QUANTIZED:
     # Quantized models need CUDA; FP8 also needs compressed-tensors: pip install compressed-tensors
     assert torch.cuda.is_available(), f"Quantized model '{MODEL_NAME}' requires CUDA, but no GPU is available"
 
-GAMMA           = float(os.getenv("COHERENCE_GAMMA", "0.9"))
-PORT            = int(os.getenv("COHERENCE_PORT", "10001"))
-# Normalize reward by subtracting the greedy log-prob at each position.
-# reward_i = log P(proposed_i) - log P(greedy_i), always in (-inf, 0].
-# 0 = matched teacher's best choice; more negative = teacher preferred something else.
-# Superseded by USE_REFERENCE when that mode is active.
-NORMALIZE       = True
-# Scale factor applied after per-token averaging. Brings the mean per-token
-# advantage (typically -4..0) into the same range as the other reward signals
-# (capped at ~-0.5). Set via COHERENCE_SCALE env var to tune without code changes.
-REWARD_SCALE    = float(os.getenv("COHERENCE_SCALE", "0.2"))
-# Penalty applied when both teacher and student ended the previous block (mutual EOS)
-# but the student talks again in the next block (rambling after turn completion).
-# Bypasses the teacher forward pass — the answer is structurally wrong regardless of content.
+GAMMA  = float(os.getenv("COHERENCE_GAMMA", "0.9"))
+PORT   = int(os.getenv("COHERENCE_PORT", "10001"))
+# Per-token normalization: reward_i = log P(token_i) - log P(best_token_i), always in (-inf, 0].
+# 0 = teacher's best choice at that position; more negative = teacher preferred something else.
+# This gives gradient signal across the full quality spectrum, not just at the teacher's
+# single greedy output — coherent-but-not-optimal responses get moderate positive reward.
+NORMALIZE        = True
+REWARD_SCALE     = float(os.getenv("COHERENCE_SCALE", "0.2"))
 RAMBLING_PENALTY = float(os.getenv("COHERENCE_RAMBLING_PENALTY", "-4.0"))
-# Reference-based scoring: greedily generate a teacher reference response, then
-# reward = normalized_score(proposed) - normalized_score(reference).
-# Supersedes per-token NORMALIZE when enabled.
-USE_REFERENCE        = os.getenv("COHERENCE_USE_REFERENCE", "1") == "1"
-REFERENCE_MAX_TOKENS = int(os.getenv("COHERENCE_REFERENCE_MAX_TOKENS", "16"))
-# per-token normalization is superseded by reference-based normalization
-_NORMALIZE_PER_TOKEN = NORMALIZE and not USE_REFERENCE
 
 # Nonlinear shaping: map the "good zone" [SHAPE_THRESHOLD, 0] → [SHAPE_OUT_LO, SHAPE_OUT_HI]
 # using a convex (t^2) curve so near-perfect responses receive the steepest positive gradient.
@@ -242,7 +228,6 @@ class RewardResponse(BaseModel):
     reward:          float
     n_tokens:        int
     token_log_probs: list[float]
-    greedy_text:     str = ""
 
 
 # ── endpoint ──────────────────────────────────────────────────────────────────
@@ -361,7 +346,6 @@ def _forward_score(
     n_hint: Optional[int],
     gamma: float,
     nl_ids: set[int],
-    normalize: bool,
     include_terminal_eos: bool = False,
 ) -> tuple[float, list[float], int]:
     """Score `text_to_score` inside a full chat sequence. Returns (score, lps, n_tokens)."""
@@ -374,36 +358,8 @@ def _forward_score(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     token_ids = full_ids[0, t_start:end_pos].tolist()
-    score, lps = _score_tokens(logits, token_ids, gamma, normalize)
+    score, lps = _score_tokens(logits, token_ids, gamma, NORMALIZE)
     return score, lps, n_tokens
-
-
-def _generate_greedy_reference(
-    system_content: str, last_user: str
-) -> tuple[str, list[int]]:
-    """Greedily generate a teacher reference response. Returns (text, token_ids)."""
-    messages_prefix = [
-        {"role": "system", "content": system_content},
-        {"role": "user",   "content": _frame_user_msg(last_user)},
-    ]
-    pfx_out = _tokenizer.apply_chat_template(
-        messages_prefix, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
-    )
-    prefix_ids: torch.Tensor = (
-        pfx_out.input_ids if hasattr(pfx_out, "input_ids") else pfx_out
-    ).to(_model.device)
-    with torch.inference_mode():
-        gen_out = _model.generate(
-            prefix_ids,
-            max_new_tokens=REFERENCE_MAX_TOKENS,
-            do_sample=False,
-            pad_token_id=_tokenizer.eos_token_id,
-        )
-    new_ids = gen_out[0, prefix_ids.shape[1]:].tolist()
-    while new_ids and new_ids[-1] in _end_ids:
-        new_ids.pop()
-    text = _tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-    return text, new_ids
 
 
 @app.post("/reward", responses={503: {"description": "Model not loaded"}})
@@ -428,40 +384,23 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
     system_content = _SYSTEM_TMPL.format(history=history_str)
     nl_ids         = set(_tokenizer.encode("\n", add_special_tokens=False))
 
-    greedy_text    = ""
-    greedy_new_ids: list[int] = []
-    if USE_REFERENCE:
-        greedy_text, greedy_new_ids = _generate_greedy_reference(
-            system_content, req.last_user_message
-        )
-
     # Space separator prevents BPE from fusing the last char of last_bot_message
     # with the first char of proposed_next into a single boundary-spanning token.
-    sep = " " if req.last_bot_message else ""
+    sep            = " " if req.last_bot_message else ""
     assistant_full = req.last_bot_message + sep + req.proposed_next
-    proposed_score, token_log_probs, n_proposed = _forward_score(
+    score, token_log_probs, n_proposed = _forward_score(
         system_content, req.last_user_message, assistant_full,
-        req.proposed_next, req.n_proposed_tokens, req.gamma, nl_ids, _NORMALIZE_PER_TOKEN,
+        req.proposed_next, req.n_proposed_tokens, req.gamma, nl_ids,
         include_terminal_eos=req.student_emitted_eos,
     )
 
     if n_proposed <= 0:
         return RewardResponse(reward=0.0, n_tokens=0, token_log_probs=[])
 
-    greedy_score = 0.0
-    if USE_REFERENCE and greedy_new_ids:
-        greedy_assistant = req.last_bot_message + sep + greedy_text
-        greedy_score, _, _ = _forward_score(
-            system_content, req.last_user_message, greedy_assistant,
-            greedy_text, None, req.gamma, nl_ids, normalize=False,
-        )
-
-    raw = proposed_score - greedy_score if (USE_REFERENCE and greedy_text) else proposed_score
     return RewardResponse(
-        reward=_shape_reward(raw),
+        reward=_shape_reward(score),
         n_tokens=n_proposed,
         token_log_probs=token_log_probs,
-        greedy_text=greedy_text,
     )
 
 
