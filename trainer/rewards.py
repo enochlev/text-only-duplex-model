@@ -151,7 +151,7 @@ def coherence_reward(
 _VAD_BASE_URL     = f"http://localhost:{_os.getenv('VAD_PORT', '10002')}"
 _VAD_COMPLETE_URL = f"{_VAD_BASE_URL}/vad/complete"
 _VAD_OVERLAP_URL  = f"{_VAD_BASE_URL}/vad/overlap"
-_VAD_TIMEOUT_S    = 5.0   # rewards are offline; allow for parallel worker contention
+_VAD_TIMEOUT_S    = 20.0  # rewards are offline; allow for parallel worker contention
 _VAD_RETRY_AFTER  = 20    # skip N calls after a failure, then retry
 
 _complete_fail_count = 0
