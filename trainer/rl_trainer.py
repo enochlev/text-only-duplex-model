@@ -18,7 +18,6 @@ from __future__ import annotations
 import concurrent.futures
 import csv
 import os
-import random
 import re
 import time
 import uuid
@@ -130,8 +129,8 @@ class TrainerConfig:
     model_name_or_path: str
     """HuggingFace model id or local path (e.g., "Qwen/Qwen2.5-1.5B-Instruct")."""
 
-    vllm_max_tokens: int = 16
-    """Max new tokens per LLM generation (should match production setting)."""
+    vllm_max_tokens: int = 48
+    """Max new tokens per LLM generation. Generation is always trimmed to the last .?! boundary."""
 
     vllm_temperature: float = 1.0
     """Sampling temperature. Must be > 0 for REINFORCE exploration."""
@@ -177,22 +176,6 @@ class TrainerConfig:
     reward_workers: int = 4
     """Thread-pool size for parallel reward evaluation.
     0 = auto (min(32, cpu_count)). Set to 1 to disable parallelism."""
-
-    silence_inject_lambda_knob: float = 0.25
-    """Probability applied to two exploration heuristics per LLM call:
-    1. Truncate generated text at its last punctuation mark.
-    2. Force silence when the previous bot block ended with a sentence-ending
-       punctuation (.!?), giving the user the floor.
-    Set to 0.0 to disable both."""
-
-    silence_inject_start_episode: int = 0
-    """Total episodes to collect before silence injection activates.
-    0 = on from the start. Use e.g. 40 to let the model learn to speak first."""
-
-    random_block_keep: bool = True
-    """When True, randomly keep 1–4 blocks of each 16-token generation, then
-    switch to reactive self-generation. Teaches the model when to stop/continue
-    without always pre-committing to the full generation window."""
 
     tts_model: str = ""
     """Piper TTS model path used for GPTVoiceSimulator real-time episodes.
@@ -310,12 +293,10 @@ class VirtualSimulationConnection:
         simulator: Any,  # PlaybackSimulator | GPTVoiceSimulator
         vllm_engine: Any,
         tokenizer: Any,
-        vllm_max_tokens: int = 16,
+        vllm_max_tokens: int = 48,
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
-        silence_inject_lambda_knob: float = 0.0,
-        random_block_keep: bool = False,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -324,8 +305,6 @@ class VirtualSimulationConnection:
         self.vllm_temperature = vllm_temperature
         self.tts_model = tts_model
         self.device = device
-        self.silence_inject_lambda_knob = silence_inject_lambda_knob
-        self.random_block_keep = random_block_keep
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -341,29 +320,6 @@ class VirtualSimulationConnection:
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
             last_context_version[0] = agent.context_version
-            lam = self.silence_inject_lambda_knob
-
-            # Silence injection: if the last bot block ended at a sentence boundary,
-            # randomly yield the floor back to the user.
-            if lam > 0.0 and random.random() < lam:
-                last_bot = next(
-                    (b for b in reversed(agent.blocks) if b.assistant_text), None
-                )
-                if last_bot and last_bot.assistant_text.rstrip().endswith(('.', '!', '?')):
-                    ptok = self.tokenizer.encode(
-                        system_prompt + "\n\n" + user_message, add_special_tokens=False
-                    )
-                    steps.append(StepRecord(
-                        step_id=str(uuid.uuid4())[:8],
-                        prompt_text=system_prompt + "\n\n" + user_message,
-                        full_prompt_tokens=ptok,
-                        response_token_ids=[],
-                        log_probs=[],
-                        is_idle=True,
-                        source_block_id=agent._latest_user_source_block_id,
-                        user_spoke_before=user_spoke,
-                    ))
-                    return ""
 
             text, ptok, rtok, lps = llm_generate_train(
                 system_prompt,
@@ -374,25 +330,8 @@ class VirtualSimulationConnection:
                 temperature=self.vllm_temperature,
             )
 
-            # Random block-keep: keep 1–4 blocks, drop the rest so the model
-            # enters reactive self-generation sooner on short draws.
-            if text and self.random_block_keep and len(rtok) > 0:
-                tokens_per_block = max(1, self.vllm_max_tokens // 4)
-                n_keep = random.randint(1, 4) * tokens_per_block
-                if n_keep < len(rtok):
-                    candidate = self.tokenizer.decode(rtok[:n_keep], skip_special_tokens=True).strip()
-                    # Snap to last word boundary to avoid partial-word fragments.
-                    # Only apply truncation when the result has enough content.
-                    last_space = candidate.rfind(' ')
-                    if last_space > 0:
-                        candidate = candidate[:last_space]
-                    if len(candidate.split()) >= 3:
-                        rtok = self.tokenizer.encode(candidate, add_special_tokens=False)
-                        lps = lps[:len(rtok)]
-                        text = candidate
-
-            # Punctuation truncation: cut text at its last punctuation mark.
-            if text and lam > 0.0 and random.random() < lam:
+            # Always trim at the last sentence-ending punctuation.
+            if text:
                 matches = list(_PUNCT_RE.finditer(text))
                 if matches:
                     text = text[:matches[-1].end()]
@@ -514,12 +453,10 @@ class RealTimeGPTEpisodeRunner:
         simulator: GPTVoiceSimulator,
         vllm_engine: Any,
         tokenizer: Any,
-        vllm_max_tokens: int = 16,
+        vllm_max_tokens: int = 48,
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
-        silence_inject_lambda_knob: float = 0.0,
-        random_block_keep: bool = False,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -528,8 +465,6 @@ class RealTimeGPTEpisodeRunner:
         self.vllm_temperature = vllm_temperature
         self.tts_model = tts_model
         self.device = device
-        self.silence_inject_lambda_knob = silence_inject_lambda_knob
-        self.random_block_keep = random_block_keep
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -543,27 +478,6 @@ class RealTimeGPTEpisodeRunner:
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
             last_context_version[0] = agent.context_version
-            lam = self.silence_inject_lambda_knob
-
-            if lam > 0.0 and random.random() < lam:
-                last_bot = next(
-                    (b for b in reversed(agent.blocks) if b.assistant_text), None
-                )
-                if last_bot and last_bot.assistant_text.rstrip().endswith(('.', '!', '?')):
-                    ptok = self.tokenizer.encode(
-                        system_prompt + "\n\n" + user_message, add_special_tokens=False
-                    )
-                    steps.append(StepRecord(
-                        step_id=str(uuid.uuid4())[:8],
-                        prompt_text=system_prompt + "\n\n" + user_message,
-                        full_prompt_tokens=ptok,
-                        response_token_ids=[],
-                        log_probs=[],
-                        is_idle=True,
-                        source_block_id=agent._latest_user_source_block_id,
-                        user_spoke_before=user_spoke,
-                    ))
-                    return ""
 
             text, ptok, rtok, lps = llm_generate_train(
                 system_prompt,
@@ -574,20 +488,8 @@ class RealTimeGPTEpisodeRunner:
                 temperature=self.vllm_temperature,
             )
 
-            if text and self.random_block_keep and len(rtok) > 0:
-                tokens_per_block = max(1, self.vllm_max_tokens // 4)
-                n_keep = random.randint(1, 4) * tokens_per_block
-                if n_keep < len(rtok):
-                    candidate = self.tokenizer.decode(rtok[:n_keep], skip_special_tokens=True).strip()
-                    last_space = candidate.rfind(' ')
-                    if last_space > 0:
-                        candidate = candidate[:last_space]
-                    if len(candidate.split()) >= 3:
-                        rtok = self.tokenizer.encode(candidate, add_special_tokens=False)
-                        lps = lps[:len(rtok)]
-                        text = candidate
-
-            if text and lam > 0.0 and random.random() < lam:
+            # Always trim at the last sentence-ending punctuation.
+            if text:
                 matches = list(_PUNCT_RE.finditer(text))
                 if matches:
                     text = text[:matches[-1].end()]
@@ -995,7 +897,6 @@ class FullDuplexRLTrainer:
                     "gamma": config.gamma,
                     "baseline_ema_alpha": config.baseline_ema_alpha,
                     "gradient_clip": config.gradient_clip,
-                    "silence_inject_lambda": config.silence_inject_lambda_knob,
                 },
             )
             print(f"[trainer] wandb run initialised: {_wandb.run.name}")
@@ -1010,11 +911,6 @@ class FullDuplexRLTrainer:
 
     def collect_rollouts(self, simulators: List[Any]) -> List[Episode]:
         """Run one episode per simulator (sequentially) and return all episodes."""
-        effective_lambda = (
-            self.config.silence_inject_lambda_knob
-            if self._total_episodes >= self.config.silence_inject_start_episode
-            else 0.0
-        )
         episodes: List[Episode] = []
         for simulator in simulators:
             if isinstance(simulator, GPTVoiceSimulator):
@@ -1026,8 +922,6 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
-                    silence_inject_lambda_knob=effective_lambda,
-                    random_block_keep=self.config.random_block_keep,
                 )
             else:
                 runner = VirtualSimulationConnection(
@@ -1038,8 +932,6 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
-                    silence_inject_lambda_knob=effective_lambda,
-                    random_block_keep=self.config.random_block_keep,
                 )
             try:
                 ep = runner.run_episode()
@@ -1055,7 +947,6 @@ class FullDuplexRLTrainer:
                     f"steps={len(ep.steps)} (non-idle={n_non_idle})  "
                     f"blocks={len(ep.blocks)}  ended={ep.terminated_reason}"
                     + (f"  src={src_id}" if src_id else "")
-                    + (f"  silence_λ={effective_lambda:.2f}" if effective_lambda else "  silence_λ=off")
                     + f"  last_prompt_tok={last_prompt_tok}"
                 )
                 print()
@@ -1103,7 +994,10 @@ class FullDuplexRLTrainer:
         print(f"  Action : {'<idle>' if step.is_idle else repr(action_str)}")
         print(f"  Blocks : {step.blocks_covered or '[]'}")
 
+        # Full response: join all covered blocks for step-level coherence scoring.
+        full_response = " ".join(b.assistant_text for b in covered if b.assistant_text).strip()
         total = 0.0
+
         for block in covered:
             user_snippet = (block.user_text or "<silence>")[:60]
             bot_snippet  = (block.assistant_text or "<idle>")[:60]
@@ -1113,7 +1007,6 @@ class FullDuplexRLTrainer:
                 )
             )
             print(f"\n  ┌─ Block {block.block_id[:8]}  [bot_toks={bot_toks}]")
-            # Show last 4 history blocks as context before RM scores
             ctx = history[-4:] if len(history) >= 4 else history
             if ctx:
                 for ci, hb in enumerate(ctx):
@@ -1129,7 +1022,9 @@ class FullDuplexRLTrainer:
             for rm_idx, (fn, w, name) in enumerate(
                 zip(self.reward_fns, self.rm_weights, fn_names), start=1
             ):
-                score = fn(block, history, is_terminal)
+                if fn.__name__ == "coherence_reward":
+                    continue  # printed once at step level below
+                score = _call_fn(fn, block, history, is_terminal)
                 weighted = w * score
                 blk_total += weighted
                 marker = "  " if weighted == 0.0 else ("▲ " if weighted > 0 else "▼ ")
@@ -1138,6 +1033,19 @@ class FullDuplexRLTrainer:
 
             total += blk_total
             print(f"  └─ block total : {blk_total:+.4f}")
+
+        # Coherence: scored once per step using the full combined response.
+        for rm_idx, (fn, w, name) in enumerate(
+            zip(self.reward_fns, self.rm_weights, fn_names), start=1
+        ):
+            if fn.__name__ != "coherence_reward" or not covered:
+                continue
+            score = fn(covered[0], history, is_terminal, proposed_override=full_response)
+            weighted = w * score
+            total += weighted
+            marker = "  " if weighted == 0.0 else ("▲ " if weighted > 0 else "▼ ")
+            print(f"\n  [step] RM{rm_idx:<2} {name:<28} full_response={full_response[:40]!r}")
+            print(f"         raw={score:+.4f}  w={w:.2f}  → {weighted:+.4f}  {marker}")
 
         print(f"  STEP REWARD : {total:+.4f}")
         return total
@@ -1237,10 +1145,16 @@ class FullDuplexRLTrainer:
             covered_ids = set(step.blocks_covered)
             covered = [b for b in episode.blocks if b.block_id in covered_ids]
             history = _prior_history(covered_ids)
+            # Full response text: join all covered blocks so coherence sees the
+            # complete 48-token generation, not just the first block's chunk.
+            full_response = " ".join(b.assistant_text for b in covered if b.assistant_text).strip()
             total = 0.0
             breakdown: Dict[str, float] = {}
             for fn, w in zip(self.reward_fns, self.rm_weights):
-                fn_total = sum(w * _call_fn(fn, block, history, is_terminal) for block in covered)
+                if fn.__name__ == "coherence_reward" and covered:
+                    fn_total = w * fn(covered[0], history, is_terminal, proposed_override=full_response)
+                else:
+                    fn_total = sum(w * _call_fn(fn, block, history, is_terminal) for block in covered)
                 breakdown[fn.__name__] = fn_total
                 total += fn_total
             return total, breakdown
