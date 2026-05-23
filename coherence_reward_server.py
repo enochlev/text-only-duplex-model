@@ -251,6 +251,37 @@ async def health():
     return {"status": "ok", "model": MODEL_NAME, "eos_token_ids": sorted(_end_ids)}
 
 
+def _find_text_start_by_hint(
+    full_ids: torch.Tensor, text_end: int, target: str, hint: int
+) -> Optional[int]:
+    """Try hint, hint+1, hint-1 offsets back from text_end. Returns start pos or None.
+
+    BPE can merge the last char of the prefix with the first char of proposed_next,
+    shifting the in-context token count by ±1 vs. the standalone-encoded hint.
+    """
+    for k in (hint, hint + 1, hint - 1):
+        if k <= 0:
+            continue
+        start = text_end - k
+        if start >= 0 and _tokenizer.decode(full_ids[0, start:text_end].tolist()).strip() == target:
+            return start
+    return None
+
+
+def _find_text_start_by_scan(
+    full_ids: torch.Tensor, text_end: int, target: str
+) -> Optional[int]:
+    """Scan backwards from text_end up to max_scan tokens. Returns start pos or None."""
+    max_scan = min(text_end, max(len(target) // 2 + 20, 40))
+    for k in range(1, max_scan + 1):
+        start = text_end - k
+        if start < 0:
+            break
+        if _tokenizer.decode(full_ids[0, start:text_end].tolist()).strip() == target:
+            return start
+    return None
+
+
 def _locate_tokens(
     full_ids: torch.Tensor,
     text: str,
@@ -266,13 +297,14 @@ def _locate_tokens(
     """
     seq_len    = full_ids.shape[1]
     strippable = _end_ids | nl_ids
+    target     = text.strip()
 
-    # Strip all trailing EOS/NL to find where text tokens actually end.
+    # Strip trailing EOS/NL to find where text tokens actually end.
     text_end = seq_len
     while text_end > 0 and full_ids[0, text_end - 1].item() in strippable:
         text_end -= 1
 
-    # Optionally extend by exactly one EOS for premature-EOS scoring.
+    # Optionally extend by one EOS for premature-EOS scoring.
     eos_appended = (
         include_terminal_eos
         and text_end < seq_len
@@ -280,34 +312,26 @@ def _locate_tokens(
     )
     end_pos = text_end + (1 if eos_appended else 0)
 
+    # Locate where the proposed text starts, fastest path first.
+    text_start: Optional[int] = None
     if n_tokens_hint is not None and n_tokens_hint > 0:
-        n = n_tokens_hint + (1 if eos_appended else 0)
-        return end_pos - n, end_pos, n
-
-    target     = text.strip()
-    text_start = None
-    n_found    = 0
-    max_scan   = min(text_end, max(len(text) // 2 + 20, 40))
-    for k in range(1, max_scan + 1):
-        start = text_end - k
-        if start < 0:
-            break
-        if _tokenizer.decode(full_ids[0, start:text_end].tolist()).strip() == target:
-            text_start = start
-            n_found    = k + (1 if eos_appended else 0)
-            break
+        text_start = _find_text_start_by_hint(full_ids, text_end, target, n_tokens_hint)
     if text_start is None:
-        ids        = _tokenizer.encode(text, add_special_tokens=False)
-        n_found    = len(ids) + (1 if eos_appended else 0)
-        text_start = end_pos - n_found
-    decoded = _tokenizer.decode(full_ids[0, text_start:text_end].tolist())
+        text_start = _find_text_start_by_scan(full_ids, text_end, target)
+    if text_start is None:
+        # Last resort: trust standalone encoding length.
+        n_standalone = len(_tokenizer.encode(text, add_special_tokens=False))
+        text_start   = end_pos - n_standalone - (1 if eos_appended else 0)
+
+    n_tokens = end_pos - text_start
+    decoded  = _tokenizer.decode(full_ids[0, text_start:text_end].tolist())
     if decoded.strip() != target:
         print(
             f"[coherence SERVER] token-alignment mismatch!  "
             f"text={text!r}  decoded={decoded!r}  "
-            f"seq_len={seq_len}  n={n_found}  start={text_start}  end={end_pos}"
+            f"seq_len={seq_len}  n={n_tokens}  start={text_start}  end={end_pos}"
         )
-    return text_start, end_pos, n_found
+    return text_start, end_pos, n_tokens
 
 
 def _build_assistant_ids(
