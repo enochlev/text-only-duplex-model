@@ -282,10 +282,10 @@ def llm_generate_train(
             log_probs.append(lp_val)
 
     text_clean = text.replace("<idle>", "").strip()
-    # Strip leading bare "idle"/"Idle" word — the model learned to prefix responses
-    # with its idle concept without angle brackets.  Bare "idle" → truly silent;
-    # "IdleSome real words." → keep only the real content.
-    text_clean = re.sub(r'^[Ii]dle\b', '', text_clean).strip()
+    # If the model leads with "idle"/"Idle", it decided to be silent — discard
+    # everything that follows too (the continuation is post-idle garbage).
+    if re.match(r'^[Ii]dle', text_clean):
+        text_clean = ""
     if not text_clean:
         # Keep tokens so REINFORCE can push against idle/EOS generation when penalised.
         return "", prompt_token_ids, response_token_ids, log_probs
