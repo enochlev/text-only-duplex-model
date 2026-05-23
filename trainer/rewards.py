@@ -151,7 +151,7 @@ def coherence_reward(
 _VAD_BASE_URL     = f"http://localhost:{_os.getenv('VAD_PORT', '10002')}"
 _VAD_COMPLETE_URL = f"{_VAD_BASE_URL}/vad/complete"
 _VAD_OVERLAP_URL  = f"{_VAD_BASE_URL}/vad/overlap"
-_VAD_TIMEOUT_S    = 1.0   # generous — rewards are computed offline, not real-time
+_VAD_TIMEOUT_S    = 5.0   # rewards are offline; allow for parallel worker contention
 _VAD_RETRY_AFTER  = 20    # skip N calls after a failure, then retry
 
 _complete_fail_count = 0
@@ -180,7 +180,7 @@ def _vad_turn_complete(
     if not text or not text.strip():
         return None
     if _complete_fail_count >= _VAD_RETRY_AFTER:
-        return None
+        _complete_fail_count = 0  # allow a retry attempt after skipping N calls
     payload: dict = {"text": text}
     if mic_audio is not None and len(mic_audio) > 0:
         payload["audio_b64"] = base64.b64encode(
@@ -219,7 +219,7 @@ def _vad_overlap_score(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional
     """
     global _overlap_fail_count
     if _overlap_fail_count >= _VAD_RETRY_AFTER:
-        return None
+        _overlap_fail_count = 0  # allow a retry attempt after skipping N calls
     mic_b64 = base64.b64encode(
         np.clip(mic_audio, -1.0, 1.0).astype(np.float32).tobytes()
     ).decode()
