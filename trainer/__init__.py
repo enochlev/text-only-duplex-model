@@ -19,7 +19,6 @@ from .rewards import (
     interruption_penalty,
     interruption_penalty_overlap,
     silence_too_long_penalty,
-    monologue_too_long_penalty,
     check_rm_servers,
 )
 from .data_ingestion import (
@@ -51,7 +50,6 @@ __all__ = [
     "interruption_penalty",
     "interruption_penalty_overlap",
     "silence_too_long_penalty",
-    "monologue_too_long_penalty",
     "check_rm_servers",
     # data_ingestion
     "EpisodeData",

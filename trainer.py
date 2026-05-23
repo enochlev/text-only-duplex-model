@@ -26,7 +26,6 @@ from trainer import (
     interruption_penalty,
     interruption_penalty_overlap,
     silence_too_long_penalty,
-    monologue_too_long_penalty,
     make_default_data_pool,
     check_rm_servers,
 )
@@ -114,9 +113,8 @@ def main() -> None:
         silence_too_long_penalty,        # Namo turn detector — tier 1
         silence_too_long_penalty,        # Namo turn detector — tier 2 (lighter weight)
         coherence_reward,                # teacher LLM scoring; requires coherence server running
-        monologue_too_long_penalty,      # escalating penalty for bot monologues > 3 consecutive blocks
     ]
-    reward_weights = [1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0]
+    reward_weights = [1.0, 1.0, 1.0, 1.0, 0.5, 1.0]
 
     config.reward_fn_weights = reward_weights
 
