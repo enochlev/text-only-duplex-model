@@ -84,7 +84,7 @@ def main() -> None:
         kl_ref_coeff=args.kl_ref_coeff,
         kl_ref_clip=args.kl_ref_clip,
         episodes_per_train_step=args.episodes_per_step,
-        max_seq_len=812,
+        max_seq_len=712,
         device="cuda",
         output_dir=args.output_dir,
         save_every_n_steps=args.save_every,

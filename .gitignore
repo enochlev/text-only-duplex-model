@@ -16,3 +16,5 @@ wheels/
 voices/*
 debug/*
 checkpoints/*
+wandb/*
+logs/*
