@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--kl-coeff", type=float, default=0.01)
     parser.add_argument(
-        "--max-tokens", type=int, default=16,
+        "--max-tokens", type=int, default=48,
         help="Max new tokens per LLM generation call",
     )
     parser.add_argument(
@@ -60,16 +60,6 @@ def main() -> None:
                         help="Print per-RM scores and export block audio each step")
     parser.add_argument("--debug-dir", default="./debug",
                         help="Directory for debug audio exports (default: ./debug)")
-    parser.add_argument(
-        "--silence-lambda", type=float, default=0.25,
-        help="Probability for silence-injection heuristics: truncate at punctuation "
-             "and force silence after sentence-ending bot blocks (default: 0.25 , 0=off)",
-    )
-    parser.add_argument(
-        "--silence-lambda-delay", type=int, default=0,
-        help="Episodes to collect before silence injection activates (default: 0 = on immediately). "
-             "Use e.g. 40 to let the model learn to speak before silence pressure begins.",
-    )
     parser.add_argument(
         "--vllm-device", default=None,
         help="Pin the vLLM rollout engine to a specific GPU, e.g. 'cuda:3'. "
