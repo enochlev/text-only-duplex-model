@@ -76,7 +76,7 @@ def respond_after_user_reward(
     if block.assistant_text or len(history) < 2:
         return 0.0
     user_spoke_2ago = _user_finished_in(history[-2])
-    return -0.3 if user_spoke_2ago else 0.0
+    return -1.5 if user_spoke_2ago else 0.0
 
 
 
