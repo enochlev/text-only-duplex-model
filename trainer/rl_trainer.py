@@ -1151,7 +1151,7 @@ class FullDuplexRLTrainer:
                 return 0.0, {}
             rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
             if _user_finished_in(hist[-2]):
-                penalty = rm1_w * (-1.0)
+                penalty = rm1_w * (-1.3)
                 return penalty, {"respond_after_user_reward": penalty}
             return 0.0, {}
 

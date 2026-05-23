@@ -152,6 +152,8 @@ _BACKCHANNELS: frozenset = frozenset({
 
 
 def _normalize_bot_text(text: str) -> str:
+    import re as _re
+    text = _re.sub(r"<[^>]+>", "", text)  # strip angle-bracket tags
     return text.lower().strip().rstrip(".,!?").strip()
 
 
