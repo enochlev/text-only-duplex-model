@@ -34,7 +34,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a full-duplex conversational policy.")
     parser.add_argument(
         "--model",
-        default="Qwen/Qwen2.5-3B-Instruct",
+        default="Qwen/Qwen2.5-7B-Instruct",
         help="HuggingFace model id or local path",
     )
     parser.add_argument("--steps", type=int, default=10, help="Number of training steps")

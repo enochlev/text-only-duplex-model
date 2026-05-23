@@ -12,6 +12,7 @@ import numpy as np
 
 from full_duplex import DuplexAudioBlock
 
+import re as _re
 import os as _os
 from dotenv import load_dotenv as _load_dotenv
 _load_dotenv()
@@ -141,19 +142,34 @@ def interruption_penalty_overlap(
 # ---------------------------------------------------------------------------
 
 _BACKCHANNELS: frozenset = frozenset({
+    # affirmations
     "ya", "yeah", "yep", "yup",
     "okay", "ok",
     "right", "alright",
-    "sure",
-    "mm", "hmm", "uh-huh", "mhm", "uhh",
+    "sure", "sure let's", "sure thing",
+    "absolutely", "certainly", "definitely", "totally",
+    "exactly", "that's right", "thats right",
+    "of course", "of course next", "of course sure",
+    # fillers / minimal acknowledgements
+    "mm", "hmm", "uh-huh", "mhm", "uhh", "uhm",
+    "wow", "really", "oh", "ah", "oh i see",
+    # comprehension signals
     "i know", "i see", "i understand",
-    "got it", "that's right", "exactly", "of course",
+    "got it", "makes sense", "fair enough", "i agree",
+    # conversation steering (hollow)
+    "let's continue", "let's continue there", "let's go",
+    "let's start", "let's", "let's see",
+    "go on", "go ahead", "continue", "proceed",
+    "please continue", "please go on", "tell me more",
+    # filler starters that appear as standalone responses
+    "interesting", "great", "nice", "good",
+    "sounds good", "sounds great",
 })
 
 
 def _normalize_bot_text(text: str) -> str:
-    import re as _re
-    text = _re.sub(r"<[^>]+>", "", text)  # strip angle-bracket tags
+    text = _re.sub(r"<[^>]+>", "", text)   # strip angle-bracket tags
+    text = _re.sub(r"[,;:]", "", text)      # strip internal punctuation (keep hyphens/apostrophes)
     return text.lower().strip().rstrip(".,!?").strip()
 
 
