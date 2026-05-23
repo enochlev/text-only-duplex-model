@@ -15,10 +15,8 @@ from .rl_trainer import (
 from .rewards import (
     RewardFn,
     respond_after_user_reward,
-    coherence_reward,
     interruption_penalty,
     interruption_penalty_overlap,
-    silence_too_long_penalty,
     check_rm_servers,
 )
 from .data_ingestion import (
@@ -42,14 +40,9 @@ __all__ = [
     "VirtualSimulationConnection",
     # rewards
     "RewardFn",
-    "latency_reward",
-    "idle_penalty",
-    "response_length_reward",
     "respond_after_user_reward",
-    "coherence_reward",
     "interruption_penalty",
     "interruption_penalty_overlap",
-    "silence_too_long_penalty",
     "check_rm_servers",
     # data_ingestion
     "EpisodeData",

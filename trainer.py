@@ -22,10 +22,8 @@ from trainer import (
     FullDuplexRLTrainer,
     TrainerConfig,
     respond_after_user_reward,
-    coherence_reward,
     interruption_penalty,
     interruption_penalty_overlap,
-    silence_too_long_penalty,
     make_default_data_pool,
     check_rm_servers,
 )
@@ -95,14 +93,11 @@ def main() -> None:
     # (0.5) — the escalation inside the function already handles run length,
     # so the two instances give different gradient magnitudes per call site.
     reward_fns = [
-        respond_after_user_reward,
-        interruption_penalty,            # block-level crossover: both parties speaking simultaneously
-        interruption_penalty_overlap,    # progressive VAD: -overlap_ratio; requires VAD server
-        silence_too_long_penalty,        # Namo turn detector — tier 1
-        silence_too_long_penalty,        # Namo turn detector — tier 2 (lighter weight)
-        coherence_reward,                # teacher LLM scoring; requires coherence server running
+        respond_after_user_reward,    # penalise silence after user finishes
+        interruption_penalty,         # penalise talking over the user
+        interruption_penalty_overlap, # VAD-based overlap penalty
     ]
-    reward_weights = [1.0, 1.0, 1.0, 1.0, 0.5, 1.0]
+    reward_weights = [1.0, 1.0, 1.0]
 
     config.reward_fn_weights = reward_weights
 

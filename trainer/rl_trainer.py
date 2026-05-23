@@ -994,8 +994,6 @@ class FullDuplexRLTrainer:
         print(f"  Action : {'<idle>' if step.is_idle else repr(action_str)}")
         print(f"  Blocks : {step.blocks_covered or '[]'}")
 
-        # Full response: join all covered blocks for step-level coherence scoring.
-        full_response = " ".join(b.assistant_text for b in covered if b.assistant_text).strip()
         total = 0.0
 
         for block in covered:
@@ -1022,8 +1020,6 @@ class FullDuplexRLTrainer:
             for rm_idx, (fn, w, name) in enumerate(
                 zip(self.reward_fns, self.rm_weights, fn_names), start=1
             ):
-                if fn.__name__ == "coherence_reward":
-                    continue  # printed once at step level below
                 score = _call_fn(fn, block, history, is_terminal)
                 weighted = w * score
                 blk_total += weighted
@@ -1033,19 +1029,6 @@ class FullDuplexRLTrainer:
 
             total += blk_total
             print(f"  └─ block total : {blk_total:+.4f}")
-
-        # Coherence: scored once per step using the full combined response.
-        for rm_idx, (fn, w, name) in enumerate(
-            zip(self.reward_fns, self.rm_weights, fn_names), start=1
-        ):
-            if fn.__name__ != "coherence_reward" or not covered:
-                continue
-            score = fn(covered[0], history, is_terminal, proposed_override=full_response)
-            weighted = w * score
-            total += weighted
-            marker = "  " if weighted == 0.0 else ("▲ " if weighted > 0 else "▼ ")
-            print(f"\n  [step] RM{rm_idx:<2} {name:<28} full_response={full_response[:40]!r}")
-            print(f"         raw={score:+.4f}  w={w:.2f}  → {weighted:+.4f}  {marker}")
 
         print(f"  STEP REWARD : {total:+.4f}")
         return total
@@ -1070,10 +1053,6 @@ class FullDuplexRLTrainer:
             return episode.blocks[:first]
 
         def _call_fn(fn, block, hist, terminal):
-            if fn.__name__ == "interruption_penalty":
-                idx = _block_idx.get(block.block_id, -1)
-                nxt = episode.blocks[idx + 1] if 0 <= idx < len(episode.blocks) - 1 else None
-                return fn(block, hist, terminal, next_block=nxt)
             return fn(block, hist, terminal)
 
         def _idle_rm1_reward(step: "StepRecord") -> Tuple[float, Dict[str, float]]:
@@ -1145,16 +1124,10 @@ class FullDuplexRLTrainer:
             covered_ids = set(step.blocks_covered)
             covered = [b for b in episode.blocks if b.block_id in covered_ids]
             history = _prior_history(covered_ids)
-            # Full response text: join all covered blocks so coherence sees the
-            # complete 48-token generation, not just the first block's chunk.
-            full_response = " ".join(b.assistant_text for b in covered if b.assistant_text).strip()
             total = 0.0
             breakdown: Dict[str, float] = {}
             for fn, w in zip(self.reward_fns, self.rm_weights):
-                if fn.__name__ == "coherence_reward" and covered:
-                    fn_total = w * fn(covered[0], history, is_terminal, proposed_override=full_response)
-                else:
-                    fn_total = sum(w * _call_fn(fn, block, history, is_terminal) for block in covered)
+                fn_total = sum(w * _call_fn(fn, block, history, is_terminal) for block in covered)
                 breakdown[fn.__name__] = fn_total
                 total += fn_total
             return total, breakdown
