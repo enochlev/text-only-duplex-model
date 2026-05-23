@@ -857,8 +857,8 @@ def make_default_data_pool(
 
     # Give UltraChat the same total weight as all scripts combined → ~50% sampling.
     sources.append(UltraChatTTSSource(
-        silence_after_s=24.0,
-        inter_turn_pause_s=12.0,
+        silence_after_s=silence_after_s,
+        inter_turn_pause_s=inter_turn_pause_s,
         max_episode_s=max_episode_s,
         block_s=block_s,
         wpm=wpm,
