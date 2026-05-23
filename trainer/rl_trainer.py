@@ -1057,8 +1057,8 @@ class FullDuplexRLTrainer:
         history: List[DuplexAudioBlock],
         is_terminal: bool,
         fn_names: List[str],
-    ) -> float:
-        """Run reward functions with full debug output. Returns total reward."""
+    ) -> Tuple[float, Dict[str, float]]:
+        """Run reward functions with full debug output. Returns (total, breakdown)."""
         action_str = "<idle>" if step.is_idle else (step.prompt_text or "")[-80:].strip()
 
         print(f"\n{'═'*70}")
@@ -1068,6 +1068,7 @@ class FullDuplexRLTrainer:
         print(f"  Blocks : {step.blocks_covered or '[]'}")
 
         total = 0.0
+        breakdown: Dict[str, float] = {}
 
         for block in covered:
             user_snippet = (block.user_text or "<silence>")[:60]
@@ -1096,6 +1097,7 @@ class FullDuplexRLTrainer:
                 score = fn(block, history, is_terminal)
                 weighted = w * score
                 blk_total += weighted
+                breakdown[fn.__name__] = breakdown.get(fn.__name__, 0.0) + weighted
                 marker = "  " if weighted == 0.0 else ("▲ " if weighted > 0 else "▼ ")
                 print(f"  │  RM{rm_idx:<2} {name:<28} raw={score:+.4f}  w={w:.2f}"
                       f"  → {weighted:+.4f}  {marker}")
@@ -1104,7 +1106,7 @@ class FullDuplexRLTrainer:
             print(f"  └─ block total : {blk_total:+.4f}")
 
         print(f"  STEP REWARD : {total:+.4f}")
-        return total
+        return total, breakdown
 
     def compute_rewards(self, episode: Episode, ep_idx: int = 0) -> Episode:
         """Fill StepRecord.reward using weighted sum of reward functions.
@@ -1168,7 +1170,7 @@ class FullDuplexRLTrainer:
                 covered_ids = set(step.blocks_covered)
                 covered = [b for b in episode.blocks if b.block_id in covered_ids]
                 history = _prior_history(covered_ids)
-                step.reward = self._debug_step(
+                step.reward, step.reward_breakdown = self._debug_step(
                     self._step_count, ep_idx, i, step,
                     covered, history, is_terminal, fn_names,
                 )
@@ -1424,14 +1426,15 @@ class FullDuplexRLTrainer:
         all_rewards = [s.reward for s in all_steps]
         n_scored = len(all_rewards)
 
-        # Per-reward-function averages across all scored steps
-        fn_totals: Dict[str, float] = {}
+        # Per-reward-function averages across all scored steps.
+        # Pre-seeded with all RM names so every RM always appears even when it fires 0.
+        fn_totals: Dict[str, float] = {fn.__name__: 0.0 for fn in self.reward_fns}
         for s in all_steps:
             for fn_name, val in s.reward_breakdown.items():
                 fn_totals[fn_name] = fn_totals.get(fn_name, 0.0) + val
         fn_avgs: Dict[str, float] = {
             k: v / n_scored for k, v in fn_totals.items()
-        } if n_scored else {}
+        } if n_scored else {fn.__name__: 0.0 for fn in self.reward_fns}
 
         metrics: Dict[str, float] = {
             "step": float(self._step_count),
