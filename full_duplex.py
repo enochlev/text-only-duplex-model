@@ -993,6 +993,7 @@ class DuplexAudioAgent:
                 return
 
             cleaned = self._normalize(raw).strip()
+            cleaned = re.sub(r"<think>.*?</think>", " ", cleaned, flags=re.DOTALL)
             for _tok in ("</s>", "<AI>", "<user>", "<s>", "<idle>"):
                 cleaned = cleaned.replace(_tok, " ")
             cleaned = cleaned.strip()

@@ -834,6 +834,8 @@ def _create_vllm_engine(
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             dtype=dtype,
+            enforce_eager=True
+
         )
 
     try:
@@ -921,14 +923,15 @@ class FullDuplexRLTrainer:
 
         self.ref_model: Optional[Any] = None
         if config.ref_model_name_or_path:
-            print(f"[trainer] loading frozen reference model: {config.ref_model_name_or_path}")
+            print(f"[trainer] loading frozen reference model (CPU): {config.ref_model_name_or_path}")
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 config.ref_model_name_or_path, dtype=torch.bfloat16
             )
-            self.ref_model.to(config.device)
             self.ref_model.eval()
             for p in self.ref_model.parameters():
                 p.requires_grad_(False)
+            # Keep on CPU — only moved to GPU per-batch in compute_kl_ref_rewards.
+            # Saves ~8 GB of GPU memory at the cost of one H2D transfer per step.
 
         vllm_local_rank = 0
         if config.vllm_device:
@@ -951,9 +954,17 @@ class FullDuplexRLTrainer:
             local_rank=vllm_local_rank,
         )
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=config.learning_rate
-        )
+        try:
+            import bitsandbytes as bnb
+            self.optimizer = bnb.optim.AdamW8bit(
+                self.model.parameters(), lr=config.learning_rate, weight_decay=0.0
+            )
+            print("[trainer] using 8-bit AdamW (bitsandbytes)")
+        except ImportError:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=config.learning_rate, weight_decay=0.0
+            )
+            print("[trainer] bitsandbytes not found, using fp32 AdamW")
         self._baseline: float = 0.0
         self._step_count: int = 0
         self._total_episodes: int = 0
@@ -1252,22 +1263,19 @@ class FullDuplexRLTrainer:
                 all_tokens = prompt_tokens + step.response_token_ids
                 n_prompt = len(prompt_tokens)
 
-                input_ids = torch.tensor(
-                    [all_tokens], dtype=torch.long, device=self.config.device
-                )
-
-                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    ref_logits = self.ref_model(input_ids=input_ids).logits  # [1, T, V]
+                # ref_model lives on CPU to save GPU memory.
+                input_ids = torch.tensor([all_tokens], dtype=torch.long)  # CPU
+                with torch.no_grad():
+                    ref_logits = self.ref_model(input_ids=input_ids).logits  # [1, T, V] CPU
 
                 # Causal shift: logits[i] predicts token[i+1]
                 shift_logits = ref_logits[0, n_prompt - 1: n_prompt - 1 + n_resp, :]  # [n_resp, V]
                 shift_labels = torch.tensor(
-                    step.response_token_ids[:n_resp],
-                    dtype=torch.long, device=self.config.device,
-                )
+                    step.response_token_ids[:n_resp], dtype=torch.long
+                )  # CPU
                 per_token_ref_lp = -torch.nn.functional.cross_entropy(
                     shift_logits, shift_labels, reduction="none"
-                ).cpu()  # [n_resp]
+                )  # already CPU
 
                 per_token_student_lp = torch.tensor(step.log_probs[:n_resp])
                 per_token_kl = per_token_student_lp - per_token_ref_lp

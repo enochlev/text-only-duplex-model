@@ -34,14 +34,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a full-duplex conversational policy.")
     parser.add_argument(
         "--model",
-        default="Qwen/Qwen2.5-7B-Instruct",
+        default="Qwen/Qwen3-4B-Instruct-2507",
         help="HuggingFace model id or local path",
     )
     parser.add_argument("--steps", type=int, default=10, help="Number of training steps")
     parser.add_argument("--episodes-per-step", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--kl-coeff", type=float, default=0.01)
-    parser.add_argument("--ref-model", default="Qwen/Qwen2.5-3B-Instruct",
+    parser.add_argument("--ref-model", default="Qwen/Qwen3-4B-Instruct-2507",
                         help="HF model id or local path for frozen reference model (enables kl_coherence reward)")
     parser.add_argument("--kl-ref-coeff", type=float, default=0.05,
                         help="Scale factor for KL-against-reference reward penalty")
