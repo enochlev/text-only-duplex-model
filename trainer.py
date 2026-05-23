@@ -34,13 +34,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a full-duplex conversational policy.")
     parser.add_argument(
         "--model",
-        default="Qwen/Qwen3-1.7B",
+        default="Qwen/Qwen2.5-3B-Instruct",
         help="HuggingFace model id or local path",
     )
     parser.add_argument("--steps", type=int, default=10, help="Number of training steps")
     parser.add_argument("--episodes-per-step", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--kl-coeff", type=float, default=0.01)
+    parser.add_argument("--ref-model", default="Qwen/Qwen2.5-3B-Instruct",
+                        help="HF model id or local path for frozen reference model (enables kl_coherence reward)")
+    parser.add_argument("--kl-ref-coeff", type=float, default=0.05,
+                        help="Scale factor for KL-against-reference reward penalty")
+    parser.add_argument("--kl-ref-clip", type=float, default=5.0,
+                        help="Per-token KL clip value before averaging")
     parser.add_argument(
         "--max-tokens", type=int, default=48,
         help="Max new tokens per LLM generation call",
@@ -74,6 +80,9 @@ def main() -> None:
         vllm_gpu_memory_utilization=args.gpu_mem,
         learning_rate=args.lr,
         kl_coeff=args.kl_coeff,
+        ref_model_name_or_path=args.ref_model,
+        kl_ref_coeff=args.kl_ref_coeff,
+        kl_ref_clip=args.kl_ref_clip,
         episodes_per_train_step=args.episodes_per_step,
         max_seq_len=812,
         device="cuda",
