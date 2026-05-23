@@ -1020,7 +1020,7 @@ class FullDuplexRLTrainer:
             for rm_idx, (fn, w, name) in enumerate(
                 zip(self.reward_fns, self.rm_weights, fn_names), start=1
             ):
-                score = _call_fn(fn, block, history, is_terminal)
+                score = fn(block, history, is_terminal)
                 weighted = w * score
                 blk_total += weighted
                 marker = "  " if weighted == 0.0 else ("▲ " if weighted > 0 else "▼ ")
