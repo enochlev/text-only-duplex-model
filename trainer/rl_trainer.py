@@ -187,7 +187,7 @@ class TrainerConfig:
     maximise its memory budget independently.  Defaults to None (vLLM shares
     the same device as config.device)."""
 
-    ref_model_name_or_path: Optional[str] = None
+    ref_model_name_or_path: Optional[str] = "Qwen/Qwen3-4B-Instruct-2507-FP8"
     """HF model id or local path for the frozen reference model.
     When set, enables the KL-against-reference reward (kl_coherence)."""
 
@@ -838,20 +838,32 @@ def _create_vllm_engine(
 
         )
 
-    try:
-        from vllm.executor.gpu_executor import GPUExecutor as _GPUExec  # type: ignore
-        _orig_create = _GPUExec._create_worker
+    # vLLM <= 0.7.x used GPUExecutor; 0.8.x replaced it with UniProcExecutor.
+    # Try both paths so the patch works across versions.
+    import importlib
+    _executor_cls = None
+    _orig_create = None
+    for _mod_path, _cls_name in [
+        ("vllm.executor.gpu_executor", "GPUExecutor"),
+        ("vllm.executor.uniproc_executor", "UniProcExecutor"),
+    ]:
+        try:
+            _mod = importlib.import_module(_mod_path)
+            _executor_cls = getattr(_mod, _cls_name)
+            _orig_create = _executor_cls._create_worker
+            break
+        except (ImportError, AttributeError):
+            continue
 
+    if _executor_cls is not None:
         def _pinned_create(self, local_rank=0, rank=0, **kw):  # type: ignore[override]
             return _orig_create(self, local_rank=local_rank, rank=rank, **kw)
 
-        # Bind the target rank into the closure via a default arg.
         _pinned_create.__defaults__ = (local_rank, 0)
-        _GPUExec._create_worker = _pinned_create
-        print(f"[trainer] vLLM pinned to cuda:{local_rank} via GPUExecutor patch")
-    except Exception as exc:
-        print(f"[trainer] WARNING: could not pin vLLM to cuda:{local_rank} — {exc!r}")
-        _orig_create = None
+        _executor_cls._create_worker = _pinned_create
+        print(f"[trainer] vLLM pinned to cuda:{local_rank} via {_executor_cls.__name__} patch")
+    else:
+        print(f"[trainer] WARNING: could not pin vLLM to cuda:{local_rank} — no compatible executor found")
 
     try:
         engine = LLM(
@@ -862,7 +874,7 @@ def _create_vllm_engine(
         )
     finally:
         if _orig_create is not None:
-            _GPUExec._create_worker = _orig_create  # always restore
+            _executor_cls._create_worker = _orig_create  # always restore
 
     return engine
 
@@ -923,15 +935,15 @@ class FullDuplexRLTrainer:
 
         self.ref_model: Optional[Any] = None
         if config.ref_model_name_or_path:
-            print(f"[trainer] loading frozen reference model (CPU): {config.ref_model_name_or_path}")
+            print(f"[trainer] loading frozen reference model (GPU): {config.ref_model_name_or_path}")
             self.ref_model = AutoModelForCausalLM.from_pretrained(
-                config.ref_model_name_or_path, dtype=torch.bfloat16
+                config.ref_model_name_or_path,
+                torch_dtype="auto",
+                device_map=config.device,
             )
             self.ref_model.eval()
             for p in self.ref_model.parameters():
                 p.requires_grad_(False)
-            # Keep on CPU — only moved to GPU per-batch in compute_kl_ref_rewards.
-            # Saves ~8 GB of GPU memory at the cost of one H2D transfer per step.
 
         vllm_local_rank = 0
         if config.vllm_device:
@@ -1249,6 +1261,8 @@ class FullDuplexRLTrainer:
         if self.ref_model is None:
             return episodes
 
+        ref_device = next(self.ref_model.parameters()).device
+
         for episode in episodes:
             for step in episode.steps:
                 if step.is_idle or not step.response_token_ids or not step.log_probs:
@@ -1263,19 +1277,18 @@ class FullDuplexRLTrainer:
                 all_tokens = prompt_tokens + step.response_token_ids
                 n_prompt = len(prompt_tokens)
 
-                # ref_model lives on CPU to save GPU memory.
-                input_ids = torch.tensor([all_tokens], dtype=torch.long)  # CPU
+                input_ids = torch.tensor([all_tokens], dtype=torch.long, device=ref_device)
                 with torch.no_grad():
-                    ref_logits = self.ref_model(input_ids=input_ids).logits  # [1, T, V] CPU
+                    ref_logits = self.ref_model(input_ids=input_ids).logits  # [1, T, V]
 
                 # Causal shift: logits[i] predicts token[i+1]
-                shift_logits = ref_logits[0, n_prompt - 1: n_prompt - 1 + n_resp, :]  # [n_resp, V]
+                shift_logits = ref_logits[0, n_prompt - 1: n_prompt - 1 + n_resp, :].float()  # [n_resp, V]
                 shift_labels = torch.tensor(
-                    step.response_token_ids[:n_resp], dtype=torch.long
-                )  # CPU
+                    step.response_token_ids[:n_resp], dtype=torch.long, device=ref_device
+                )
                 per_token_ref_lp = -torch.nn.functional.cross_entropy(
                     shift_logits, shift_labels, reduction="none"
-                )  # already CPU
+                ).cpu()
 
                 per_token_student_lp = torch.tensor(step.log_probs[:n_resp])
                 per_token_kl = per_token_student_lp - per_token_ref_lp
