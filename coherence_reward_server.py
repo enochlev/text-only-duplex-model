@@ -49,11 +49,19 @@ PORT            = int(os.getenv("COHERENCE_PORT", "10001"))
 # Normalize reward by subtracting the greedy log-prob at each position.
 # reward_i = log P(proposed_i) - log P(greedy_i), always in (-inf, 0].
 # 0 = matched teacher's best choice; more negative = teacher preferred something else.
+# Superseded by USE_REFERENCE when that mode is active.
 NORMALIZE       = True
 # Scale factor applied after per-token averaging. Brings the mean per-token
 # advantage (typically -4..0) into the same range as the other reward signals
 # (capped at ~-0.5). Set via COHERENCE_SCALE env var to tune without code changes.
 REWARD_SCALE    = float(os.getenv("COHERENCE_SCALE", "0.2"))
+# Reference-based scoring: greedily generate a teacher reference response, then
+# reward = normalized_score(proposed) - normalized_score(reference).
+# Supersedes per-token NORMALIZE when enabled.
+USE_REFERENCE        = os.getenv("COHERENCE_USE_REFERENCE", "1") == "1"
+REFERENCE_MAX_TOKENS = int(os.getenv("COHERENCE_REFERENCE_MAX_TOKENS", "16"))
+# per-token normalization is superseded by reference-based normalization
+_NORMALIZE_PER_TOKEN = NORMALIZE and not USE_REFERENCE
 
 # Nonlinear shaping: map the "good zone" [SHAPE_THRESHOLD, 0] → [SHAPE_OUT_LO, SHAPE_OUT_HI]
 # using a convex (t^2) curve so near-perfect responses receive the steepest positive gradient.
@@ -72,6 +80,26 @@ def _shape_reward(r: float) -> float:
         t = (r - _SHAPE_THRESHOLD) / (0.0 - _SHAPE_THRESHOLD)  # 0 at threshold, 1 at 0
         return _SHAPE_OUT_LO + (_SHAPE_OUT_HI - _SHAPE_OUT_LO) * t ** 2
     return r
+
+
+def _score_tokens(
+    logits_slice: torch.Tensor,
+    token_ids: list[int],
+    gamma: float,
+    normalize_per_token: bool,
+) -> tuple[float, list[float]]:
+    """Score a token sequence given pre-sliced logits [n, vocab]."""
+    log_probs = F.log_softmax(logits_slice, dim=-1)
+    token_lps: list[float] = []
+    for i, tok_id in enumerate(token_ids):
+        lp = log_probs[i, tok_id].item()
+        if normalize_per_token:
+            lp -= log_probs[i].max().item()
+        token_lps.append(lp)
+    n = len(token_lps)
+    raw = sum(gamma ** i * lp for i, lp in enumerate(token_lps))
+    score = (raw / math.sqrt(n)) * REWARD_SCALE if n > 0 else 0.0
+    return score, token_lps
 
 
 # ── server ────────────────────────────────────────────────────────────────────
@@ -179,6 +207,7 @@ class RewardResponse(BaseModel):
     reward:          float
     n_tokens:        int
     token_log_probs: list[float]
+    greedy_text:     str = ""
 
 
 # ── endpoint ──────────────────────────────────────────────────────────────────
@@ -188,7 +217,120 @@ async def health():
     return {"status": "ok", "model": MODEL_NAME, "eos_token_ids": sorted(_end_ids)}
 
 
-@app.post("/reward", response_model=RewardResponse)
+def _locate_tokens(
+    full_ids: torch.Tensor,
+    text: str,
+    n_tokens_hint: Optional[int],
+    nl_ids: set[int],
+) -> tuple[int, int, int]:
+    """Return (text_start, end_pos, n_tokens) for `text` within full_ids."""
+    seq_len    = full_ids.shape[1]
+    strippable = _end_ids | nl_ids
+    end_pos    = seq_len
+    while end_pos > 0 and full_ids[0, end_pos - 1].item() in strippable:
+        end_pos -= 1
+
+    if n_tokens_hint is not None and n_tokens_hint > 0:
+        n = n_tokens_hint
+        return end_pos - n, end_pos, n
+
+    target     = text.strip()
+    text_start = None
+    n_found    = 0
+    max_scan   = min(end_pos, max(len(text) // 2 + 20, 40))
+    for k in range(1, max_scan + 1):
+        start = end_pos - k
+        if start < 0:
+            break
+        if _tokenizer.decode(full_ids[0, start:end_pos].tolist()).strip() == target:
+            text_start = start
+            n_found    = k
+            break
+    if text_start is None:
+        ids        = _tokenizer.encode(text, add_special_tokens=False)
+        n_found    = len(ids)
+        text_start = end_pos - n_found
+    decoded = _tokenizer.decode(full_ids[0, text_start:end_pos].tolist())
+    if decoded.strip() != target:
+        print(
+            f"[coherence SERVER] token-alignment mismatch!  "
+            f"text={text!r}  decoded={decoded!r}  "
+            f"seq_len={seq_len}  n={n_found}  start={text_start}  end={end_pos}"
+        )
+    return text_start, end_pos, n_found
+
+
+def _build_assistant_ids(
+    system_content: str,
+    last_user: str,
+    assistant_text: str,
+) -> torch.Tensor:
+    """Tokenize a complete chat turn and return input_ids on the model device."""
+    messages = [
+        {"role": "system",    "content": system_content},
+        {"role": "user",      "content": last_user},
+        {"role": "assistant", "content": assistant_text},
+    ]
+    out = _tokenizer.apply_chat_template(
+        messages, add_generation_prompt=False, return_tensors="pt", enable_thinking=False
+    )
+    ids: torch.Tensor = out.input_ids if hasattr(out, "input_ids") else out
+    return ids.to(_model.device)
+
+
+def _forward_score(
+    system_content: str,
+    last_user: str,
+    assistant_text: str,
+    text_to_score: str,
+    n_hint: Optional[int],
+    gamma: float,
+    nl_ids: set[int],
+    normalize: bool,
+) -> tuple[float, list[float], int]:
+    """Score `text_to_score` inside a full chat sequence. Returns (score, lps, n_tokens)."""
+    full_ids = _build_assistant_ids(system_content, last_user, assistant_text)
+    t_start, end_pos, n_tokens = _locate_tokens(full_ids, text_to_score, n_hint, nl_ids)
+    if n_tokens <= 0 or t_start <= 0:
+        return 0.0, [], 0
+    with torch.inference_mode():
+        logits = _model(full_ids).logits[0][t_start - 1 : end_pos - 1].clone()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    token_ids = full_ids[0, t_start:end_pos].tolist()
+    score, lps = _score_tokens(logits, token_ids, gamma, normalize)
+    return score, lps, n_tokens
+
+
+def _generate_greedy_reference(
+    system_content: str, last_user: str
+) -> tuple[str, list[int]]:
+    """Greedily generate a teacher reference response. Returns (text, token_ids)."""
+    messages_prefix = [
+        {"role": "system", "content": system_content},
+        {"role": "user",   "content": last_user},
+    ]
+    pfx_out = _tokenizer.apply_chat_template(
+        messages_prefix, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
+    )
+    prefix_ids: torch.Tensor = (
+        pfx_out.input_ids if hasattr(pfx_out, "input_ids") else pfx_out
+    ).to(_model.device)
+    with torch.inference_mode():
+        gen_out = _model.generate(
+            prefix_ids,
+            max_new_tokens=REFERENCE_MAX_TOKENS,
+            do_sample=False,
+            pad_token_id=_tokenizer.eos_token_id,
+        )
+    new_ids = gen_out[0, prefix_ids.shape[1]:].tolist()
+    while new_ids and new_ids[-1] in _end_ids:
+        new_ids.pop()
+    text = _tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+    return text, new_ids
+
+
+@app.post("/reward", responses={503: {"description": "Model not loaded"}})
 async def compute_reward(req: RewardRequest) -> RewardResponse:
     if _model is None or _tokenizer is None:
         raise HTTPException(503, "model not loaded")
@@ -198,113 +340,38 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
 
     history_str    = _fmt_history([b.model_dump() for b in req.history])
     system_content = _SYSTEM_TMPL.format(history=history_str)
+    nl_ids         = set(_tokenizer.encode("\n", add_special_tokens=False))
 
-    messages_full = [
-        {"role": "system",    "content": system_content},
-        {"role": "user",      "content": req.last_user_message},
-        {"role": "assistant", "content": req.last_bot_message + req.proposed_next},
-    ]
+    greedy_text    = ""
+    greedy_new_ids: list[int] = []
+    if USE_REFERENCE:
+        greedy_text, greedy_new_ids = _generate_greedy_reference(
+            system_content, req.last_user_message
+        )
 
-    _tmpl_out = _tokenizer.apply_chat_template(
-        messages_full,
-        add_generation_prompt=False,
-        return_tensors="pt",
-        enable_thinking=False,
+    assistant_full = req.last_bot_message + req.proposed_next
+    proposed_score, token_log_probs, n_proposed = _forward_score(
+        system_content, req.last_user_message, assistant_full,
+        req.proposed_next, req.n_proposed_tokens, req.gamma, nl_ids, _NORMALIZE_PER_TOKEN,
     )
-    # newer transformers returns BatchEncoding; older returns a plain tensor
-    full_ids: torch.Tensor = (
-        _tmpl_out.input_ids if hasattr(_tmpl_out, "input_ids") else _tmpl_out
-    ).to(_model.device)  # [1, seq_len]
-
-    # ── locate proposed_next tokens inside full_ids ───────────────────────────
-    #
-    # We cannot encode proposed_next in isolation OR build a prefix template —
-    # BPE merges tokens across BOTH the last_bot_message/proposed_next boundary
-    # AND the proposed_next/end-token boundary. The only reliable method is to
-    # scan backwards through full_ids itself: find the shortest suffix of the
-    # pre-end-token region that decodes to proposed_next.
-
-    seq_len = full_ids.shape[1]
-
-    # Strip trailing end-of-turn tokens and newlines the template appended.
-    # Qwen3 emits <|im_end|>\n (newline after the end token), so we must also
-    # strip \n or the end token never gets reached.
-    _nl_ids = set(_tokenizer.encode("\n", add_special_tokens=False))
-    _strippable = _end_ids | _nl_ids
-    end_pos = seq_len
-    while end_pos > 0 and full_ids[0, end_pos - 1].item() in _strippable:
-        end_pos -= 1
-
-    if req.n_proposed_tokens is not None and req.n_proposed_tokens > 0:
-        n_proposed    = req.n_proposed_tokens
-        proposed_start = end_pos - n_proposed
-    else:
-        # Fallback scan for callers that don't pre-compute the token count.
-        # BPE tokenizers are context-sensitive at boundaries, so isolated
-        # encoding of proposed_next can differ from in-context tokenization.
-        proposed_text  = req.proposed_next.strip()
-        proposed_start = None
-        n_proposed     = 0
-        max_scan       = min(end_pos, max(len(req.proposed_next) // 2 + 20, 40))
-        for n in range(1, max_scan + 1):
-            start = end_pos - n
-            if start < 0:
-                break
-            if _tokenizer.decode(full_ids[0, start:end_pos].tolist()).strip() == proposed_text:
-                proposed_start = start
-                n_proposed     = n
-                break
-        if proposed_start is None:
-            ids = _tokenizer.encode(req.proposed_next, add_special_tokens=False)
-            n_proposed     = len(ids)
-            proposed_start = end_pos - n_proposed
-        decoded = _tokenizer.decode(full_ids[0, proposed_start:end_pos].tolist())
-        if decoded.strip() != req.proposed_next.strip():
-            print(
-                f"[coherence SERVER] token-alignment mismatch!  "
-                f"proposed_next={req.proposed_next!r}  "
-                f"decoded_from_ids={decoded!r}  "
-                f"seq_len={seq_len}  n_proposed={n_proposed}  "
-                f"proposed_start={proposed_start}  end_pos={end_pos}"
-            )
 
     if n_proposed <= 0:
         return RewardResponse(reward=0.0, n_tokens=0, token_log_probs=[])
-    if proposed_start <= 0:
-        raise HTTPException(400, "proposed_next longer than full sequence — check inputs")
 
-    # ── forward pass ──────────────────────────────────────────────────────────
+    greedy_score = 0.0
+    if USE_REFERENCE and greedy_new_ids:
+        greedy_assistant = req.last_bot_message + greedy_text
+        greedy_score, _, _ = _forward_score(
+            system_content, req.last_user_message, greedy_assistant,
+            greedy_text, len(greedy_new_ids), req.gamma, nl_ids, normalize=False,
+        )
 
-    with torch.inference_mode():
-        full_logits = _model(full_ids).logits[0]          # [seq_len, vocab]
-        # Slice only the positions that predict proposed tokens before log_softmax.
-        # logits[p-1] predicts token at position p, so we need [proposed_start-1 : end_pos-1].
-        needed_logits = full_logits[proposed_start - 1 : end_pos - 1].clone()  # [n_proposed, vocab]
-        del full_logits
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    log_probs = F.log_softmax(needed_logits, dim=-1)  # [n_proposed, vocab]
-    del needed_logits
-
-    token_log_probs: list[float] = []
-    for i, p in enumerate(range(proposed_start, end_pos)):
-        tok_id  = full_ids[0, p].item()
-        lp      = log_probs[i, tok_id].item()
-        if NORMALIZE:
-            lp -= log_probs[i].max().item()  # subtract greedy log-prob → advantage in (-inf, 0]
-        token_log_probs.append(lp)
-
-    n_tokens = len(token_log_probs)
-    raw = sum(req.gamma ** i * lp for i, lp in enumerate(token_log_probs))
-    # Divide by sqrt(n_tokens) so longer consistently-good responses score higher than
-    # short fillers, then apply nonlinear shaping to reward near-perfect scores positively.
-    reward = _shape_reward((raw / math.sqrt(n_tokens)) * REWARD_SCALE) if n_tokens > 0 else 0.0
-
+    raw = proposed_score - greedy_score if (USE_REFERENCE and greedy_text) else proposed_score
     return RewardResponse(
-        reward=reward,
-        n_tokens=n_tokens,
+        reward=_shape_reward(raw),
+        n_tokens=n_proposed,
         token_log_probs=token_log_probs,
+        greedy_text=greedy_text,
     )
 
 
