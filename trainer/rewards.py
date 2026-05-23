@@ -192,8 +192,11 @@ def coherence_reward(
         n_proposed_tokens = None
 
     payload = {
+        # Strip bot turns from history so the teacher conditions only on what
+        # the USER said. Sending student bot output lets degenerate backchannel
+        # loops contaminate the teacher's reference, erasing the penalty.
         "history": [
-            {"user": b.user_text or "", "bot": b.assistant_text or ""}
+            {"user": b.user_text or "", "bot": ""}
             for b in history
         ],
         "last_user_message": last_user,
