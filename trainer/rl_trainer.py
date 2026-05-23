@@ -189,6 +189,11 @@ class TrainerConfig:
     """Total episodes to collect before silence injection activates.
     0 = on from the start. Use e.g. 40 to let the model learn to speak first."""
 
+    random_block_keep: bool = True
+    """When True, randomly keep 1–4 blocks of each 16-token generation, then
+    switch to reactive self-generation. Teaches the model when to stop/continue
+    without always pre-committing to the full generation window."""
+
     tts_model: str = ""
     """Piper TTS model path used for GPTVoiceSimulator real-time episodes.
     Defaults to the full_duplex module default (en_US-danny-low) when empty."""
@@ -306,6 +311,7 @@ class VirtualSimulationConnection:
         tts_model: str = "",
         device: Optional[str] = None,
         silence_inject_lambda_knob: float = 0.0,
+        random_block_keep: bool = False,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -315,6 +321,7 @@ class VirtualSimulationConnection:
         self.tts_model = tts_model
         self.device = device
         self.silence_inject_lambda_knob = silence_inject_lambda_knob
+        self.random_block_keep = random_block_keep
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -362,6 +369,16 @@ class VirtualSimulationConnection:
                 max_tokens=self.vllm_max_tokens,
                 temperature=self.vllm_temperature,
             )
+
+            # Random block-keep: keep 1–4 blocks, drop the rest so the model
+            # enters reactive self-generation sooner on short draws.
+            if text and self.random_block_keep and len(rtok) > 0:
+                tokens_per_block = max(1, self.vllm_max_tokens // 4)
+                n_keep = random.randint(1, 4) * tokens_per_block
+                if n_keep < len(rtok):
+                    rtok = rtok[:n_keep]
+                    lps = lps[:n_keep]
+                    text = self.tokenizer.decode(rtok, skip_special_tokens=True).strip()
 
             # Punctuation truncation: cut text at its last punctuation mark.
             if text and lam > 0.0 and random.random() < lam:
@@ -491,6 +508,7 @@ class RealTimeGPTEpisodeRunner:
         tts_model: str = "",
         device: Optional[str] = None,
         silence_inject_lambda_knob: float = 0.0,
+        random_block_keep: bool = False,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -500,6 +518,7 @@ class RealTimeGPTEpisodeRunner:
         self.tts_model = tts_model
         self.device = device
         self.silence_inject_lambda_knob = silence_inject_lambda_knob
+        self.random_block_keep = random_block_keep
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -543,6 +562,14 @@ class RealTimeGPTEpisodeRunner:
                 max_tokens=self.vllm_max_tokens,
                 temperature=self.vllm_temperature,
             )
+
+            if text and self.random_block_keep and len(rtok) > 0:
+                tokens_per_block = max(1, self.vllm_max_tokens // 4)
+                n_keep = random.randint(1, 4) * tokens_per_block
+                if n_keep < len(rtok):
+                    rtok = rtok[:n_keep]
+                    lps = lps[:n_keep]
+                    text = self.tokenizer.decode(rtok, skip_special_tokens=True).strip()
 
             if text and lam > 0.0 and random.random() < lam:
                 matches = list(_PUNCT_RE.finditer(text))
@@ -984,6 +1011,7 @@ class FullDuplexRLTrainer:
                     tts_model=self.config.tts_model,
                     device=self.config.device,
                     silence_inject_lambda_knob=effective_lambda,
+                    random_block_keep=self.config.random_block_keep,
                 )
             else:
                 runner = VirtualSimulationConnection(
@@ -995,6 +1023,7 @@ class FullDuplexRLTrainer:
                     tts_model=self.config.tts_model,
                     device=self.config.device,
                     silence_inject_lambda_knob=effective_lambda,
+                    random_block_keep=self.config.random_block_keep,
                 )
             try:
                 ep = runner.run_episode()

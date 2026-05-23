@@ -105,6 +105,7 @@ def _frame_user_msg(text: str) -> str:
 def _shape_reward(r: float) -> float:
     if r >= _SHAPE_THRESHOLD:
         t = (r - _SHAPE_THRESHOLD) / (0.0 - _SHAPE_THRESHOLD)  # 0 at threshold, 1 at 0
+        t = min(t, 1.0)  # clamp: r > 0 (proposed beats greedy) still caps at SHAPE_OUT_HI
         return _SHAPE_OUT_LO + (_SHAPE_OUT_HI - _SHAPE_OUT_LO) * t ** 2
     return r
 

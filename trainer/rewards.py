@@ -387,7 +387,7 @@ def interruption_penalty(
             return 0.0
 
     if run == 1:
-        return -0.05
+        return 0.0  # first overlap: bot had no causal visibility of user speech
     if run == 2:
         return -0.15
     if run == 3:
