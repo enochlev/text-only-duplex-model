@@ -197,6 +197,11 @@ class TrainerConfig:
     kl_ref_clip: float = 5.0
     """Per-token KL clip value. Prevents BPE boundary outliers from dominating the mean."""
 
+    max_blocks_after_user_speech: int = 2
+    """Hard cap on consecutive LLM calls when the user is silent.
+    0 = speak only while user is talking, 1 = one extra block, 2 = two extra blocks (default).
+    LLM calls beyond this window are forced idle without vLLM invocation."""
+
 
 # ---------------------------------------------------------------------------
 # vLLM generation with training metadata
@@ -307,6 +312,7 @@ class VirtualSimulationConnection:
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
+        max_blocks_after_user_speech: int = 2,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -315,6 +321,7 @@ class VirtualSimulationConnection:
         self.vllm_temperature = vllm_temperature
         self.tts_model = tts_model
         self.device = device
+        self.max_blocks_after_user_speech = max_blocks_after_user_speech
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -326,10 +333,32 @@ class VirtualSimulationConnection:
         # Tracks the context_version at the time of the previous LLM call so
         # we can detect whether the user spoke between calls.
         last_context_version: List[int] = [-1]
+        # Counts consecutive LLM calls without user speech. Starts high so
+        # the model doesn't generate before the first utterance.
+        blocks_since_user_spoke: List[int] = [999]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
             last_context_version[0] = agent.context_version
+
+            if user_spoke:
+                blocks_since_user_spoke[0] = 0
+            else:
+                blocks_since_user_spoke[0] += 1
+
+            if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
+                # Outside the speaking window — force idle without vLLM call.
+                steps.append(StepRecord(
+                    step_id=str(uuid.uuid4())[:8],
+                    prompt_text=system_prompt + "\n\n" + user_message,
+                    full_prompt_tokens=[],
+                    response_token_ids=[],
+                    log_probs=[],
+                    is_idle=True,
+                    source_block_id=agent._latest_user_source_block_id,
+                    user_spoke_before=user_spoke,
+                ))
+                return ""
 
             text, ptok, rtok, lps = llm_generate_train(
                 system_prompt,
@@ -467,6 +496,7 @@ class RealTimeGPTEpisodeRunner:
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
+        max_blocks_after_user_speech: int = 2,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -475,6 +505,7 @@ class RealTimeGPTEpisodeRunner:
         self.vllm_temperature = vllm_temperature
         self.tts_model = tts_model
         self.device = device
+        self.max_blocks_after_user_speech = max_blocks_after_user_speech
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -484,10 +515,29 @@ class RealTimeGPTEpisodeRunner:
 
         steps: List[StepRecord] = []
         last_context_version: List[int] = [-1]
+        blocks_since_user_spoke: List[int] = [999]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
             last_context_version[0] = agent.context_version
+
+            if user_spoke:
+                blocks_since_user_spoke[0] = 0
+            else:
+                blocks_since_user_spoke[0] += 1
+
+            if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
+                steps.append(StepRecord(
+                    step_id=str(uuid.uuid4())[:8],
+                    prompt_text=system_prompt + "\n\n" + user_message,
+                    full_prompt_tokens=[],
+                    response_token_ids=[],
+                    log_probs=[],
+                    is_idle=True,
+                    source_block_id=agent._latest_user_source_block_id,
+                    user_spoke_before=user_spoke,
+                ))
+                return ""
 
             text, ptok, rtok, lps = llm_generate_train(
                 system_prompt,
@@ -943,6 +993,7 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
+                    max_blocks_after_user_speech=self.config.max_blocks_after_user_speech,
                 )
             else:
                 runner = VirtualSimulationConnection(
@@ -953,6 +1004,7 @@ class FullDuplexRLTrainer:
                     vllm_temperature=self.config.vllm_temperature,
                     tts_model=self.config.tts_model,
                     device=self.config.device,
+                    max_blocks_after_user_speech=self.config.max_blocks_after_user_speech,
                 )
             try:
                 ep = runner.run_episode()
