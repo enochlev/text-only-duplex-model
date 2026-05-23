@@ -17,6 +17,7 @@ from .rewards import (
     respond_after_user_reward,
     interruption_penalty,
     interruption_penalty_overlap,
+    backchannel_loop_penalty,
     check_rm_servers,
 )
 from .data_ingestion import (
@@ -43,6 +44,7 @@ __all__ = [
     "respond_after_user_reward",
     "interruption_penalty",
     "interruption_penalty_overlap",
+    "backchannel_loop_penalty",
     "check_rm_servers",
     # data_ingestion
     "EpisodeData",

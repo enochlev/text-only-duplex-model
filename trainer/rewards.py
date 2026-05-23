@@ -137,6 +137,57 @@ def interruption_penalty_overlap(
 
 
 # ---------------------------------------------------------------------------
+# Backchannel loop penalty
+# ---------------------------------------------------------------------------
+
+_BACKCHANNELS: frozenset = frozenset({
+    "ya", "yeah", "yep", "yup",
+    "okay", "ok",
+    "right", "alright",
+    "sure",
+    "mm", "hmm", "uh-huh", "mhm", "uhh",
+    "i know", "i see", "i understand",
+    "got it", "that's right", "exactly", "of course",
+})
+
+
+def _normalize_bot_text(text: str) -> str:
+    return text.lower().strip().rstrip(".,!?").strip()
+
+
+def backchannel_loop_penalty(
+    block: DuplexAudioBlock,
+    history: List[DuplexAudioBlock],
+    _is_terminal: bool,
+) -> float:
+    """Penalise consecutive backchannel-only bot blocks.
+
+    A single backchannel is natural and free. Penalty escalates at -0.5
+    per additional consecutive backchannel block:
+      run=1: 0.0   run=2: -0.5   run=3: -1.0   run=4: -1.5 ...
+    """
+    if not block.assistant_text:
+        return 0.0
+
+    norm = _normalize_bot_text(block.assistant_text)
+    if norm not in _BACKCHANNELS:
+        return 0.0
+
+    run = 1
+    for b in reversed(history):
+        if not b.assistant_text:
+            break
+        if _normalize_bot_text(b.assistant_text) in _BACKCHANNELS:
+            run += 1
+        else:
+            break
+
+    if run <= 1:
+        return 0.0
+    return -0.5 * (run - 1)
+
+
+# ---------------------------------------------------------------------------
 # VAD clients
 # ---------------------------------------------------------------------------
 

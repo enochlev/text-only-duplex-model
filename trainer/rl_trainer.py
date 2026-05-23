@@ -187,6 +187,16 @@ class TrainerConfig:
     maximise its memory budget independently.  Defaults to None (vLLM shares
     the same device as config.device)."""
 
+    ref_model_name_or_path: Optional[str] = None
+    """HF model id or local path for the frozen reference model.
+    When set, enables the KL-against-reference reward (kl_coherence)."""
+
+    kl_ref_coeff: float = 0.05
+    """Scale factor for the KL-against-reference reward penalty."""
+
+    kl_ref_clip: float = 5.0
+    """Per-token KL clip value. Prevents BPE boundary outliers from dominating the mean."""
+
 
 # ---------------------------------------------------------------------------
 # vLLM generation with training metadata
@@ -855,6 +865,17 @@ class FullDuplexRLTrainer:
         # Trades ~30% extra compute for a large reduction in activation memory.
         self.model.gradient_checkpointing_enable()
 
+        self.ref_model: Optional[Any] = None
+        if config.ref_model_name_or_path:
+            print(f"[trainer] loading frozen reference model: {config.ref_model_name_or_path}")
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                config.ref_model_name_or_path, dtype=torch.bfloat16
+            )
+            self.ref_model.to(config.device)
+            self.ref_model.eval()
+            for p in self.ref_model.parameters():
+                p.requires_grad_(False)
+
         vllm_local_rank = 0
         if config.vllm_device:
             try:
@@ -1143,6 +1164,65 @@ class FullDuplexRLTrainer:
         return episode
 
     # ------------------------------------------------------------------
+    # KL-against-reference reward
+    # ------------------------------------------------------------------
+
+    def compute_kl_ref_rewards(self, episodes: List[Episode]) -> List[Episode]:
+        """Add KL-against-reference penalty to each non-idle step's reward.
+
+        For each response token t:
+            kl_t = log p_student(t) - log p_ref(t)
+        Penalty = -kl_ref_coeff * mean(clip(kl_t, max=kl_ref_clip))
+
+        No-op when ref_model is not loaded. Adds 'kl_coherence' to
+        step.reward_breakdown so it appears in metrics and debug logs.
+        """
+        if self.ref_model is None:
+            return episodes
+
+        for episode in episodes:
+            for step in episode.steps:
+                if step.is_idle or not step.response_token_ids or not step.log_probs:
+                    continue
+
+                n_resp = len(step.response_token_ids)
+                budget = self.config.max_seq_len - n_resp - 1
+                if budget < 1:
+                    continue
+
+                prompt_tokens = step.full_prompt_tokens[-budget:]
+                all_tokens = prompt_tokens + step.response_token_ids
+                n_prompt = len(prompt_tokens)
+
+                input_ids = torch.tensor(
+                    [all_tokens], dtype=torch.long, device=self.config.device
+                )
+
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    ref_logits = self.ref_model(input_ids=input_ids).logits  # [1, T, V]
+
+                # Causal shift: logits[i] predicts token[i+1]
+                shift_logits = ref_logits[0, n_prompt - 1: n_prompt - 1 + n_resp, :]  # [n_resp, V]
+                shift_labels = torch.tensor(
+                    step.response_token_ids[:n_resp],
+                    dtype=torch.long, device=self.config.device,
+                )
+                per_token_ref_lp = -torch.nn.functional.cross_entropy(
+                    shift_logits, shift_labels, reduction="none"
+                ).cpu()  # [n_resp]
+
+                per_token_student_lp = torch.tensor(step.log_probs[:n_resp])
+                per_token_kl = per_token_student_lp - per_token_ref_lp
+                per_token_kl_clipped = torch.clamp(per_token_kl, max=self.config.kl_ref_clip)
+                mean_kl = per_token_kl_clipped.mean().item()
+
+                penalty = -self.config.kl_ref_coeff * mean_kl
+                step.reward = (step.reward or 0.0) + penalty
+                step.reward_breakdown["kl_coherence"] = penalty
+
+        return episodes
+
+    # ------------------------------------------------------------------
     # REINFORCE loss
     # ------------------------------------------------------------------
 
@@ -1249,6 +1329,9 @@ class FullDuplexRLTrainer:
 
         # Score
         episodes = [self.compute_rewards(e, ep_idx=i) for i, e in enumerate(episodes)]
+
+        # KL-against-reference penalty (no-op when ref_model is None)
+        episodes = self.compute_kl_ref_rewards(episodes)
 
         # Update EMA baseline from all returns in this batch
         all_returns: List[float] = []
