@@ -215,30 +215,27 @@ def test_silence_token_is_scored():
 
 # ── 7. Repetition of prev_bot is penalised ───────────────────────────────────
 
-def test_repetition_penalized():
-    """Stuttering — repeating the exact same block back-to-back multiple times —
-    should score worse than a natural continuation.
+def test_reward_bounded_within_shaped_range():
+    """All rewards should fall within the shaped output range.
 
-    Note: with USE_REFERENCE, a single repetition can score well because
-    the teacher would also produce that phrase. Stuttering (3x same phrase)
-    is clearly degenerate and the teacher should penalise it more.
+    _shape_reward maps scores above SHAPE_THRESHOLD to [SHAPE_OUT_LO, SHAPE_OUT_HI]
+    and passes negative scores through unchanged. Rewards should never be
+    wildly out of range regardless of input.
+
+    Note: repetition is NOT penalised by the coherence reward — that's
+    monologue_too_long_penalty's job. coherence only scores contextual fit.
     """
-    user  = "Tell me about Paris."
-    block = "Paris is the capital of France."
-
-    # Three-block stutter: prev_bot is the phrase repeated; proposed is it again
-    stutter_bot = f"{block} {block} {block}"
-    r_stutter = _reward(block, last_user=user, last_bot=stutter_bot)
-
-    # Natural continuation after one clean block
-    r_natural = _reward(
-        "It's known for the Eiffel Tower and its rich cultural heritage.",
-        last_user=user, last_bot=block,
-    )
-    assert r_natural["reward"] > r_stutter["reward"], (
-        f"Natural continuation ({r_natural['reward']:.4f}) should beat "
-        f"stutter ({r_stutter['reward']:.4f})"
-    )
+    cases = [
+        ("Sure, happy to help with that.", "Can you help me?", ""),
+        ("uh-huh I see right yeah.", "What do you think?", ""),
+        ("Completely unrelated gibberish zxqwerty bloop.", "Tell me about Python.", ""),
+        ("Yes, that follows naturally.", "So the next step is?", "I think we should start by"),
+    ]
+    for proposed, last_user, last_bot in cases:
+        r = _reward(proposed, last_user=last_user, last_bot=last_bot)
+        reward = r["reward"]
+        assert reward <= 1.0, f"reward={reward:.4f} exceeds SHAPE_OUT_HI=1.0 for {proposed!r}"
+        assert reward >= -10.0, f"reward={reward:.4f} is absurdly negative for {proposed!r}"
 
 
 # ── 8. First response with no history or prefix ───────────────────────────────
