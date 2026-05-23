@@ -1,0 +1,27 @@
+# Freeze the serving stack while installing NeMo ASR.
+# Use with:
+#   pip install -r requirements.txt -c constraints-llm.txt
+# If NeMo requests incompatible versions, pip will error instead of changing these.
+
+vllm==0.8.5
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
+transformers==4.57.6 
+tokenizers==0.22.2
+xformers==0.0.29.post2
+triton==3.2.0
+sentencepiece==0.2.0
+protobuf>=4.25,<5
+
+# Keep vLLM tracing packages coherent. Mixing newer OpenTelemetry releases into
+# this stack is what usually causes the protobuf conflict.
+opentelemetry-api==1.26.0
+opentelemetry-sdk==1.26.0
+opentelemetry-exporter-otlp==1.26.0
+opentelemetry-proto==1.26.0
+
+# NeMo ASR currently pulls `datasets`, and newer `datasets` releases require
+# pyarrow>=21. Pin both together if this env needs the older Arrow line.
+datasets==3.6.0
+pyarrow==20.0.0
