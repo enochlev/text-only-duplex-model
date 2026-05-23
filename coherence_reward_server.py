@@ -55,6 +55,10 @@ NORMALIZE       = True
 # advantage (typically -4..0) into the same range as the other reward signals
 # (capped at ~-0.5). Set via COHERENCE_SCALE env var to tune without code changes.
 REWARD_SCALE    = float(os.getenv("COHERENCE_SCALE", "0.2"))
+# Penalty applied when both teacher and student ended the previous block (mutual EOS)
+# but the student talks again in the next block (rambling after turn completion).
+# Bypasses the teacher forward pass — the answer is structurally wrong regardless of content.
+RAMBLING_PENALTY = float(os.getenv("COHERENCE_RAMBLING_PENALTY", "-4.0"))
 # Reference-based scoring: greedily generate a teacher reference response, then
 # reward = normalized_score(proposed) - normalized_score(reference).
 # Supersedes per-token NORMALIZE when enabled.
@@ -73,6 +77,25 @@ _SHAPE_OUT_HI    = float(os.getenv("COHERENCE_SHAPE_OUT_HI",    "1.0"))
 # Tokens the chat template appends after the assistant turn (stripped when
 # locating the proposed block inside the full token sequence).
 _END_STRINGS = ["<|im_end|>", "<|endoftext|>", "<|end_of_text|>", "</s>"]
+
+# Punctuation that marks a sentence as complete. Anything else gets " ..."
+# appended to signal the turn was cut mid-stream.
+_SENTENCE_TERMINALS = frozenset('.?!:;')
+
+
+def _frame_user_msg(text: str) -> str:
+    """Reframe the user message as reported speech with an explicit turn boundary.
+
+    Two defenses against sentence-completion bleed:
+    - '[User said]:' prefix  — teacher reads this as a quoted utterance to
+      respond TO, not an open prompt to continue.
+    - ' ...'  suffix        — appended when the message has no terminal
+      punctuation, signalling the speaker was cut off mid-stream.
+    """
+    stripped = text.rstrip()
+    if stripped and stripped[-1] not in _SENTENCE_TERMINALS:
+        stripped += " ..."
+    return f"[User said]: {stripped}"
 
 
 def _shape_reward(r: float) -> float:
@@ -201,6 +224,13 @@ class RewardRequest(BaseModel):
     proposed_next:     str          # new block text to score
     gamma:             float = GAMMA
     n_proposed_tokens: Optional[int] = None  # pre-computed token count; skips server scan when set
+    # True when the previous block ended with mutual EOS (teacher proposed EOS, student agreed).
+    # Any non-empty proposed_next in this state is rambling and receives RAMBLING_PENALTY directly.
+    prev_block_was_eos: bool = False
+    # True when the student emitted EOS before the block boundary (ended early).
+    # The EOS token is included in scoring so the teacher's low P(EOS) at that position
+    # contributes a natural penalty — symmetric counterpart to RAMBLING_PENALTY.
+    student_emitted_eos: bool = False
 
 
 class RewardResponse(BaseModel):
@@ -222,35 +252,51 @@ def _locate_tokens(
     text: str,
     n_tokens_hint: Optional[int],
     nl_ids: set[int],
+    include_terminal_eos: bool = False,
 ) -> tuple[int, int, int]:
-    """Return (text_start, end_pos, n_tokens) for `text` within full_ids."""
+    """Return (text_start, end_pos, n_tokens) for `text` within full_ids.
+
+    When include_terminal_eos=True the scoring window is extended by one EOS
+    token past the text, so the teacher's P(EOS) at that position is scored.
+    This penalises premature endings when the teacher would have continued.
+    """
     seq_len    = full_ids.shape[1]
     strippable = _end_ids | nl_ids
-    end_pos    = seq_len
-    while end_pos > 0 and full_ids[0, end_pos - 1].item() in strippable:
-        end_pos -= 1
+
+    # Strip all trailing EOS/NL to find where text tokens actually end.
+    text_end = seq_len
+    while text_end > 0 and full_ids[0, text_end - 1].item() in strippable:
+        text_end -= 1
+
+    # Optionally extend by exactly one EOS for premature-EOS scoring.
+    eos_appended = (
+        include_terminal_eos
+        and text_end < seq_len
+        and full_ids[0, text_end].item() in _end_ids
+    )
+    end_pos = text_end + (1 if eos_appended else 0)
 
     if n_tokens_hint is not None and n_tokens_hint > 0:
-        n = n_tokens_hint
+        n = n_tokens_hint + (1 if eos_appended else 0)
         return end_pos - n, end_pos, n
 
     target     = text.strip()
     text_start = None
     n_found    = 0
-    max_scan   = min(end_pos, max(len(text) // 2 + 20, 40))
+    max_scan   = min(text_end, max(len(text) // 2 + 20, 40))
     for k in range(1, max_scan + 1):
-        start = end_pos - k
+        start = text_end - k
         if start < 0:
             break
-        if _tokenizer.decode(full_ids[0, start:end_pos].tolist()).strip() == target:
+        if _tokenizer.decode(full_ids[0, start:text_end].tolist()).strip() == target:
             text_start = start
-            n_found    = k
+            n_found    = k + (1 if eos_appended else 0)
             break
     if text_start is None:
         ids        = _tokenizer.encode(text, add_special_tokens=False)
-        n_found    = len(ids)
+        n_found    = len(ids) + (1 if eos_appended else 0)
         text_start = end_pos - n_found
-    decoded = _tokenizer.decode(full_ids[0, text_start:end_pos].tolist())
+    decoded = _tokenizer.decode(full_ids[0, text_start:text_end].tolist())
     if decoded.strip() != target:
         print(
             f"[coherence SERVER] token-alignment mismatch!  "
@@ -287,10 +333,11 @@ def _forward_score(
     gamma: float,
     nl_ids: set[int],
     normalize: bool,
+    include_terminal_eos: bool = False,
 ) -> tuple[float, list[float], int]:
     """Score `text_to_score` inside a full chat sequence. Returns (score, lps, n_tokens)."""
     full_ids = _build_assistant_ids(system_content, last_user, assistant_text)
-    t_start, end_pos, n_tokens = _locate_tokens(full_ids, text_to_score, n_hint, nl_ids)
+    t_start, end_pos, n_tokens = _locate_tokens(full_ids, text_to_score, n_hint, nl_ids, include_terminal_eos)
     if n_tokens <= 0 or t_start <= 0:
         return 0.0, [], 0
     with torch.inference_mode():
@@ -338,6 +385,16 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
     if not req.proposed_next.strip():
         return RewardResponse(reward=0.0, n_tokens=0, token_log_probs=[])
 
+    # Rambling: previous block was a mutual EOS (turn complete) but model talks again.
+    # The ideal teacher output here is a single EOS — no forward pass needed.
+    if req.prev_block_was_eos:
+        n_est = req.n_proposed_tokens or len(_tokenizer.encode(req.proposed_next, add_special_tokens=False))
+        print(
+            f"[coherence RAMBLING] penalty={RAMBLING_PENALTY}  n_tokens={n_est}"
+            f"  proposed={req.proposed_next!r:.40}"
+        )
+        return RewardResponse(reward=RAMBLING_PENALTY, n_tokens=n_est, token_log_probs=[])
+
     history_str    = _fmt_history([b.model_dump() for b in req.history])
     system_content = _SYSTEM_TMPL.format(history=history_str)
     nl_ids         = set(_tokenizer.encode("\n", add_special_tokens=False))
@@ -353,6 +410,7 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
     proposed_score, token_log_probs, n_proposed = _forward_score(
         system_content, req.last_user_message, assistant_full,
         req.proposed_next, req.n_proposed_tokens, req.gamma, nl_ids, _NORMALIZE_PER_TOKEN,
+        include_terminal_eos=req.student_emitted_eos,
     )
 
     if n_proposed <= 0:
@@ -363,7 +421,7 @@ async def compute_reward(req: RewardRequest) -> RewardResponse:
         greedy_assistant = req.last_bot_message + greedy_text
         greedy_score, _, _ = _forward_score(
             system_content, req.last_user_message, greedy_assistant,
-            greedy_text, len(greedy_new_ids), req.gamma, nl_ids, normalize=False,
+            greedy_text, None, req.gamma, nl_ids, normalize=False,
         )
 
     raw = proposed_score - greedy_score if (USE_REFERENCE and greedy_text) else proposed_score
