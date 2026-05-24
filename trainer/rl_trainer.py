@@ -967,17 +967,10 @@ class FullDuplexRLTrainer:
             local_rank=vllm_local_rank,
         )
 
-        try:
-            import bitsandbytes as bnb
-            self.optimizer = bnb.optim.AdamW8bit(
-                self.model.parameters(), lr=config.learning_rate, weight_decay=0.0
-            )
-            print("[trainer] using 8-bit AdamW (bitsandbytes)")
-        except ImportError:
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=config.learning_rate, weight_decay=0.0
-            )
-            print("[trainer] bitsandbytes not found, using fp32 AdamW")
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=config.learning_rate, weight_decay=0.0
+        )
+        print("[trainer] using fp32 AdamW")
         self._baseline: float = 0.0
         self._step_count: int = 0
         self._total_episodes: int = 0
