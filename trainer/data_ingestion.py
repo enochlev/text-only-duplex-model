@@ -239,21 +239,38 @@ _ULTRACHAT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 #   pip install "sentence-transformers<3.0"
 
 
-def _load_ultrachat_prompts(max_prompts: int = _ULTRACHAT_MAX_CACHE) -> List[str]:
-    """Load and cache short first-turn user prompts from UltraChat 200k.
+def _ultrachat_cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    path = os.path.join(base, "full_duplex_trainer")
+    os.makedirs(path, exist_ok=True)
+    return path
 
-    Filters to messages with fewer than 20 words from the first user turn.
-    Results are cached at module level so the dataset is streamed only once.
+
+def _load_ultrachat_prompts(max_prompts: int = _ULTRACHAT_MAX_CACHE) -> List[str]:
+    """Load short first-turn user prompts from UltraChat 200k, with disk cache.
+
+    First run streams from HuggingFace and writes to
+    ~/.cache/full_duplex_trainer/ultrachat_prompts_{max_prompts}.json.
+    Subsequent runs load from disk in ~0.5 s.
     """
     global _ULTRACHAT_PROMPTS
     if _ULTRACHAT_PROMPTS is not None:
         return _ULTRACHAT_PROMPTS
+
+    cache_path = os.path.join(_ultrachat_cache_dir(), f"ultrachat_prompts_{max_prompts}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            _ULTRACHAT_PROMPTS = json.load(f)
+        print(f"[UltraChatTTSSource] loaded {len(_ULTRACHAT_PROMPTS)} prompts from disk cache")
+        return _ULTRACHAT_PROMPTS
+
     try:
         from datasets import load_dataset  # type: ignore
     except ImportError:
         raise RuntimeError(
             "UltraChatTTSSource requires 'datasets'. pip install datasets"
         )
+    print("[UltraChatTTSSource] streaming ultrachat_200k (first run only — will cache to disk)…")
     ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
     prompts: List[str] = []
     for example in ds:
@@ -269,7 +286,9 @@ def _load_ultrachat_prompts(max_prompts: int = _ULTRACHAT_MAX_CACHE) -> List[str
             if len(prompts) >= max_prompts:
                 break
     _ULTRACHAT_PROMPTS = prompts
-    print(f"[UltraChatTTSSource] cached {len(prompts)} prompts from ultrachat_200k")
+    with open(cache_path, "w") as f:
+        json.dump(prompts, f)
+    print(f"[UltraChatTTSSource] cached {len(prompts)} prompts → {cache_path}")
     return _ULTRACHAT_PROMPTS
 
 
@@ -286,12 +305,26 @@ def set_embed_device(device: str) -> None:
 
 
 def _get_ultrachat_embeddings() -> "np.ndarray":
-    """Lazily encode all cached prompts and return L2-normalised embeddings."""
+    """Lazily encode all cached prompts, with disk cache for the embeddings.
+
+    Embeddings are saved to
+    ~/.cache/full_duplex_trainer/ultrachat_embeddings_{N}.npy (~70 MB).
+    Loading from disk takes ~0.3 s vs ~5 s to re-encode.
+    """
     global _ULTRACHAT_EMBEDDINGS
     if _ULTRACHAT_EMBEDDINGS is not None:
         return _ULTRACHAT_EMBEDDINGS
     import numpy as _np
     prompts = _load_ultrachat_prompts()
+    model_tag = _ULTRACHAT_EMBED_MODEL.replace("/", "_")
+    cache_path = os.path.join(
+        _ultrachat_cache_dir(),
+        f"ultrachat_embeddings_{len(prompts)}_{model_tag}.npy",
+    )
+    if os.path.exists(cache_path):
+        _ULTRACHAT_EMBEDDINGS = _np.load(cache_path)
+        print(f"[UltraChatTTSSource] embeddings loaded from disk  shape={_ULTRACHAT_EMBEDDINGS.shape}")
+        return _ULTRACHAT_EMBEDDINGS
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore
     except ImportError:
@@ -314,7 +347,8 @@ def _get_ultrachat_embeddings() -> "np.ndarray":
     if _torch.cuda.is_available():
         _torch.cuda.empty_cache()
     _ULTRACHAT_EMBEDDINGS = emb.astype(_np.float32)
-    print(f"[UltraChatTTSSource] embeddings ready  shape={_ULTRACHAT_EMBEDDINGS.shape}")
+    _np.save(cache_path, _ULTRACHAT_EMBEDDINGS)
+    print(f"[UltraChatTTSSource] embeddings cached → {cache_path}  shape={_ULTRACHAT_EMBEDDINGS.shape}")
     return _ULTRACHAT_EMBEDDINGS
 
 

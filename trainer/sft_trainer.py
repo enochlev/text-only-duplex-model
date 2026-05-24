@@ -159,8 +159,10 @@ class SilenceDataCollector:
                 mic = sim.get_audio_chunk(chunk_samples, ASR_SAMPLE_RATE)
                 if mic is None:
                     break
-                agent.push_mic_audio(mic, ASR_SAMPLE_RATE)
-                agent.poll()
+                agent.receive_mic_chunk(ASR_SAMPLE_RATE, mic)
+                tts_out = agent.poll()
+                if tts_out is not None:
+                    sim.on_agent_tts(*tts_out)
                 sim_time[0] += dt
 
             # Tokenise and bucket collected prompts
