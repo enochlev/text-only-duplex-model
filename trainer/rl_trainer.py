@@ -1053,6 +1053,8 @@ class FullDuplexRLTrainer:
         self._baseline: float = 0.0
         self._step_count: int = 0
         self._total_episodes: int = 0
+        self._run_summary_path: str = os.path.join(config.output_dir, "run_summary.txt")
+        self._init_run_summary()
 
         if HAS_WANDB and os.getenv("WANDB_API_KEY"):
             _wandb.init(
@@ -1157,55 +1159,60 @@ class FullDuplexRLTrainer:
         history: List[DuplexAudioBlock],
         is_terminal: bool,
         fn_names: List[str],
+        *,
+        kl_penalty: float = 0.0,
+        mean_kl: float = 0.0,
     ) -> Tuple[float, Dict[str, float]]:
-        """Run reward functions with full debug output. Returns (total, breakdown)."""
-        action_str = "<idle>" if step.is_idle else (step.prompt_text or "")[-80:].strip()
-
-        print(f"\n{'═'*70}")
-        print(f"  Step {step_num:04d}  |  ep={ep_idx}  step_idx={step_idx}"
-              f"  {'TERMINAL' if is_terminal else ''}")
-        print(f"  Action : {'<idle>' if step.is_idle else repr(action_str)}")
-        print(f"  Blocks : {step.blocks_covered or '[]'}")
-
+        """Run reward functions with compact debug output. Returns (total, breakdown)."""
         total = 0.0
         breakdown: Dict[str, float] = {}
 
+        # Full decoded step response (untruncated) shown as "pending bot"
+        pending_bot = ""
+        if step.response_token_ids:
+            pending_bot = self.tokenizer.decode(
+                step.response_token_ids, skip_special_tokens=True
+            ).strip()
+
         for block in covered:
-            user_snippet = (block.user_text or "<silence>")[:60]
-            bot_snippet  = (block.assistant_text or "<idle>")[:60]
             bot_toks = len(
-                self.tokenizer.encode(
-                    block.assistant_text or "", add_special_tokens=False
-                )
+                self.tokenizer.encode(block.assistant_text or "", add_special_tokens=False)
             )
             print(f"\n  ┌─ Block {block.block_id[:8]}  [bot_toks={bot_toks}]")
-            ctx = history[-4:] if len(history) >= 4 else history
+            ctx = history[-3:] if len(history) >= 3 else history
             if ctx:
                 for ci, hb in enumerate(ctx):
-                    hu = ((hb.user_text or "-")[:32])
-                    ha = ((hb.assistant_text or "-")[:28])
+                    hu = (hb.user_text or "-")[:32]
+                    ha = (hb.assistant_text or "-")[:28]
                     print(f"  │  B[{ci - len(ctx)}]  u={hu!r:<35}  ai={ha!r}")
                 print(f"  │  {'─'*60}")
-            print(f"  │  user : {user_snippet!r}")
-            print(f"  │  bot  : {bot_snippet!r}")
-            print("  │")
+            print(f"  │  user : {(block.user_text or '<silence>')!r}")
+            print(f"  │  bot  : {(block.assistant_text or '<idle>')!r}")
+            if pending_bot:
+                print(f"  │  pending bot : {pending_bot!r}")
 
             blk_total = 0.0
-            for rm_idx, (fn, w, name) in enumerate(
-                zip(self.reward_fns, self.rm_weights, fn_names), start=1
-            ):
+            rm_vals: List[float] = []
+            for fn, w in zip(self.reward_fns, self.rm_weights):
                 score = fn(block, history, is_terminal)
                 weighted = w * score
                 blk_total += weighted
                 breakdown[fn.__name__] = breakdown.get(fn.__name__, 0.0) + weighted
-                marker = "  " if weighted == 0.0 else ("▲ " if weighted > 0 else "▼ ")
-                print(f"  │  RM{rm_idx:<2} {name:<28} raw={score:+.4f}  w={w:.2f}"
-                      f"  → {weighted:+.4f}  {marker}")
+                rm_vals.append(weighted)
 
             total += blk_total
-            print(f"  └─ block total : {blk_total:+.4f}")
+            rm_parts = " | ".join(f"RM{i+1}={v:+.2f}" for i, v in enumerate(rm_vals))
+            print(f"  │  {rm_parts} | BLOCK_RM={blk_total:+.3f}")
+            print(f"  └─")
 
-        print(f"  STEP REWARD : {total:+.4f}")
+        # Step-level summary with optional inline KL
+        if kl_penalty != 0.0:
+            kl_str = f" | KL={kl_penalty:+.3f} (mean_kl={mean_kl:+.3f})"
+            final = total + kl_penalty
+            print(f"  STEP: RM={total:+.3f}{kl_str} | TOTAL={final:+.3f} (post weighting)")
+        else:
+            print(f"  STEP: RM={total:+.3f} | TOTAL={total:+.3f} (post weighting)")
+
         return total, breakdown
 
     def compute_rewards(self, episode: Episode, ep_idx: int = 0) -> Episode:
@@ -1273,33 +1280,29 @@ class FullDuplexRLTrainer:
                 if step.is_idle:
                     reward, breakdown = _idle_rm1_reward(step)
                     if reward or breakdown:
-                        print(f"\n{'═'*70}")
-                        print(f"  Step {self._step_count:04d}  |  ep={ep_idx}  step_idx={i}"
-                              f"  {'TERMINAL' if is_terminal else ''}")
-                        print("  Action : <idle>  [direct RM]")
-                        if "respond_after_user_reward" in breakdown:
-                            rm1_val = breakdown["respond_after_user_reward"]
-                            _w = self.rm_weights[0] if self.rm_weights else 1.0
-                            raw = rm1_val / _w if _w else rm1_val
-                            print(f"  RM1  respond_after_user_reward  raw={raw:+.4f}  "
-                                  f"w={_w:.2f}  → {rm1_val:+.4f}  ▼")
-                        if "correct_idle_reward" in breakdown:
-                            rm5_val = breakdown["correct_idle_reward"]
-                            _w5 = self.rm_weights[4] if len(self.rm_weights) > 4 else 1.0
-                            raw5 = rm5_val / _w5 if _w5 else rm5_val
-                            print(f"  RM5  correct_idle_reward         raw={raw5:+.4f}  "
-                                  f"w={_w5:.2f}  → {rm5_val:+.4f}  ▲")
-                        print(f"  STEP REWARD : {reward:+.4f}")
+                        rm1 = breakdown.get("respond_after_user_reward", 0.0)
+                        rm5 = breakdown.get("correct_idle_reward", 0.0)
+                        suffix = " TERMINAL" if is_terminal else ""
+                        print(f"\n  [IDLE step_idx={i}{suffix}]  "
+                              f"RM1={rm1:+.2f} | RM5={rm5:+.2f} | TOTAL={reward:+.3f}")
                     step.reward = reward
                     step.reward_breakdown = breakdown
                     continue
                 covered_ids = set(step.blocks_covered)
                 covered = [b for b in episode.blocks if b.block_id in covered_ids]
                 history = _prior_history(covered_ids)
+
+                # Pre-compute KL so it appears inline with block rewards
+                kl_penalty, mean_kl = self._compute_kl_penalty(step)
+
                 step.reward, step.reward_breakdown = self._debug_step(
                     self._step_count, ep_idx, i, step,
                     covered, history, is_terminal, fn_names,
+                    kl_penalty=kl_penalty, mean_kl=mean_kl,
                 )
+                if kl_penalty:
+                    step.reward = (step.reward or 0.0) + kl_penalty
+                    step.reward_breakdown["kl_coherence"] = kl_penalty
 
             # ── Episode token summary ──────────────────────────────────────
             ep_prompt_total    = sum(len(s.full_prompt_tokens)  for s in episode.steps)
@@ -1347,67 +1350,61 @@ class FullDuplexRLTrainer:
     # KL-against-reference reward
     # ------------------------------------------------------------------
 
+    def _compute_kl_penalty(self, step: "StepRecord") -> Tuple[float, float]:
+        """Compute KL-against-reference penalty for one non-idle step.
+
+        Returns (penalty, mean_kl). Returns (0.0, 0.0) when ref_model is not
+        loaded or the step has no response tokens.
+        """
+        if self.ref_model is None or step.is_idle or not step.response_token_ids or not step.log_probs:
+            return 0.0, 0.0
+
+        n_resp = len(step.response_token_ids)
+        budget = self.config.max_seq_len - n_resp - 1
+        if budget < 1:
+            return 0.0, 0.0
+
+        ref_device = next(self.ref_model.parameters()).device
+        prompt_tokens = step.full_prompt_tokens[-budget:]
+        all_tokens = prompt_tokens + step.response_token_ids
+        n_prompt = len(prompt_tokens)
+
+        input_ids = torch.tensor([all_tokens], dtype=torch.long, device=ref_device)
+        with torch.no_grad():
+            ref_logits = self.ref_model(input_ids=input_ids).logits  # [1, T, V]
+
+        # Causal shift: logits[i] predicts token[i+1]
+        shift_logits = ref_logits[0, n_prompt - 1: n_prompt - 1 + n_resp, :].float()
+        shift_labels = torch.tensor(
+            step.response_token_ids[:n_resp], dtype=torch.long, device=ref_device
+        )
+        per_token_ref_lp = -torch.nn.functional.cross_entropy(
+            shift_logits, shift_labels, reduction="none"
+        ).cpu()
+
+        per_token_student_lp = torch.tensor(step.log_probs[:n_resp])
+        per_token_kl = per_token_student_lp - per_token_ref_lp
+        mean_kl = torch.clamp(per_token_kl, max=self.config.kl_ref_clip).mean().item()
+        penalty = -self.config.kl_ref_coeff * mean_kl
+        return penalty, mean_kl
+
     def compute_kl_ref_rewards(self, episodes: List[Episode]) -> List[Episode]:
         """Add KL-against-reference penalty to each non-idle step's reward.
 
-        For each response token t:
-            kl_t = log p_student(t) - log p_ref(t)
-        Penalty = -kl_ref_coeff * mean(clip(kl_t, max=kl_ref_clip))
-
-        No-op when ref_model is not loaded. Adds 'kl_coherence' to
-        step.reward_breakdown so it appears in metrics and debug logs.
+        No-op when ref_model is not loaded. Steps already tagged with
+        'kl_coherence' (debug path computed it inline) are skipped.
         """
         if self.ref_model is None:
             return episodes
 
-        ref_device = next(self.ref_model.parameters()).device
-
         for episode in episodes:
             for step in episode.steps:
-                if step.is_idle or not step.response_token_ids or not step.log_probs:
-                    continue
-
-                n_resp = len(step.response_token_ids)
-                budget = self.config.max_seq_len - n_resp - 1
-                if budget < 1:
-                    continue
-
-                prompt_tokens = step.full_prompt_tokens[-budget:]
-                all_tokens = prompt_tokens + step.response_token_ids
-                n_prompt = len(prompt_tokens)
-
-                input_ids = torch.tensor([all_tokens], dtype=torch.long, device=ref_device)
-                with torch.no_grad():
-                    ref_logits = self.ref_model(input_ids=input_ids).logits  # [1, T, V]
-
-                # Causal shift: logits[i] predicts token[i+1]
-                shift_logits = ref_logits[0, n_prompt - 1: n_prompt - 1 + n_resp, :].float()  # [n_resp, V]
-                shift_labels = torch.tensor(
-                    step.response_token_ids[:n_resp], dtype=torch.long, device=ref_device
-                )
-                per_token_ref_lp = -torch.nn.functional.cross_entropy(
-                    shift_logits, shift_labels, reduction="none"
-                ).cpu()
-
-                per_token_student_lp = torch.tensor(step.log_probs[:n_resp])
-                per_token_kl = per_token_student_lp - per_token_ref_lp
-                per_token_kl_clipped = torch.clamp(per_token_kl, max=self.config.kl_ref_clip)
-                mean_kl = per_token_kl_clipped.mean().item()
-
-                penalty = -self.config.kl_ref_coeff * mean_kl
-                step.reward = (step.reward or 0.0) + penalty
-                step.reward_breakdown["kl_coherence"] = penalty
-
-                if self.config.debug:
-                    if penalty > 0:
-                        marker = "▲ "
-                    elif penalty < 0:
-                        marker = "▼ "
-                    else:
-                        marker = "  "
-                    print(f"  KL   kl_coherence               "
-                          f"mean_kl={mean_kl:+.4f}  coeff={self.config.kl_ref_coeff}"
-                          f"  → {penalty:+.4f}  {marker}")
+                if "kl_coherence" in step.reward_breakdown:
+                    continue  # debug path already computed and applied
+                penalty, _ = self._compute_kl_penalty(step)
+                if penalty:
+                    step.reward = (step.reward or 0.0) + penalty
+                    step.reward_breakdown["kl_coherence"] = penalty
 
         return episodes
 
@@ -1586,6 +1583,8 @@ class FullDuplexRLTrainer:
             print(f"  {'avg_' + fn_name:32s}  {avg_val:+.4f}")
         print(f"{'━'*width}\n")
 
+        self._write_step_to_summary(metrics, episodes)
+
         if HAS_WANDB and _wandb.run is not None:
             _wandb.log(metrics, step=self._step_count)
 
@@ -1629,6 +1628,7 @@ class FullDuplexRLTrainer:
                 self.save_checkpoint()
         self.save_checkpoint(tag="final")
         self._export_rewards_csv(history)
+        self._write_final_summary(history)
         if HAS_WANDB and _wandb.run is not None:
             _wandb.finish()
         return history
@@ -1652,9 +1652,152 @@ class FullDuplexRLTrainer:
                     self.save_checkpoint()
         self.save_checkpoint(tag="final")
         self._export_rewards_csv(history)
+        self._write_final_summary(history)
         if HAS_WANDB and _wandb.run is not None:
             _wandb.finish()
         return history
+
+    # ------------------------------------------------------------------
+    # Run summary file
+    # ------------------------------------------------------------------
+
+    def _init_run_summary(self) -> None:
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        cfg = self.config
+        rm_names = [fn.__name__ for fn in self.reward_fns]
+        lines = [
+            "=" * 80,
+            "TRAINING RUN SUMMARY",
+            f"Started : {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Summary : {self._run_summary_path}",
+            "=" * 80,
+            "",
+            "INITIALIZATION PARAMETERS",
+            "-" * 40,
+            f"  model              : {cfg.model_name_or_path}",
+            f"  ref_model          : {cfg.ref_model_name_or_path}",
+            f"  learning_rate      : {cfg.learning_rate}",
+            f"  kl_coeff           : {cfg.kl_coeff}",
+            f"  kl_ref_coeff       : {cfg.kl_ref_coeff}",
+            f"  kl_ref_clip        : {cfg.kl_ref_clip}",
+            f"  gamma              : {cfg.gamma}",
+            f"  baseline_ema_alpha : {cfg.baseline_ema_alpha}",
+            f"  gradient_clip      : {cfg.gradient_clip}",
+            f"  episodes_per_step  : {cfg.episodes_per_train_step}",
+            f"  vllm_max_tokens    : {cfg.vllm_max_tokens}",
+            f"  vllm_temperature   : {cfg.vllm_temperature}",
+            f"  max_seq_len        : {cfg.max_seq_len}",
+            f"  max_blocks_after_u : {cfg.max_blocks_after_user_speech}",
+            f"  device             : {cfg.device}",
+            f"  vllm_device        : {cfg.vllm_device}",
+            f"  reward_fns         : {rm_names}",
+            f"  rm_weights         : {self.rm_weights}",
+            "",
+        ]
+        with open(self._run_summary_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"[trainer] run summary → {self._run_summary_path}")
+
+    def _append_summary(self, text: str) -> None:
+        with open(self._run_summary_path, "a") as f:
+            f.write(text)
+
+    def _write_step_to_summary(
+        self, metrics: Dict[str, float], episodes: List[Episode]
+    ) -> None:
+        """Append one train-step section: metrics + 1–2 sampled episodes."""
+        if not episodes:
+            return
+        step_n = int(metrics["step"])
+        lines = [
+            f"\n{'='*80}",
+            f"STEP {step_n:04d}  |  "
+            f"loss={metrics['loss']:.4f}  "
+            f"avg_reward={metrics['avg_reward']:+.4f}  "
+            f"baseline={metrics['baseline']:.3f}  "
+            f"non_idle={int(metrics['n_non_idle'])}/{int(metrics['n_steps_total'])}",
+        ]
+
+        # Per-RM averages on one line
+        rm_names = [fn.__name__ for fn in self.reward_fns]
+        rm_parts = "  ".join(
+            f"avg_RM{i+1}={metrics.get('avg_' + n, 0.0):+.3f}"
+            for i, n in enumerate(rm_names)
+        )
+        kl_avg = metrics.get("avg_kl_coherence", None)
+        kl_str = f"  avg_KL={kl_avg:+.3f}" if kl_avg is not None else ""
+        lines.append(f"  {rm_parts}{kl_str}")
+        lines.append("")
+
+        # Sample up to 2 episodes
+        n_sample = min(2, len(episodes))
+        rng = np.random.default_rng(seed=step_n)
+        sampled = list(rng.choice(len(episodes), size=n_sample, replace=False))
+        for ep_i in sampled:
+            ep = episodes[ep_i]
+            lines += [
+                f"  ── Sampled episode {ep.episode_id}  "
+                f"[steps={len(ep.steps)} blocks={len(ep.blocks)} ended={ep.terminated_reason}]",
+                "  Conversation:",
+            ]
+            for bi, blk in enumerate(ep.blocks, 1):
+                u = (blk.user_text or "<silence>")
+                b = (blk.assistant_text or "<idle>")
+                lines.append(f"    [{bi:02d}] U: {u}")
+                lines.append(f"         B: {b}")
+            lines.append("  Scored steps:")
+            for st in ep.steps:
+                idle_mark = "IDLE " if st.is_idle else "SPEAK"
+                rm_vals = "  ".join(
+                    f"RM{i+1}={st.reward_breakdown.get(n, 0.0):+.2f}"
+                    for i, n in enumerate(rm_names)
+                )
+                kl_v = st.reward_breakdown.get("kl_coherence", None)
+                kl_part = f"  KL={kl_v:+.3f}" if kl_v is not None else ""
+                lines.append(
+                    f"    [{idle_mark}] blks={len(st.blocks_covered):1d}  "
+                    f"{rm_vals}{kl_part}  TOTAL={st.reward or 0.0:+.3f}"
+                )
+            lines.append("")
+
+        self._append_summary("\n".join(lines) + "\n")
+
+    def _write_final_summary(self, history: List[Dict[str, float]]) -> None:
+        if not history:
+            return
+        n = len(history)
+        split = max(1, n // 5)
+        avg_r_all = sum(h["avg_reward"] for h in history) / n
+        avg_r_early = sum(h["avg_reward"] for h in history[:split]) / split
+        avg_r_late = sum(h["avg_reward"] for h in history[-split:]) / split
+        avg_loss = sum(h["loss"] for h in history) / n
+
+        rm_names = [fn.__name__ for fn in self.reward_fns]
+        rm_summary = "  ".join(
+            f"RM{i+1}={sum(h.get('avg_' + nm, 0.0) for h in history)/n:+.3f}"
+            for i, nm in enumerate(rm_names)
+        )
+        kl_vals = [h.get("avg_kl_coherence", None) for h in history]
+        kl_vals = [v for v in kl_vals if v is not None]
+        kl_summary = f"  avg_KL={sum(kl_vals)/len(kl_vals):+.3f}" if kl_vals else ""
+
+        lines = [
+            f"\n{'='*80}",
+            "FINAL TRAINING SUMMARY",
+            f"Completed  : {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Steps      : {n}",
+            f"Episodes   : {self._total_episodes}",
+            "",
+            f"  avg_loss               : {avg_loss:.4f}",
+            f"  avg_reward (all steps) : {avg_r_all:+.4f}",
+            f"  reward trend  early={avg_r_early:+.4f}  late={avg_r_late:+.4f}  "
+            f"Δ={avg_r_late - avg_r_early:+.4f}",
+            "",
+            f"  Per-RM averages: {rm_summary}{kl_summary}",
+            f"{'='*80}",
+        ]
+        self._append_summary("\n".join(lines) + "\n")
+        print(f"[trainer] final summary written → {self._run_summary_path}")
 
     # ------------------------------------------------------------------
     # vLLM weight sync
