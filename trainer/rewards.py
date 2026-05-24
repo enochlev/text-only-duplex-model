@@ -205,6 +205,25 @@ def backchannel_loop_penalty(
     return -1.0 * (run - 1)
 
 
+def correct_idle_reward(
+    block: DuplexAudioBlock,
+    _history: List[DuplexAudioBlock],
+    _is_terminal: bool,
+) -> float:
+    """Reward choosing idle while the user is actively mid-sentence.
+
+    Returns +0.5 when the bot is silent and the user is still speaking
+    (user_text present but turn not yet complete). Returns 0.0 otherwise.
+    """
+    if block.assistant_text:
+        return 0.0
+    if not block.user_text:
+        return 0.0
+    if _user_finished_in(block):
+        return 0.0
+    return +0.5
+
+
 # ---------------------------------------------------------------------------
 # VAD clients
 # ---------------------------------------------------------------------------

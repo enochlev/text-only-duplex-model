@@ -25,6 +25,7 @@ from trainer import (
     interruption_penalty,
     interruption_penalty_overlap,
     backchannel_loop_penalty,
+    correct_idle_reward,
     make_default_data_pool,
     check_rm_servers,
     set_embed_device,
@@ -44,7 +45,7 @@ def main() -> None:
     parser.add_argument("--kl-coeff", type=float, default=0.01)
     parser.add_argument("--ref-model", default="Qwen/Qwen3-4B-Instruct-2507-FP8",
                         help="HF model id or local path for frozen reference model (enables kl_coherence reward)")
-    parser.add_argument("--kl-ref-coeff", type=float, default=0.05,
+    parser.add_argument("--kl-ref-coeff", type=float, default=0.075,
                         help="Scale factor for KL-against-reference reward penalty")
     parser.add_argument("--kl-ref-clip", type=float, default=5.0,
                         help="Per-token KL clip value before averaging")
@@ -124,8 +125,9 @@ def main() -> None:
         interruption_penalty,         # penalise talking over the user
         interruption_penalty_overlap, # VAD-based overlap penalty
         backchannel_loop_penalty,     # penalise consecutive backchannel loops
+        correct_idle_reward,          # reward staying silent while user is mid-sentence
     ]
-    reward_weights = [1.0, 1.0, 1.0, 1.0]
+    reward_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
 
     config.reward_fn_weights = reward_weights
 

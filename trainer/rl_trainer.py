@@ -1172,7 +1172,12 @@ class FullDuplexRLTrainer:
             if len(hist) < 2:
                 return 0.0, {}
             rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
-            if _user_finished_in(hist[-2]):
+            # lag=1: user just finished, first missed window → -1.0
+            if _user_finished_in(hist[-1]):
+                penalty = rm1_w * (-1.0)
+                return penalty, {"respond_after_user_reward": penalty}
+            # lag=2: user finished two blocks ago, still idle → -1.3
+            if len(hist) >= 3 and _user_finished_in(hist[-2]):
                 penalty = rm1_w * (-1.3)
                 return penalty, {"respond_after_user_reward": penalty}
             return 0.0, {}
@@ -1187,8 +1192,10 @@ class FullDuplexRLTrainer:
                         print(f"  Step {self._step_count:04d}  |  ep={ep_idx}  step_idx={i}"
                               f"  {'TERMINAL' if is_terminal else ''}")
                         print("  Action : <idle>  [RM1 direct]")
-                        print(f"  RM1  respond_after_user_reward  raw=-0.3000  "
-                              f"w={self.rm_weights[0]:.2f}  → {reward:+.4f}  ▼")
+                        _w = self.rm_weights[0] if self.rm_weights else 1.0
+                        raw = reward / _w if _w else reward
+                        print(f"  RM1  respond_after_user_reward  raw={raw:+.4f}  "
+                              f"w={_w:.2f}  → {reward:+.4f}  ▼")
                         print(f"  STEP REWARD : {reward:+.4f}")
                     step.reward = reward
                     step.reward_breakdown = breakdown
