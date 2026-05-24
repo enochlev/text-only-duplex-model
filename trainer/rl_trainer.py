@@ -405,9 +405,13 @@ class VirtualSimulationConnection:
                 eps_eligible[0] += 1
                 if _user_finished_in(_last_blk):
                     eps_vad_suppressed[0] += 1
-                elif np.random.random() < 0.20:
-                    eps_fired[0] += 1
-                    _force_idle = True
+                else:
+                    # Crossover: bot was also speaking → model should stop and listen.
+                    # Higher epsilon at overlap moments; lower at clean new-question starts.
+                    _eps_rate = 0.50 if _last_blk.assistant_text else 0.20
+                    if np.random.random() < _eps_rate:
+                        eps_fired[0] += 1
+                        _force_idle = True
             if _force_idle:
                 _, ptok, rtok, lps = llm_generate_train(
                     system_prompt, user_message,
@@ -623,9 +627,13 @@ class RealTimeGPTEpisodeRunner:
                 eps_eligible[0] += 1
                 if _user_finished_in(_last_blk):
                     eps_vad_suppressed[0] += 1
-                elif np.random.random() < 0.20:
-                    eps_fired[0] += 1
-                    _force_idle = True
+                else:
+                    # Crossover: bot was also speaking → model should stop and listen.
+                    # Higher epsilon at overlap moments; lower at clean new-question starts.
+                    _eps_rate = 0.50 if _last_blk.assistant_text else 0.20
+                    if np.random.random() < _eps_rate:
+                        eps_fired[0] += 1
+                        _force_idle = True
             if _force_idle:
                 _, ptok, rtok, lps = llm_generate_train(
                     system_prompt, user_message,
