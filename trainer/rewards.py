@@ -143,7 +143,7 @@ def interruption_penalty_overlap(
 
 _BACKCHANNELS: frozenset = frozenset({
     # affirmations
-    "ya", "yeah", "yep", "yup",
+    "ya", "yeah", "yep", "yup", "yes", "yes please", "yes sure", "yes of course",
     "okay", "ok",
     "right", "alright",
     "sure", "sure let's", "sure thing",
@@ -154,16 +154,32 @@ _BACKCHANNELS: frozenset = frozenset({
     "mm", "hmm", "uh-huh", "mhm", "uhh", "uhm",
     "wow", "really", "oh", "ah", "oh i see",
     # comprehension signals
-    "i know", "i see", "i understand",
+    "i know", "i see", "i understand", "i hear you", "i hear that",
     "got it", "makes sense", "fair enough", "i agree",
+    "noted", "understood", "copy that",
+    # hollow topic acknowledgements
+    "interesting", "interesting topic", "interesting point", "interesting question",
+    "great", "great question", "great point",
+    "good", "good question", "good point",
+    "nice", "fair point", "that's fair", "thats fair",
+    "sounds good", "sounds great", "sounds right", "sounds about right",
+    "that makes sense", "makes total sense",
+    # short clarifying fragments (non-variable forms)
+    "which ones", "which one", "like what", "how so", "such as",
     # conversation steering (hollow)
     "let's continue", "let's continue there", "let's go",
     "let's start", "let's", "let's see",
     "go on", "go ahead", "continue", "proceed",
     "please continue", "please go on", "tell me more",
-    # filler starters that appear as standalone responses
-    "interesting", "great", "nice", "good",
-    "sounds good", "sounds great",
+})
+
+# Prefix-matched backchannels — covers variable-length clarifying questions
+# like "What kind of style?" / "What kind of engaging tone?" / "What type of X?"
+_BACKCHANNEL_PREFIXES: frozenset = frozenset({
+    "what kind of",
+    "what type of",
+    "which kind of",
+    "which type of",
 })
 
 
@@ -188,14 +204,15 @@ def backchannel_loop_penalty(
         return 0.0
 
     norm = _normalize_bot_text(block.assistant_text)
-    if norm not in _BACKCHANNELS:
+    if norm not in _BACKCHANNELS and not any(norm.startswith(p) for p in _BACKCHANNEL_PREFIXES):
         return 0.0
 
     run = 1
     for b in reversed(history):
         if not b.assistant_text:
             break
-        if _normalize_bot_text(b.assistant_text) in _BACKCHANNELS:
+        n = _normalize_bot_text(b.assistant_text)
+        if n in _BACKCHANNELS or any(n.startswith(p) for p in _BACKCHANNEL_PREFIXES):
             run += 1
         else:
             break
