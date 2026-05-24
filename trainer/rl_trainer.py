@@ -226,6 +226,7 @@ def llm_generate_train(
     tokenizer: Any,
     max_tokens: int = 16,
     temperature: float = 1.0,
+    logit_bias: Optional[Dict[int, float]] = None,
 ) -> Tuple[str, List[int], List[int], List[float]]:
     """
     Generate a response with the vLLM engine and return training metadata.
@@ -255,12 +256,15 @@ def llm_generate_train(
 
     prompt_token_ids: List[int] = tokenizer.encode(full_prompt, add_special_tokens=False)
 
-    sampling_params = VLLMSamplingParams(
+    sp_kwargs: Dict[str, Any] = dict(
         max_tokens=max_tokens,
         temperature=temperature,
         logprobs=1,
         skip_special_tokens=True,
     )
+    if logit_bias:
+        sp_kwargs["logit_bias"] = logit_bias
+    sampling_params = VLLMSamplingParams(**sp_kwargs)
     outputs = vllm_engine.generate([full_prompt], sampling_params, use_tqdm=False)
     out = outputs[0].outputs[0]
 
@@ -417,6 +421,7 @@ class VirtualSimulationConnection:
                     system_prompt, user_message,
                     self.vllm_engine, self.tokenizer,
                     max_tokens=1, temperature=self.vllm_temperature,
+                    logit_bias={self.tokenizer.eos_token_id: 100},
                 )
                 text = ""
             else:
@@ -639,6 +644,7 @@ class RealTimeGPTEpisodeRunner:
                     system_prompt, user_message,
                     self.vllm_engine, self.tokenizer,
                     max_tokens=1, temperature=self.vllm_temperature,
+                    logit_bias={self.tokenizer.eos_token_id: 100},
                 )
                 text = ""
             else:
