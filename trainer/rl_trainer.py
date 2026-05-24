@@ -423,6 +423,10 @@ class VirtualSimulationConnection:
                     max_tokens=1, temperature=self.vllm_temperature,
                     logit_bias={self.tokenizer.eos_token_id: 100},
                 )
+                # vLLM may strip EOS from token_ids (skip_special_tokens).
+                # Without it, accumulate_reinforce_gradients skips this step.
+                if not rtok and lps:
+                    rtok = [self.tokenizer.eos_token_id]
                 text = ""
             else:
                 text, ptok, rtok, lps = llm_generate_train(
@@ -646,6 +650,10 @@ class RealTimeGPTEpisodeRunner:
                     max_tokens=1, temperature=self.vllm_temperature,
                     logit_bias={self.tokenizer.eos_token_id: 100},
                 )
+                # vLLM may strip EOS from token_ids (skip_special_tokens).
+                # Without it, accumulate_reinforce_gradients skips this step.
+                if not rtok and lps:
+                    rtok = [self.tokenizer.eos_token_id]
                 text = ""
             else:
                 text, ptok, rtok, lps = llm_generate_train(
