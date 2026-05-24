@@ -8,6 +8,7 @@ Exports:
 """
 
 import contextlib
+import inspect
 import io
 import math
 import os
@@ -17,7 +18,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Generator, List, Optional
 
 import numpy as np
 from dotenv import load_dotenv
@@ -64,7 +65,7 @@ def llm_generate_openai(system_prompt: str, user_message: str) -> str:
         instructions=system_prompt,
         input=[{"role": "user", "content": user_message}],
         reasoning={"effort": "none"},
-        max_output_tokens=12,
+        max_output_tokens=60,
     )
     return response.output[0].content[0].text.strip()
 
@@ -91,12 +92,37 @@ def llm_generate_groq(system_prompt: str, user_message: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
-        "max_tokens": 12,
+        "max_tokens": 60,
         "temperature": 0.0,
     }
     request_params.update(config["params"])
     response = client.chat.completions.create(**request_params)
     return response.choices[0].message.content.strip()
+
+
+def llm_stream_groq(system_prompt: str, user_message: str) -> Generator[str, None, None]:
+    """Streaming Groq call — yields token strings one at a time."""
+    global _next_model_index, _last_used_model
+    client = _get_groq_client()
+    config = GROQ_MODEL_CONFIGS[_next_model_index]
+    model = config["model"]
+    _last_used_model = model
+    _next_model_index = (_next_model_index + 1) % len(GROQ_MODEL_CONFIGS)
+    request_params: dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "max_tokens": 60,
+        "temperature": 0.0,
+        "stream": True,
+    }
+    request_params.update(config["params"])
+    for chunk in client.chat.completions.create(**request_params):
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
 
 
 # call local vllm. Not with caht but with completion
@@ -107,7 +133,7 @@ def local_llm_generate(system_prompt: str, user_message: str) -> str:
     payload = {
         "model": "fd",
         "prompt": user_message,
-        "max_tokens": 12,
+        "max_tokens": 60,
         "temperature": 0.0,
         # logprobs
         "logprobs": 5
@@ -131,6 +157,11 @@ ASR_SAMPLE_RATE   = 16000    # Parakeet expects 16 kHz; incoming mic is resample
 MAX_MIC_BLOCKS    = 8       # rolling mic audio window (last N agent blocks)
 MAX_AUDIO_QUEUE_S = MAX_MIC_BLOCKS * DEFAULT_BLOCK_S   # ≈ 20s safety cap
 MAX_HISTORY_S     = 600.0    # prune blocks older than 10 minutes
+
+# LLM response trimming: find first sentence-end at or after this char position.
+# ~160 chars ≈ 40 tokens for English text (60-token max ÷ 1.5 chars/token avg).
+_SENT_END_RE            = re.compile(r'[.!?]')
+_LLM_TRIM_SEARCH_START  = 160
 
 # ---------------------------------------------------------------------------
 # Templates
@@ -336,7 +367,7 @@ class DuplexAudioAgent:
         default_block_s: float = DEFAULT_BLOCK_S,
         tts_model: str = TTS_MODEL,
         device: Optional[str] = None,
-        llm_generate_fn: Callable[[str, str], str] = llm_generate_groq,
+        llm_generate_fn: Callable = llm_stream_groq,
         max_prompt_blocks: int = 20,
         # Injected for testing (None → use real implementations)
         tts_fn: Optional[Callable[[str], tuple]] = None,
@@ -368,6 +399,12 @@ class DuplexAudioAgent:
         self._last_ctx_flush_user_fingerprint: str = ""
         self.last_llm_error: Optional[str] = None
         self.last_llm_error_seq: int = 0
+
+        # Streaming LLM state — stream thread writes to _stream_word_queue;
+        # poll() drains it under DuplexSession.lock so _pending_words is single-threaded.
+        self._stream_word_queue: queue.Queue = queue.Queue()
+        self._stream_pending_accumulator: List[str] = []
+        self._stream_generation_context_version: Optional[int] = None
 
         # Block timing
         self._next_block_ts: float = 0.0
@@ -944,6 +981,179 @@ class DuplexAudioAgent:
         return system_prompt, user_message
 
     # ------------------------------------------------------------------
+    # Generation window
+    # ------------------------------------------------------------------
+
+    def _within_generation_window(self) -> bool:
+        """True if the model is allowed to generate in the current block.
+
+        Allowed windows:
+          0 – user is currently speaking (current block has user_text)
+          1 – one block after user stopped (previous block had user_text)
+          2 – two blocks after user stopped, but ONLY if the bot has not
+              yet spoken in block[-1] (i.e. bot hasn't started responding)
+        """
+        current_user = self._current_block.user_text if self._current_block else ""
+        if current_user:
+            return True
+
+        if not self.blocks:
+            return False
+
+        last = self.blocks[-1]
+        if last.user_text:
+            return True  # one block after user stopped
+
+        if len(self.blocks) >= 2 and self.blocks[-2].user_text:
+            # Two blocks after user stopped — only if bot hasn't spoken in block[-1]
+            return not bool(last.assistant_text)
+
+        return False
+
+    # ------------------------------------------------------------------
+    # LLM helpers
+    # ------------------------------------------------------------------
+
+    def _clean_llm_buffer(self, text: str, partial: bool) -> str:
+        """Apply the standard LLM output cleaning pipeline.
+
+        When partial=True, strips incomplete (unclosed) <think> blocks so that
+        mid-stream content inside an open tag is not surfaced as speech.
+        """
+        cleaned = self._normalize(text).strip()
+        cleaned = re.sub(r"<think>.*?</think>", " ", cleaned, flags=re.DOTALL)
+        if partial:
+            cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
+        for _tok in ("</s>", "<AI>", "<user>", "<s>", "<idle>"):
+            cleaned = cleaned.replace(_tok, " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _drain_stream_word_queue(self) -> None:
+        """Drain words queued by the background streaming LLM thread.
+
+        Called from poll() which holds DuplexSession.lock, so _pending_words
+        and _committed_words access remains single-threaded.
+        """
+        while True:
+            try:
+                item = self._stream_word_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                # Stream complete — reset accumulator for next stream
+                self._stream_pending_accumulator = []
+            elif isinstance(item, dict):
+                # Timing/context metadata from the background thread
+                self._pending_llm_latency_s = item.get("llm_latency_s")
+                self._pending_response_source_block_id = item.get("source_block_id")
+                source_block = self._get_block_by_id(item.get("source_block_id"))
+                self._pending_response_asr_latency_s = (
+                    source_block.asr_latency_s if source_block is not None else None
+                )
+                self._last_accepted_response_context_version = item.get("context_version")
+            else:
+                # Word batch from the stream
+                batch: List[str] = item
+                self._stream_pending_accumulator.extend(batch)
+                self._update_pending_queue(self._stream_pending_accumulator)
+
+    def _run_llm_background(
+        self,
+        system_prompt: str,
+        user_message: str,
+        gen_ctx_ver: int,
+        gen_src_id: Optional[str],
+        llm_t0: float,
+    ) -> None:
+        """Background thread: stream tokens from LLM, batch into word groups, enqueue."""
+        BATCH_SIZE = 5
+        raw_buffer = ""
+        flushed_count = 0
+        meta_sent = False
+        trim_applied = False
+
+        try:
+            for token in self._llm_generate_fn(system_prompt, user_message):
+                if self.context_version != gen_ctx_ver:
+                    break  # stale — discard remaining stream
+
+                if not token:
+                    continue
+
+                if not meta_sent:
+                    # Send metadata with TTFT on first token arrival
+                    ttft = time.perf_counter() - llm_t0
+                    self._stream_word_queue.put({
+                        "llm_latency_s": ttft,
+                        "source_block_id": gen_src_id,
+                        "context_version": gen_ctx_ver,
+                    })
+                    meta_sent = True
+
+                raw_buffer += token
+                cleaned = self._clean_llm_buffer(raw_buffer, partial=not trim_applied)
+
+                if not trim_applied and len(cleaned) >= _LLM_TRIM_SEARCH_START:
+                    m = _SENT_END_RE.search(cleaned, _LLM_TRIM_SEARCH_START)
+                    if m:
+                        cleaned = cleaned[: m.end()].strip()
+                        trim_applied = True
+
+                words = cleaned.split()
+                # If raw_buffer doesn't end with whitespace, last word may be incomplete
+                flushable = words if (trim_applied or (raw_buffer and raw_buffer[-1].isspace())) else words[:-1]
+
+                new_words = flushable[flushed_count:]
+                while len(new_words) >= BATCH_SIZE:
+                    self._stream_word_queue.put(new_words[:BATCH_SIZE])
+                    flushed_count += BATCH_SIZE
+                    new_words = new_words[BATCH_SIZE:]
+
+                if trim_applied:
+                    if new_words:
+                        self._stream_word_queue.put(new_words)
+                        flushed_count += len(new_words)
+                    break
+
+            # Final flush — only if stream was not cancelled due to staleness
+            if self.context_version == gen_ctx_ver:
+                cleaned = self._clean_llm_buffer(raw_buffer, partial=False)
+                if not trim_applied and cleaned:
+                    m = _SENT_END_RE.search(cleaned, _LLM_TRIM_SEARCH_START)
+                    if m:
+                        cleaned = cleaned[: m.end()].strip()
+                final_words = cleaned.split()
+                remaining = final_words[flushed_count:]
+                if remaining:
+                    self._stream_word_queue.put(remaining)
+
+                if not meta_sent:
+                    # Zero-token response — still send metadata so context_version is set
+                    self._stream_word_queue.put({
+                        "llm_latency_s": time.perf_counter() - llm_t0,
+                        "source_block_id": gen_src_id,
+                        "context_version": gen_ctx_ver,
+                    })
+
+                model_tag = _last_used_model.split("/")[-1] if _last_used_model else "?"
+                total_words = len(cleaned.split())
+                total_s = time.perf_counter() - llm_t0
+                self._vlog(
+                    f"└─ LLM ← [{model_tag}] stream  {cleaned!r}"
+                    f"  ({total_words} words, {total_s:.2f}s)"
+                )
+
+        except Exception as exc:
+            self.last_llm_error = f"{type(exc).__name__}: {exc}"
+            self.last_llm_error_seq += 1
+            print(f"[llm stream×] {self.last_llm_error}")
+
+        finally:
+            self._stream_word_queue.put(None)  # always signal completion
+            self._llm_in_flight = False
+
+    # ------------------------------------------------------------------
     # LLM
     # ------------------------------------------------------------------
 
@@ -957,32 +1167,34 @@ class DuplexAudioAgent:
             self._current_block is None or not self._current_block.user_text
         ):
             return
+        if not self._within_generation_window():
+            return
 
-        self._llm_in_flight = True
         generation_context_version = self.context_version
         generation_source_block_id = self._latest_user_source_block_id
+        system_prompt, user_message = self._build_prompt()
+        self._log_llm_request(generation_context_version, user_message)
+        llm_t0 = time.perf_counter()
+
+        if inspect.isgeneratorfunction(self._llm_generate_fn):
+            # Streaming path — background thread manages _llm_in_flight and queue.
+            self._llm_in_flight = True
+            self._stream_pending_accumulator = []
+            self._stream_generation_context_version = generation_context_version
+            try:
+                self._executor.submit(
+                    self._run_llm_background,
+                    system_prompt, user_message,
+                    generation_context_version, generation_source_block_id, llm_t0,
+                )
+            except Exception:
+                self._llm_in_flight = False
+                raise
+            return  # background thread owns the rest
+
+        # Synchronous path (string-returning functions — used by all existing tests)
+        self._llm_in_flight = True
         try:
-            system_prompt, user_message = self._build_prompt()
-            _log_blocks = self.blocks[-self._max_prompt_blocks:]
-            _W = 55
-            header = f"┌─ LLM REQUEST  ctx={generation_context_version} {'─' * max(0, _W - 20 - len(str(generation_context_version)))}"
-            lines = [header]
-            for i, blk in enumerate(_log_blocks):
-                idx_label = f"B[{i - len(_log_blocks)}]"
-                u = (blk.user_text[:35] + "…") if len(blk.user_text or "") > 35 else (blk.user_text or "-")
-                visible_ai = self._assistant_text_for_prompt(blk)
-                if blk.assistant_text and blk.assistant_text_stale:
-                    ai_part = f'ai="-"  stale={blk.assistant_text[:30]!r}'
-                elif visible_ai:
-                    ai_part = f"ai={visible_ai[:35]!r}"
-                else:
-                    ai_part = 'ai="-"'
-                lines.append(f"│  {idx_label}  u={u!r:<38}  {ai_part}")
-            lines.append(f"│  ({len(self.blocks)} total blocks, showing last {len(_log_blocks)})")
-            tail = user_message[-60:].replace("\n", "↵")
-            lines.append(f"│  tail → …{tail}")
-            self._vlog("\n".join(lines))
-            llm_t0 = time.perf_counter()
             raw_response = self._llm_generate_fn(system_prompt, user_message)
             llm_latency = time.perf_counter() - llm_t0
             raw = raw_response.strip() if isinstance(raw_response, str) else str(raw_response or "").strip()
@@ -992,20 +1204,15 @@ class DuplexAudioAgent:
                 self._vlog(f"└─ LLM ← STALE (ctx {generation_context_version} → {self.context_version})  discarded {raw!r}")
                 return
 
-            cleaned = self._normalize(raw).strip()
-            cleaned = re.sub(r"<think>.*?</think>", " ", cleaned, flags=re.DOTALL)
-            for _tok in ("</s>", "<AI>", "<user>", "<s>", "<idle>"):
-                cleaned = cleaned.replace(_tok, " ")
-            cleaned = cleaned.strip()
+            cleaned = self._clean_llm_buffer(raw, partial=False)
+            if cleaned:
+                m = _SENT_END_RE.search(cleaned, _LLM_TRIM_SEARCH_START)
+                if m:
+                    cleaned = cleaned[: m.end()].strip()
+
             model_tag = _last_used_model.split("/")[-1] if _last_used_model else "?"
             self._vlog(f"└─ LLM ← [{model_tag}]  {cleaned!r}  ({len(cleaned.split())} words, {llm_latency:.2f}s)")
             self.last_llm_error = None
-
-            if not cleaned:
-                self._clear_pending_response_timing()
-                self._pending_words = []
-                self._last_accepted_response_context_version = generation_context_version
-                return
 
             proposal_words = cleaned.split()
             if not proposal_words:
@@ -1030,6 +1237,27 @@ class DuplexAudioAgent:
             print(f"[llm×] {self.last_llm_error}")
         finally:
             self._llm_in_flight = False
+
+    def _log_llm_request(self, ctx_ver: int, user_message: str) -> None:
+        _log_blocks = self.blocks[-self._max_prompt_blocks:]
+        _W = 55
+        header = f"┌─ LLM REQUEST  ctx={ctx_ver} {'─' * max(0, _W - 20 - len(str(ctx_ver)))}"
+        lines = [header]
+        for i, blk in enumerate(_log_blocks):
+            idx_label = f"B[{i - len(_log_blocks)}]"
+            u = (blk.user_text[:35] + "…") if len(blk.user_text or "") > 35 else (blk.user_text or "-")
+            visible_ai = self._assistant_text_for_prompt(blk)
+            if blk.assistant_text and blk.assistant_text_stale:
+                ai_part = f'ai="-"  stale={blk.assistant_text[:30]!r}'
+            elif visible_ai:
+                ai_part = f"ai={visible_ai[:35]!r}"
+            else:
+                ai_part = 'ai="-"'
+            lines.append(f"│  {idx_label}  u={u!r:<38}  {ai_part}")
+        lines.append(f"│  ({len(self.blocks)} total blocks, showing last {len(_log_blocks)})")
+        tail = user_message[-60:].replace("\n", "↵")
+        lines.append(f"│  tail → …{tail}")
+        self._vlog("\n".join(lines))
 
     # ------------------------------------------------------------------
     # Audio queue
@@ -1084,6 +1312,7 @@ class DuplexAudioAgent:
         audio is ready to play, or None if nothing new is available yet.
         """
         now = self._now()
+        self._drain_stream_word_queue()
         if now < self._next_block_ts:
             chunk = self._drain_audio_queue()
             if chunk is not None:

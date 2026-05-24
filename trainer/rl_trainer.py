@@ -64,7 +64,7 @@ from .rewards import RewardFn, _user_finished_in
 # OpenAI Realtime API uses 24 kHz PCM16 for both input and output audio.
 _GPT_SAMPLE_RATE = 24_000
 
-_PUNCT_RE = re.compile(r'[.!?,;:]')
+_SENT_END_RE = re.compile(r'[.!?]')
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +129,8 @@ class TrainerConfig:
     model_name_or_path: str
     """HuggingFace model id or local path (e.g., "Qwen/Qwen2.5-1.5B-Instruct")."""
 
-    vllm_max_tokens: int = 48
-    """Max new tokens per LLM generation. Generation is always trimmed to the last .?! boundary."""
+    vllm_max_tokens: int = 60
+    """Max new tokens per LLM generation. Trimmed at the first .?! after the 40th token."""
 
     vllm_temperature: float = 1.0
     """Sampling temperature. Must be > 0 for REINFORCE exploration."""
@@ -204,6 +204,8 @@ class TrainerConfig:
     max_blocks_after_user_speech: int = 2
     """Hard cap on consecutive LLM calls when the user is silent.
     0 = speak only while user is talking, 1 = one extra block, 2 = two extra blocks (default).
+    At window==2, generation is further gated: only allowed when block[-1] has no bot speech
+    (i.e. the bot has not yet started responding in the previous block).
     LLM calls beyond this window are forced idle without vLLM invocation."""
 
 
@@ -316,7 +318,7 @@ class VirtualSimulationConnection:
         simulator: Any,  # PlaybackSimulator | GPTVoiceSimulator
         vllm_engine: Any,
         tokenizer: Any,
-        vllm_max_tokens: int = 48,
+        vllm_max_tokens: int = 60,
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
@@ -368,20 +370,56 @@ class VirtualSimulationConnection:
                 ))
                 return ""
 
-            text, ptok, rtok, lps = llm_generate_train(
-                system_prompt,
-                user_message,
-                self.vllm_engine,
-                self.tokenizer,
-                max_tokens=self.vllm_max_tokens,
-                temperature=self.vllm_temperature,
-            )
+            # Window 2 (2 blocks after user stopped) is only valid if the bot
+            # has not yet spoken in block[-1]. If it already has, force idle.
+            if (blocks_since_user_spoke[0] == 2
+                    and agent.blocks
+                    and agent.blocks[-1].assistant_text):
+                steps.append(StepRecord(
+                    step_id=str(uuid.uuid4())[:8],
+                    prompt_text=system_prompt + "\n\n" + user_message,
+                    full_prompt_tokens=[],
+                    response_token_ids=[],
+                    log_probs=[],
+                    is_idle=True,
+                    source_block_id=agent._latest_user_source_block_id,
+                    user_spoke_before=user_spoke,
+                ))
+                return ""
 
-            # Always trim at the last sentence-ending punctuation.
-            if text:
-                matches = list(_PUNCT_RE.finditer(text))
-                if matches:
-                    text = text[:matches[-1].end()]
+            # Epsilon-greedy: 10% chance to force idle when user is mid-sentence.
+            # Generate max_tokens=1 to capture a real log_prob for the REINFORCE gradient
+            # so the positive RM5 reward can propagate correctly via backprop.
+            _last_blk = agent.blocks[-1] if agent.blocks else None
+            _force_idle = (
+                _last_blk is not None
+                and _last_blk.user_text
+                and not _user_finished_in(_last_blk)
+                and np.random.random() < 0.10
+            )
+            if _force_idle:
+                _, ptok, rtok, lps = llm_generate_train(
+                    system_prompt, user_message,
+                    self.vllm_engine, self.tokenizer,
+                    max_tokens=1, temperature=self.vllm_temperature,
+                )
+                text = ""
+            else:
+                text, ptok, rtok, lps = llm_generate_train(
+                    system_prompt,
+                    user_message,
+                    self.vllm_engine,
+                    self.tokenizer,
+                    max_tokens=self.vllm_max_tokens,
+                    temperature=self.vllm_temperature,
+                )
+
+            # Trim at first .?! after the 40th token; fall back to full text if none.
+            if text and len(rtok) > 40:
+                prefix = self.tokenizer.decode(rtok[:40], skip_special_tokens=True)
+                m = _SENT_END_RE.search(text, len(prefix))
+                if m:
+                    text = text[:m.end()]
                     trunc_ids = self.tokenizer.encode(text, add_special_tokens=False)
                     rtok = trunc_ids
                     lps = lps[:len(trunc_ids)]
@@ -500,7 +538,7 @@ class RealTimeGPTEpisodeRunner:
         simulator: GPTVoiceSimulator,
         vllm_engine: Any,
         tokenizer: Any,
-        vllm_max_tokens: int = 48,
+        vllm_max_tokens: int = 60,
         vllm_temperature: float = 1.0,
         tts_model: str = "",
         device: Optional[str] = None,
@@ -547,20 +585,56 @@ class RealTimeGPTEpisodeRunner:
                 ))
                 return ""
 
-            text, ptok, rtok, lps = llm_generate_train(
-                system_prompt,
-                user_message,
-                self.vllm_engine,
-                self.tokenizer,
-                max_tokens=self.vllm_max_tokens,
-                temperature=self.vllm_temperature,
-            )
+            # Window 2 (2 blocks after user stopped) is only valid if the bot
+            # has not yet spoken in block[-1]. If it already has, force idle.
+            if (blocks_since_user_spoke[0] == 2
+                    and agent.blocks
+                    and agent.blocks[-1].assistant_text):
+                steps.append(StepRecord(
+                    step_id=str(uuid.uuid4())[:8],
+                    prompt_text=system_prompt + "\n\n" + user_message,
+                    full_prompt_tokens=[],
+                    response_token_ids=[],
+                    log_probs=[],
+                    is_idle=True,
+                    source_block_id=agent._latest_user_source_block_id,
+                    user_spoke_before=user_spoke,
+                ))
+                return ""
 
-            # Always trim at the last sentence-ending punctuation.
-            if text:
-                matches = list(_PUNCT_RE.finditer(text))
-                if matches:
-                    text = text[:matches[-1].end()]
+            # Epsilon-greedy: 10% chance to force idle when user is mid-sentence.
+            # Generate max_tokens=1 to capture a real log_prob for the REINFORCE gradient
+            # so the positive RM5 reward can propagate correctly via backprop.
+            _last_blk = agent.blocks[-1] if agent.blocks else None
+            _force_idle = (
+                _last_blk is not None
+                and _last_blk.user_text
+                and not _user_finished_in(_last_blk)
+                and np.random.random() < 0.10
+            )
+            if _force_idle:
+                _, ptok, rtok, lps = llm_generate_train(
+                    system_prompt, user_message,
+                    self.vllm_engine, self.tokenizer,
+                    max_tokens=1, temperature=self.vllm_temperature,
+                )
+                text = ""
+            else:
+                text, ptok, rtok, lps = llm_generate_train(
+                    system_prompt,
+                    user_message,
+                    self.vllm_engine,
+                    self.tokenizer,
+                    max_tokens=self.vllm_max_tokens,
+                    temperature=self.vllm_temperature,
+                )
+
+            # Trim at first .?! after the 40th token; fall back to full text if none.
+            if text and len(rtok) > 40:
+                prefix = self.tokenizer.decode(rtok[:40], skip_special_tokens=True)
+                m = _SENT_END_RE.search(text, len(prefix))
+                if m:
+                    text = text[:m.end()]
                     trunc_ids = self.tokenizer.encode(text, add_special_tokens=False)
                     rtok = trunc_ids
                     lps = lps[:len(trunc_ids)]
@@ -1172,30 +1246,49 @@ class FullDuplexRLTrainer:
             if len(hist) < 2:
                 return 0.0, {}
             rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
+            reward = 0.0
+            breakdown: Dict[str, float] = {}
+            last_finished = _user_finished_in(hist[-1])
             # lag=1: user just finished, first missed window → -1.0
-            if _user_finished_in(hist[-1]):
+            if last_finished:
                 penalty = rm1_w * (-1.0)
-                return penalty, {"respond_after_user_reward": penalty}
+                reward += penalty
+                breakdown["respond_after_user_reward"] = penalty
             # lag=2: user finished two blocks ago, still idle → -1.3
-            if len(hist) >= 3 and _user_finished_in(hist[-2]):
+            elif len(hist) >= 3 and _user_finished_in(hist[-2]):
                 penalty = rm1_w * (-1.3)
-                return penalty, {"respond_after_user_reward": penalty}
-            return 0.0, {}
+                reward += penalty
+                breakdown["respond_after_user_reward"] = penalty
+            # RM5: reward idle while user is actively mid-sentence
+            if hist[-1].user_text and not last_finished:
+                rm5_w = self.rm_weights[4] if len(self.rm_weights) > 4 else 1.0
+                bonus = rm5_w * 0.5
+                reward += bonus
+                breakdown["correct_idle_reward"] = bonus
+            return reward, breakdown
 
         if self.config.debug:
             for i, step in enumerate(episode.steps):
                 is_terminal = (i == n_steps - 1)
                 if step.is_idle:
                     reward, breakdown = _idle_rm1_reward(step)
-                    if reward:
+                    if reward or breakdown:
                         print(f"\n{'═'*70}")
                         print(f"  Step {self._step_count:04d}  |  ep={ep_idx}  step_idx={i}"
                               f"  {'TERMINAL' if is_terminal else ''}")
-                        print("  Action : <idle>  [RM1 direct]")
-                        _w = self.rm_weights[0] if self.rm_weights else 1.0
-                        raw = reward / _w if _w else reward
-                        print(f"  RM1  respond_after_user_reward  raw={raw:+.4f}  "
-                              f"w={_w:.2f}  → {reward:+.4f}  ▼")
+                        print("  Action : <idle>  [direct RM]")
+                        if "respond_after_user_reward" in breakdown:
+                            rm1_val = breakdown["respond_after_user_reward"]
+                            _w = self.rm_weights[0] if self.rm_weights else 1.0
+                            raw = rm1_val / _w if _w else rm1_val
+                            print(f"  RM1  respond_after_user_reward  raw={raw:+.4f}  "
+                                  f"w={_w:.2f}  → {rm1_val:+.4f}  ▼")
+                        if "correct_idle_reward" in breakdown:
+                            rm5_val = breakdown["correct_idle_reward"]
+                            _w5 = self.rm_weights[4] if len(self.rm_weights) > 4 else 1.0
+                            raw5 = rm5_val / _w5 if _w5 else rm5_val
+                            print(f"  RM5  correct_idle_reward         raw={raw5:+.4f}  "
+                                  f"w={_w5:.2f}  → {rm5_val:+.4f}  ▲")
                         print(f"  STEP REWARD : {reward:+.4f}")
                     step.reward = reward
                     step.reward_breakdown = breakdown

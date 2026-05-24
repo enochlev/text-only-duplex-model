@@ -50,7 +50,7 @@ def main() -> None:
     parser.add_argument("--kl-ref-clip", type=float, default=5.0,
                         help="Per-token KL clip value before averaging")
     parser.add_argument(
-        "--max-tokens", type=int, default=48,
+        "--max-tokens", type=int, default=60,
         help="Max new tokens per LLM generation call",
     )
     parser.add_argument(
@@ -127,7 +127,7 @@ def main() -> None:
         backchannel_loop_penalty,     # penalise consecutive backchannel loops
         correct_idle_reward,          # reward staying silent while user is mid-sentence
     ]
-    reward_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+    reward_weights = [1.0, 1.5, 1.0, 1.0, 1.0]
 
     config.reward_fn_weights = reward_weights
 

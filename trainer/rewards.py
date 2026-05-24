@@ -189,6 +189,25 @@ def _normalize_bot_text(text: str) -> str:
     return text.lower().strip().rstrip(".,!?").strip()
 
 
+def _is_backchannel(norm: str) -> bool:
+    """True if norm is a backchannel — exact match or prefix match.
+
+    Also strips a single leading backchannel word (e.g. "sure what kind of X"
+    after comma-removal) before testing prefixes, so the model can't escape
+    detection by prepending a filler like "sure," or "right,".
+    """
+    if norm in _BACKCHANNELS:
+        return True
+    if any(norm.startswith(p) for p in _BACKCHANNEL_PREFIXES):
+        return True
+    # strip one leading single-word backchannel and re-check prefixes
+    first, _, rest = norm.partition(" ")
+    if first in _BACKCHANNELS and rest:
+        if any(rest.startswith(p) for p in _BACKCHANNEL_PREFIXES):
+            return True
+    return False
+
+
 def backchannel_loop_penalty(
     block: DuplexAudioBlock,
     history: List[DuplexAudioBlock],
@@ -204,15 +223,14 @@ def backchannel_loop_penalty(
         return 0.0
 
     norm = _normalize_bot_text(block.assistant_text)
-    if norm not in _BACKCHANNELS and not any(norm.startswith(p) for p in _BACKCHANNEL_PREFIXES):
+    if not _is_backchannel(norm):
         return 0.0
 
     run = 1
     for b in reversed(history):
         if not b.assistant_text:
             break
-        n = _normalize_bot_text(b.assistant_text)
-        if n in _BACKCHANNELS or any(n.startswith(p) for p in _BACKCHANNEL_PREFIXES):
+        if _is_backchannel(_normalize_bot_text(b.assistant_text)):
             run += 1
         else:
             break

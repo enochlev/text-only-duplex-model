@@ -1021,3 +1021,193 @@ def test_asr_window_old_not_mutable():
     # win-0 is now outside mutable range → should be rejected
     accepted = agent.ingest_parakeet_window(0.0, 1.0, [("patched", 0.5)], "win-0")
     assert accepted is False
+
+
+# ---------------------------------------------------------------------------
+# Streaming LLM path
+# ---------------------------------------------------------------------------
+
+def make_streaming_llm(tokens: list, delay_s: float = 0.0):
+    """Generator LLM that yields tokens one at a time."""
+    def gen(system_prompt, user_message):
+        for tok in tokens:
+            if delay_s:
+                time.sleep(delay_s)
+            yield tok
+    return gen
+
+
+def _wait_for_stream(agent: DuplexAudioAgent, timeout: float = 2.0) -> None:
+    """Poll until _llm_in_flight clears (stream thread finished)."""
+    deadline = time.time() + timeout
+    while agent._llm_in_flight and time.time() < deadline:
+        time.sleep(0.01)
+    assert not agent._llm_in_flight, "stream thread did not finish in time"
+
+
+def test_streaming_llm_detected_as_generator():
+    """inspect.isgeneratorfunction correctly identifies a streaming LLM."""
+    import inspect
+    from full_duplex import llm_stream_groq
+    assert inspect.isgeneratorfunction(llm_stream_groq)
+    assert not inspect.isgeneratorfunction(lambda *_: "hello")
+
+
+def test_stream_words_drain_into_pending_on_poll():
+    """Words put into _stream_word_queue are moved to _pending_words by poll()."""
+    agent = make_agent()
+    agent.receive_text_message("hi")
+    # Simulate background thread: plant metadata + words + sentinel
+    agent._stream_word_queue.put({
+        "llm_latency_s": 0.1,
+        "source_block_id": None,
+        "context_version": agent.context_version,
+    })
+    agent._stream_word_queue.put(["hello", "world"])
+    agent._stream_word_queue.put(None)
+
+    agent._drain_stream_word_queue()
+
+    # Words should now be in _pending_words (not yet committed)
+    assert "hello" in agent._pending_words or "hello" in agent._committed_words
+
+
+def test_stream_metadata_sets_last_accepted_context_version():
+    """Metadata dict from queue sets _last_accepted_response_context_version."""
+    agent = make_agent()
+    agent.receive_text_message("hi")
+    ctx = agent.context_version
+
+    agent._stream_word_queue.put({
+        "llm_latency_s": 0.2,
+        "source_block_id": None,
+        "context_version": ctx,
+    })
+    agent._stream_word_queue.put(None)
+    agent._drain_stream_word_queue()
+
+    assert agent._last_accepted_response_context_version == ctx
+
+
+def test_llm_in_flight_clears_after_stream_done():
+    """_llm_in_flight is False once the streaming thread finishes."""
+    tokens = ["Hi", " ", "there", "."]
+    agent = make_agent(llm_fn=make_streaming_llm(tokens))
+    agent.receive_text_message("hello")
+    force_block(agent)  # kicks off stream
+
+    _wait_for_stream(agent)
+    assert agent._llm_in_flight is False
+
+
+def test_no_concurrent_streams():
+    """A second _maybe_run_llm call while a stream is in-flight is a no-op."""
+    started = {"count": 0}
+    orig_submit = None
+
+    tokens = ["Hello", " ", "world"]
+    agent = make_agent(llm_fn=make_streaming_llm(tokens, delay_s=0.05))
+    orig_submit = agent._executor.submit
+
+    def counting_submit(fn, *args, **kwargs):
+        started["count"] += 1
+        return orig_submit(fn, *args, **kwargs)
+
+    agent._executor.submit = counting_submit
+    agent.receive_text_message("hi")
+
+    force_block(agent)           # first call — starts stream
+    assert agent._llm_in_flight is True
+    agent._maybe_run_llm()       # second call — should be no-op (in_flight)
+
+    assert started["count"] == 1
+    _wait_for_stream(agent)
+
+
+def test_stream_cancelled_on_context_version_change():
+    """Words queued from a stale stream are not committed after context changes."""
+    barrier = threading.Event()
+    checkpoint = {"reached": False}
+
+    def slow_gen(sys, usr):
+        yield "good "
+        yield "word "
+        checkpoint["reached"] = True
+        barrier.wait(timeout=3.0)
+        yield "stale_word"
+
+    agent = make_agent(llm_fn=slow_gen)
+    agent.receive_text_message("first")
+    force_block(agent)
+
+    # Wait until stream has produced its first two tokens
+    deadline = time.time() + 2.0
+    while not checkpoint["reached"] and time.time() < deadline:
+        time.sleep(0.01)
+
+    # Bump context_version to simulate new user input
+    agent.context_version += 1
+    barrier.set()  # unblock the stream thread
+    _wait_for_stream(agent)
+
+    # Drain whatever the stale stream put in the queue
+    agent._drain_stream_word_queue()
+
+    all_text = " ".join(
+        b.assistant_text for b in agent.blocks if b.assistant_text
+    )
+    assert "stale_word" not in all_text
+
+
+def test_stream_accumulator_grows_incrementally():
+    """Each word batch extends _stream_pending_accumulator before calling update."""
+    agent = make_agent()
+    agent.receive_text_message("hi")
+
+    agent._stream_word_queue.put({
+        "llm_latency_s": 0.1,
+        "source_block_id": None,
+        "context_version": agent.context_version,
+    })
+    agent._stream_word_queue.put(["alpha", "beta"])
+    agent._stream_word_queue.put(["gamma"])
+    agent._stream_word_queue.put(None)
+
+    agent._drain_stream_word_queue()
+
+    combined = agent._committed_words + agent._pending_words
+    assert "alpha" in combined
+    assert "beta" in combined
+    assert "gamma" in combined
+
+
+def test_stream_accumulator_reset_after_sentinel():
+    """_stream_pending_accumulator is cleared when None sentinel is drained."""
+    agent = make_agent()
+    agent._stream_pending_accumulator = ["leftover"]
+    agent._stream_word_queue.put(None)
+    agent._drain_stream_word_queue()
+    assert agent._stream_pending_accumulator == []
+
+
+def test_trim_at_first_sentence_end_after_160_chars():
+    """Responses longer than 160 chars are cut at the first .?! after that mark."""
+    # Build a response where the first .?! after 160 chars is mid-sentence
+    long_response = (
+        "This is a long response that goes on for quite a while and "   # 58
+        "does not end early at all it just keeps going and going on. "  # 60 → dot at ~118
+        "And then it continues with more stuff that should be dropped."  # beyond 160
+    )
+    # len(part1 + part2) > 160 → first . after position 160 is in part3
+    assert len(long_response) > 160
+
+    agent = make_agent(llm_fn=lambda *_: long_response)
+    agent.receive_text_message("tell me something long")
+    force_block(agent)
+    advance(agent, 2.1)
+    force_block(agent)
+
+    all_text = " ".join(
+        b.assistant_text for b in agent.blocks if b.assistant_text
+    )
+    assert "should be dropped" not in all_text
