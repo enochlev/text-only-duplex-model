@@ -938,7 +938,7 @@ class FullDuplexRLTrainer:
             print(f"[trainer] loading frozen reference model (GPU): {config.ref_model_name_or_path}")
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 config.ref_model_name_or_path,
-                torch_dtype="auto",
+                dtype="auto",
                 device_map=config.device,
             )
             self.ref_model.eval()
