@@ -467,12 +467,7 @@ class VirtualSimulationConnection:
                     transcript_words = transcript.split()
                     unknown = [w for w in transcript_words if w not in known_words]
                     if unknown:
-                        print(
-                            f"[sim_asr DEBUG] UNKNOWN WORDS in transcript for "
-                            f"t=[{start_ts:.2f}, {end_ts:.2f}]: {unknown!r}  "
-                            f"full transcript={transcript!r}"
-                        )
-                print(f"[sim_asr] t=[{start_ts:.2f}, {end_ts:.2f}]  transcript={transcript!r}")
+                        pass  # timing sanity check — unknown words expected during overlaps
                 for block in reversed(agent.blocks):
                     if abs(block.start_ts - start_ts) < 0.5:
                         if block.user_text != transcript:
