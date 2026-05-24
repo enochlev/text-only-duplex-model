@@ -68,9 +68,13 @@ def main() -> None:
                         help="Directory for debug audio exports (default: ./debug)")
     parser.add_argument(
         "--vllm-device", default=None,
-        help="Pin the vLLM rollout engine to a specific GPU, e.g. 'cuda:3'. "
-             "When set, vLLM and the training model run on separate GPUs. "
+        help="Pin the vLLM rollout engine to a specific GPU, e.g. 'cuda:1'. "
              "Default: same GPU as the training model.",
+    )
+    parser.add_argument(
+        "--ref-model-device", default=None,
+        help="Device for the frozen reference model, e.g. 'cuda:0'. "
+             "Default: same GPU as the training model (not vllm-device).",
     )
     parser.add_argument(
         "--embed-device", default="cpu",
@@ -98,6 +102,7 @@ def main() -> None:
         debug=args.debug,
         debug_dir=args.debug_dir,
         vllm_device=args.vllm_device,
+        ref_model_device=args.ref_model_device,
     )
 
     check_rm_servers()

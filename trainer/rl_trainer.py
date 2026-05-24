@@ -187,6 +187,10 @@ class TrainerConfig:
     maximise its memory budget independently.  Defaults to None (vLLM shares
     the same device as config.device)."""
 
+    ref_model_device: Optional[str] = None
+    """Device for the frozen reference model. Defaults to None (uses config.device,
+    same GPU as the training model). Set to e.g. 'cuda:1' to isolate KL computation."""
+
     ref_model_name_or_path: Optional[str] = "Qwen/Qwen3-4B-Instruct-2507-FP8"
     """HF model id or local path for the frozen reference model.
     When set, enables the KL-against-reference reward (kl_coherence)."""
@@ -935,7 +939,7 @@ class FullDuplexRLTrainer:
 
         self.ref_model: Optional[Any] = None
         if config.ref_model_name_or_path:
-            ref_device = config.vllm_device or config.device
+            ref_device = config.ref_model_device or config.device
             print(f"[trainer] loading frozen reference model ({ref_device}): {config.ref_model_name_or_path}")
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 config.ref_model_name_or_path,
