@@ -1119,9 +1119,10 @@ class FullDuplexRLTrainer:
                     + (f"  src={src_id}" if src_id else "")
                     + f"  last_prompt_tok={last_prompt_tok}"
                 )
-                print()
-                _print_episode_summary(ep)
-                print()
+                if not self.config.debug:
+                    print()
+                    _print_episode_summary(ep)
+                    print()
             except Exception as exc:
                 print(f"[trainer] episode failed: {exc!r}")
         return episodes
@@ -1144,78 +1145,66 @@ class FullDuplexRLTrainer:
             wf.setframerate(sample_rate)
             wf.writeframes(arr.tobytes())
 
-    def _debug_step(
-        self,
-        step_num: int,
-        ep_idx: int,
-        step_idx: int,
-        step: "StepRecord",
-        covered: List[DuplexAudioBlock],
-        history: List[DuplexAudioBlock],
-        is_terminal: bool,
-        fn_names: List[str],
-        *,
-        kl_penalty: float = 0.0,
-        mean_kl: float = 0.0,
-    ) -> Tuple[float, Dict[str, float]]:
-        """Run reward functions with compact debug output. Returns (total, breakdown)."""
-        total = 0.0
-        breakdown: Dict[str, float] = {}
+    def _print_scored_episode_table(self, episode: Episode, ep_idx: int) -> None:
+        """Print a conversation table with RM scores inline after each scored block."""
+        UW, BW = 38, 32
+        rm_names = [fn.__name__ for fn in self.reward_fns]
 
-        # Full decoded step response (untruncated) shown as "pending bot"
-        pending_bot = ""
-        if step.response_token_ids:
-            pending_bot = self.tokenizer.decode(
-                step.response_token_ids, skip_special_tokens=True
-            ).strip()
+        # Map block_id → the step that covers it.
+        # Walk blocks in episode order so the last assignment is the last covered block.
+        blk_to_step: Dict[str, "StepRecord"] = {}
+        for step in episode.steps:
+            for bid in step.blocks_covered:
+                blk_to_step[bid] = step
 
-        for blk_pos, block in enumerate(covered):
-            # Prior covered blocks are included in history for all RMs except
-            # interruption_penalty.  That RM must keep the original history so
-            # that T+2's overlap isn't penalised just because T+1 (committed at
-            # the same moment) also overlapped with the user.
-            aug_history = history + covered[:blk_pos]
+        # last_blk_of_step[id(step)] = block_id of that step's last covered block
+        last_blk_of_step: Dict[int, str] = {}
+        for blk in episode.blocks:
+            if blk.block_id in blk_to_step:
+                last_blk_of_step[id(blk_to_step[blk.block_id])] = blk.block_id
 
-            bot_toks = len(
-                self.tokenizer.encode(block.assistant_text or "", add_special_tokens=False)
-            )
-            print(f"\n  ┌─ Block {block.block_id[:8]}  [bot_toks={bot_toks}]")
-            ctx = history[-3:] if len(history) >= 3 else history
-            if ctx:
-                for ci, hb in enumerate(ctx):
-                    hu = (hb.user_text or "-")[:32]
-                    ha = (hb.assistant_text or "-")[:28]
-                    print(f"  │  B[{ci - len(ctx)}]  u={hu!r:<35}  ai={ha!r}")
-                print(f"  │  {'─'*60}")
-            print(f"  │  user : {(block.user_text or '<silence>')!r}")
-            print(f"  │  bot  : {(block.assistant_text or '<idle>')!r}")
-            if pending_bot:
-                print(f"  │  pending bot : {pending_bot!r}")
+        ep_prompt_tok = sum(len(s.full_prompt_tokens) for s in episode.steps)
+        ep_resp_tok = sum(len(s.response_token_ids) for s in episode.steps)
+        trainable = sum(1 for s in episode.steps if not s.is_idle and s.response_token_ids)
 
-            blk_total = 0.0
-            rm_vals: List[float] = []
-            for fn, w in zip(self.reward_fns, self.rm_weights):
-                h = history if fn.__name__ == "interruption_penalty" else aug_history
-                score = fn(block, h, is_terminal)
-                weighted = w * score
-                blk_total += weighted
-                breakdown[fn.__name__] = breakdown.get(fn.__name__, 0.0) + weighted
-                rm_vals.append(weighted)
+        print(f"\n  ep={ep_idx}  episode={episode.episode_id}  "
+              f"[steps={len(episode.steps)} blocks={len(episode.blocks)} "
+              f"ended={episode.terminated_reason}]")
+        print(f"  prompt_tok={ep_prompt_tok:,}  response_tok={ep_resp_tok:,}  "
+              f"trainable_steps={trainable}")
+        print(f"\n  {'#':>3}  {'user':<{UW}}  {'bot':<{BW}}")
+        print(f"  {'─'*3}  {'─'*UW}  {'─'*BW}")
 
-            total += blk_total
+        for i, blk in enumerate(episode.blocks, 1):
+            u = blk.user_text or "-"
+            b = blk.assistant_text or "-"
+            if len(u) > UW:
+                u = u[:UW - 1] + "…"
+            if len(b) > BW:
+                b = b[:BW - 1] + "…"
+            print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
+
+            step = blk_to_step.get(blk.block_id)
+            if step is None or step.is_idle:
+                continue
+            if last_blk_of_step.get(id(step)) != blk.block_id:
+                continue  # print RM once, after the last covered block
+
+            rm_vals = [step.reward_breakdown.get(nm, 0.0) for nm in rm_names]
+            rm_sum = sum(rm_vals)
             rm_parts = " | ".join(f"RM{i+1}={v:+.2f}" for i, v in enumerate(rm_vals))
-            print(f"  │  {rm_parts} | BLOCK_RM={blk_total:+.3f}")
-            print(f"  └─")
+            kl = step.reward_breakdown.get("kl_coherence", None)
+            if kl is not None and self.config.kl_ref_coeff:
+                mean_kl = -(kl / self.config.kl_ref_coeff)
+                kl_str = f" | KL={kl:+.3f} (mean_kl={mean_kl:+.3f})"
+            else:
+                kl_str = ""
+            n_blks = len(step.blocks_covered)
+            rm_label = "BLOCK_RM" if n_blks == 1 else f"STEP_RM(blks={n_blks})"
+            print(f"  {rm_parts} | {rm_label}={rm_sum:+.3f}{kl_str}"
+                  f" | TOTAL={step.reward or 0.0:+.3f} (post weighting)")
 
-        # Step-level summary with optional inline KL
-        if kl_penalty != 0.0:
-            kl_str = f" | KL={kl_penalty:+.3f} (mean_kl={mean_kl:+.3f})"
-            final = total + kl_penalty
-            print(f"  STEP: RM={total:+.3f}{kl_str} | TOTAL={final:+.3f} (post weighting)")
-        else:
-            print(f"  STEP: RM={total:+.3f} | TOTAL={total:+.3f} (post weighting)")
-
-        return total, breakdown
+        print(f"  {'─'*3}  {'─'*UW}  {'─'*BW}")
 
     def compute_rewards(self, episode: Episode, ep_idx: int = 0) -> Episode:
         """Fill StepRecord.reward using weighted sum of reward functions.
@@ -1277,49 +1266,33 @@ class FullDuplexRLTrainer:
             return reward, breakdown
 
         if self.config.debug:
+            # Score all steps first (no printing), then render one combined table.
             for i, step in enumerate(episode.steps):
                 is_terminal = (i == n_steps - 1)
                 if step.is_idle:
-                    reward, breakdown = _idle_rm1_reward(step)
-                    if reward or breakdown:
-                        rm1 = breakdown.get("respond_after_user_reward", 0.0)
-                        rm5 = breakdown.get("correct_idle_reward", 0.0)
-                        suffix = " TERMINAL" if is_terminal else ""
-                        print(f"\n  [IDLE step_idx={i}{suffix}]  "
-                              f"RM1={rm1:+.2f} | RM5={rm5:+.2f} | TOTAL={reward:+.3f}")
-                    step.reward = reward
-                    step.reward_breakdown = breakdown
+                    step.reward, step.reward_breakdown = _idle_rm1_reward(step)
                     continue
                 covered_ids = set(step.blocks_covered)
                 covered = [b for b in episode.blocks if b.block_id in covered_ids]
                 history = _prior_history(covered_ids)
-
-                # Pre-compute KL so it appears inline with block rewards
-                kl_penalty, mean_kl = self._compute_kl_penalty(step)
-
-                step.reward, step.reward_breakdown = self._debug_step(
-                    self._step_count, ep_idx, i, step,
-                    covered, history, is_terminal, fn_names,
-                    kl_penalty=kl_penalty, mean_kl=mean_kl,
-                )
+                total = 0.0
+                breakdown: Dict[str, float] = {}
+                for fn, w in zip(self.reward_fns, self.rm_weights):
+                    fn_total = 0.0
+                    for blk_pos, block in enumerate(covered):
+                        h = (history if fn.__name__ == "interruption_penalty"
+                             else history + covered[:blk_pos])
+                        fn_total += w * fn(block, h, is_terminal)
+                    breakdown[fn.__name__] = fn_total
+                    total += fn_total
+                kl_penalty, _ = self._compute_kl_penalty(step)
                 if kl_penalty:
-                    step.reward = (step.reward or 0.0) + kl_penalty
-                    step.reward_breakdown["kl_coherence"] = kl_penalty
+                    total += kl_penalty
+                    breakdown["kl_coherence"] = kl_penalty
+                step.reward = total
+                step.reward_breakdown = breakdown
 
-            # ── Episode token summary ──────────────────────────────────────
-            ep_prompt_total    = sum(len(s.full_prompt_tokens)  for s in episode.steps)
-            ep_response_total  = sum(len(s.response_token_ids)  for s in episode.steps)
-            trainable_steps    = sum(
-                1 for s in episode.steps
-                if not s.is_idle and s.response_token_ids
-            )
-            print(f"\n{'─'*70}")
-            print(f"  Episode token summary  (ep={ep_idx}  steps={n_steps}"
-                  f"  trainable={trainable_steps})")
-            print(f"    prompt   tokens : {ep_prompt_total:>8,}")
-            print(f"    response tokens : {ep_response_total:>8,}")
-            print(f"    total    tokens : {ep_prompt_total + ep_response_total:>8,}")
-            print(f"{'─'*70}")
+            self._print_scored_episode_table(episode, ep_idx)
             return episode
 
         def _score_step(i: int) -> Tuple[float, Dict[str, float]]:
@@ -1744,28 +1717,46 @@ class FullDuplexRLTrainer:
         sampled = list(rng.choice(len(episodes), size=n_sample, replace=False))
         for ep_i in sampled:
             ep = episodes[ep_i]
-            lines += [
+            lines.append(
                 f"  ── Sampled episode {ep.episode_id}  "
-                f"[steps={len(ep.steps)} blocks={len(ep.blocks)} ended={ep.terminated_reason}]",
-                "  Conversation:",
-            ]
-            for bi, blk in enumerate(ep.blocks, 1):
-                u = (blk.user_text or "<silence>")
-                b = (blk.assistant_text or "<idle>")
-                lines.append(f"    [{bi:02d}] U: {u}")
-                lines.append(f"         B: {b}")
-            lines.append("  Scored steps:")
+                f"[steps={len(ep.steps)} blocks={len(ep.blocks)} ended={ep.terminated_reason}]"
+            )
+
+            # Build block → last-covered-step mapping for inline RM
+            blk_to_step: Dict[str, "StepRecord"] = {}
             for st in ep.steps:
-                idle_mark = "IDLE " if st.is_idle else "SPEAK"
-                rm_vals = "  ".join(
+                for bid in st.blocks_covered:
+                    blk_to_step[bid] = st
+            last_blk: Dict[int, str] = {}
+            for blk in ep.blocks:
+                if blk.block_id in blk_to_step:
+                    last_blk[id(blk_to_step[blk.block_id])] = blk.block_id
+
+            UW, BW = 38, 30
+            for bi, blk in enumerate(ep.blocks, 1):
+                u = blk.user_text or "<silence>"
+                b = blk.assistant_text or "<idle>"
+                if len(u) > UW:
+                    u = u[:UW - 1] + "…"
+                if len(b) > BW:
+                    b = b[:BW - 1] + "…"
+                lines.append(f"    [{bi:02d}] U: {u:<{UW}}  B: {b}")
+
+                st = blk_to_step.get(blk.block_id)
+                if st is None or st.is_idle:
+                    continue
+                if last_blk.get(id(st)) != blk.block_id:
+                    continue
+                rm_str = "  ".join(
                     f"RM{i+1}={st.reward_breakdown.get(n, 0.0):+.2f}"
                     for i, n in enumerate(rm_names)
                 )
                 kl_v = st.reward_breakdown.get("kl_coherence", None)
                 kl_part = f"  KL={kl_v:+.3f}" if kl_v is not None else ""
+                n_b = len(st.blocks_covered)
                 lines.append(
-                    f"    [{idle_mark}] blks={len(st.blocks_covered):1d}  "
-                    f"{rm_vals}{kl_part}  TOTAL={st.reward or 0.0:+.3f}"
+                    f"    [RM] blks={n_b}  {rm_str}{kl_part}"
+                    f"  TOTAL={st.reward or 0.0:+.3f}"
                 )
             lines.append("")
 
