@@ -875,6 +875,7 @@ def _create_vllm_engine(
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             dtype=dtype,
+            enforce_eager=True,
         )
     finally:
         if _orig_create is not None:
