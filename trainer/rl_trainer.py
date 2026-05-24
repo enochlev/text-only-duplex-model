@@ -125,6 +125,8 @@ class Episode:
     """Eligible calls where VAD said user finished → epsilon suppressed."""
     eps_greedy_fired: int = 0
     """Calls where epsilon-greedy actually forced idle."""
+    eps_natural_fired: int = 0
+    """Calls where model chose idle on its own (no epsilon forcing)."""
 
 
 
@@ -359,6 +361,7 @@ class VirtualSimulationConnection:
         eps_eligible = [0]
         eps_vad_suppressed = [0]
         eps_fired = [0]
+        eps_natural_fired = [0]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
@@ -427,6 +430,11 @@ class VirtualSimulationConnection:
                 # Without it, accumulate_reinforce_gradients skips this step.
                 if not rtok and lps:
                     rtok = [self.tokenizer.eos_token_id]
+                eos_id = self.tokenizer.eos_token_id
+                if rtok and rtok[0] == eos_id:
+                    print(f"[eps-idle] EOS confirmed in rtok  lp={lps[0]:.3f}")
+                else:
+                    print(f"[eps-idle] WARNING: expected EOS({eos_id}) but got rtok={rtok[:3]}")
                 text = ""
             else:
                 text, ptok, rtok, lps = llm_generate_train(
@@ -437,6 +445,8 @@ class VirtualSimulationConnection:
                     max_tokens=self.vllm_max_tokens,
                     temperature=self.vllm_temperature,
                 )
+                if not text:
+                    eps_natural_fired[0] += 1
 
             # Trim at first .?! after the 40th token; fall back to full text if none.
             if text and len(rtok) > 40:
@@ -537,6 +547,7 @@ class VirtualSimulationConnection:
             eps_greedy_eligible=eps_eligible[0],
             eps_greedy_vad_suppressed=eps_vad_suppressed[0],
             eps_greedy_fired=eps_fired[0],
+            eps_natural_fired=eps_natural_fired[0],
         )
 
 
@@ -587,6 +598,7 @@ class RealTimeGPTEpisodeRunner:
         eps_eligible = [0]
         eps_vad_suppressed = [0]
         eps_fired = [0]
+        eps_natural_fired = [0]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
@@ -654,6 +666,11 @@ class RealTimeGPTEpisodeRunner:
                 # Without it, accumulate_reinforce_gradients skips this step.
                 if not rtok and lps:
                     rtok = [self.tokenizer.eos_token_id]
+                eos_id = self.tokenizer.eos_token_id
+                if rtok and rtok[0] == eos_id:
+                    print(f"[eps-idle] EOS confirmed in rtok  lp={lps[0]:.3f}")
+                else:
+                    print(f"[eps-idle] WARNING: expected EOS({eos_id}) but got rtok={rtok[:3]}")
                 text = ""
             else:
                 text, ptok, rtok, lps = llm_generate_train(
@@ -664,6 +681,8 @@ class RealTimeGPTEpisodeRunner:
                     max_tokens=self.vllm_max_tokens,
                     temperature=self.vllm_temperature,
                 )
+                if not text:
+                    eps_natural_fired[0] += 1
 
             # Trim at first .?! after the 40th token; fall back to full text if none.
             if text and len(rtok) > 40:
@@ -765,6 +784,7 @@ class RealTimeGPTEpisodeRunner:
             eps_greedy_eligible=eps_eligible[0],
             eps_greedy_vad_suppressed=eps_vad_suppressed[0],
             eps_greedy_fired=eps_fired[0],
+            eps_natural_fired=eps_natural_fired[0],
         )
 
 
@@ -1235,11 +1255,12 @@ class FullDuplexRLTrainer:
               f"ended={episode.terminated_reason}]")
         print(f"  prompt_tok={ep_prompt_tok:,}  response_tok={ep_resp_tok:,}  "
               f"trainable_steps={trainable}{trunc_str}")
+        _eps_denom = max(episode.eps_greedy_eligible - episode.eps_greedy_vad_suppressed, 1)
         print(f"  eps: eligible={episode.eps_greedy_eligible}  "
               f"vad_blocked={episode.eps_greedy_vad_suppressed}  "
+              f"natural_fired={episode.eps_natural_fired}  "
               f"fired={episode.eps_greedy_fired}  "
-              f"effective_rate="
-              f"{episode.eps_greedy_fired / max(episode.eps_greedy_eligible - episode.eps_greedy_vad_suppressed, 1):.0%}"
+              f"effective_rate={episode.eps_greedy_fired / _eps_denom:.0%}"
               )
         print(f"\n  {'#':>3}  {'user':<{UW}}  {'bot':<{BW}}")
         print(f"  {'─'*3}  {'─'*UW}  {'─'*BW}")
@@ -1527,6 +1548,18 @@ class FullDuplexRLTrainer:
                 nll_mean = out.loss
                 policy_log_prob = -nll_mean * n_resp  # sum of response log_probs
 
+                eos_id = self.tokenizer.eos_token_id
+                if (step.is_idle and n_resp == 1
+                        and step.response_token_ids[0] == eos_id
+                        and self.config.debug):
+                    print(
+                        f"[backprop-idle] EOS({eos_id}) trained  "
+                        f"log_π(EOS|ctx)={policy_log_prob.item():.3f}  "
+                        f"vllm_lp={step.log_probs[0]:.3f}  "
+                        f"advantage={advantage:.3f}  "
+                        f"reward={step.reward:.3f}"
+                    )
+
                 # KL penalty: KL(π_old || π_θ) ≈ log π_old − log π_θ per sampled token.
                 # Positive when the current policy has moved away from the rollout
                 # distribution, adding to the loss and resisting large weight updates.
@@ -1619,7 +1652,12 @@ class FullDuplexRLTrainer:
             "n_non_idle": float(
                 sum(sum(1 for s in e.steps if not s.is_idle) for e in episodes)
             ),
+            "eps_fired_total": float(sum(e.eps_greedy_fired for e in episodes)),
+            "eps_natural_fired_total": float(sum(e.eps_natural_fired for e in episodes)),
+            "eps_eligible_total": float(sum(e.eps_greedy_eligible for e in episodes)),
         }
+        _eps_elig = max(metrics["eps_eligible_total"], 1)
+        natural_rate = metrics["eps_natural_fired_total"] / _eps_elig
         width = 70
         print(f"\n{'━'*width}")
         print(
@@ -1627,6 +1665,11 @@ class FullDuplexRLTrainer:
             f"loss={metrics['loss']:.4f}  "
             f"baseline={metrics['baseline']:.3f}  "
             f"non_idle={int(metrics['n_non_idle'])}/{int(metrics['n_steps_total'])}"
+        )
+        print(
+            f"  eps: fired={int(metrics['eps_fired_total'])}  "
+            f"natural_fired={int(metrics['eps_natural_fired_total'])}  "
+            f"natural_rate={natural_rate:.1%}"
         )
         print(f"  {'─'*width}")
         print(f"  {'avg_total_reward':32s}  {metrics['avg_reward']:+.4f}")
@@ -1760,13 +1803,18 @@ class FullDuplexRLTrainer:
         if not episodes:
             return
         step_n = int(metrics["step"])
+        _nat = int(metrics.get("eps_natural_fired_total", 0))
+        _fired = int(metrics.get("eps_fired_total", 0))
+        _elig = max(metrics.get("eps_eligible_total", 1), 1)
+        _nat_rate = _nat / _elig
         lines = [
             f"\n{'='*80}",
             f"STEP {step_n:04d}  |  "
             f"loss={metrics['loss']:.4f}  "
             f"avg_reward={metrics['avg_reward']:+.4f}  "
             f"baseline={metrics['baseline']:.3f}  "
-            f"non_idle={int(metrics['n_non_idle'])}/{int(metrics['n_steps_total'])}",
+            f"non_idle={int(metrics['n_non_idle'])}/{int(metrics['n_steps_total'])}  "
+            f"eps_fired={_fired}  natural_fired={_nat}({_nat_rate:.1%})",
         ]
 
         # Per-RM averages on one line
