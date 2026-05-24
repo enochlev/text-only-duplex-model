@@ -67,6 +67,10 @@ def main() -> None:
     parser.add_argument("--debug-dir", default="./debug",
                         help="Directory for debug audio exports (default: ./debug)")
     parser.add_argument(
+        "--device", default="cuda:0",
+        help="Device for the training model and optimizer (e.g. 'cuda:0', 'cuda:1'). Default: cuda:0.",
+    )
+    parser.add_argument(
         "--vllm-device", default=None,
         help="Pin the vLLM rollout engine to a specific GPU, e.g. 'cuda:1'. "
              "Default: same GPU as the training model.",
@@ -96,7 +100,7 @@ def main() -> None:
         kl_ref_clip=args.kl_ref_clip,
         episodes_per_train_step=args.episodes_per_step,
         max_seq_len=712,
-        device="cuda",
+        device=args.device,
         output_dir=args.output_dir,
         save_every_n_steps=args.save_every,
         debug=args.debug,
