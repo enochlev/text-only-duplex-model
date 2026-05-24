@@ -119,6 +119,12 @@ class Episode:
     blocks: List[DuplexAudioBlock]
     terminated_reason: str
     """"max_duration" | "simulator_done"."""
+    eps_greedy_eligible: int = 0
+    """LLM calls where user had text (epsilon-greedy was eligible)."""
+    eps_greedy_vad_suppressed: int = 0
+    """Eligible calls where VAD said user finished → epsilon suppressed."""
+    eps_greedy_fired: int = 0
+    """Calls where epsilon-greedy actually forced idle."""
 
 
 
@@ -346,6 +352,9 @@ class VirtualSimulationConnection:
         # Counts consecutive LLM calls without user speech. Starts high so
         # the model doesn't generate before the first utterance.
         blocks_since_user_spoke: List[int] = [999]
+        eps_eligible = [0]
+        eps_vad_suppressed = [0]
+        eps_fired = [0]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
@@ -387,16 +396,18 @@ class VirtualSimulationConnection:
                 ))
                 return ""
 
-            # Epsilon-greedy: 10% chance to force idle when user is mid-sentence.
+            # Epsilon-greedy: 20% chance to force idle when user is mid-sentence.
             # Generate max_tokens=1 to capture a real log_prob for the REINFORCE gradient
             # so the positive RM5 reward can propagate correctly via backprop.
             _last_blk = agent.blocks[-1] if agent.blocks else None
-            _force_idle = (
-                _last_blk is not None
-                and _last_blk.user_text
-                and not _user_finished_in(_last_blk)
-                and np.random.random() < 0.20
-            )
+            _force_idle = False
+            if _last_blk is not None and _last_blk.user_text:
+                eps_eligible[0] += 1
+                if _user_finished_in(_last_blk):
+                    eps_vad_suppressed[0] += 1
+                elif np.random.random() < 0.20:
+                    eps_fired[0] += 1
+                    _force_idle = True
             if _force_idle:
                 _, ptok, rtok, lps = llm_generate_train(
                     system_prompt, user_message,
@@ -510,6 +521,9 @@ class VirtualSimulationConnection:
             steps=steps,
             blocks=list(agent.blocks),
             terminated_reason=terminated_reason,
+            eps_greedy_eligible=eps_eligible[0],
+            eps_greedy_vad_suppressed=eps_vad_suppressed[0],
+            eps_greedy_fired=eps_fired[0],
         )
 
 
@@ -557,6 +571,9 @@ class RealTimeGPTEpisodeRunner:
         steps: List[StepRecord] = []
         last_context_version: List[int] = [-1]
         blocks_since_user_spoke: List[int] = [999]
+        eps_eligible = [0]
+        eps_vad_suppressed = [0]
+        eps_fired = [0]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
             user_spoke = (agent.context_version != last_context_version[0])
@@ -597,16 +614,18 @@ class RealTimeGPTEpisodeRunner:
                 ))
                 return ""
 
-            # Epsilon-greedy: 10% chance to force idle when user is mid-sentence.
+            # Epsilon-greedy: 20% chance to force idle when user is mid-sentence.
             # Generate max_tokens=1 to capture a real log_prob for the REINFORCE gradient
             # so the positive RM5 reward can propagate correctly via backprop.
             _last_blk = agent.blocks[-1] if agent.blocks else None
-            _force_idle = (
-                _last_blk is not None
-                and _last_blk.user_text
-                and not _user_finished_in(_last_blk)
-                and np.random.random() < 0.20
-            )
+            _force_idle = False
+            if _last_blk is not None and _last_blk.user_text:
+                eps_eligible[0] += 1
+                if _user_finished_in(_last_blk):
+                    eps_vad_suppressed[0] += 1
+                elif np.random.random() < 0.20:
+                    eps_fired[0] += 1
+                    _force_idle = True
             if _force_idle:
                 _, ptok, rtok, lps = llm_generate_train(
                     system_prompt, user_message,
@@ -721,6 +740,9 @@ class RealTimeGPTEpisodeRunner:
             steps=steps,
             blocks=list(agent.blocks),
             terminated_reason=terminated_reason,
+            eps_greedy_eligible=eps_eligible[0],
+            eps_greedy_vad_suppressed=eps_vad_suppressed[0],
+            eps_greedy_fired=eps_fired[0],
         )
 
 
@@ -1112,12 +1134,23 @@ class FullDuplexRLTrainer:
                 src_id = getattr(src, "source_id", "") or getattr(simulator, "source_id", "")
                 mode = "realtime" if isinstance(simulator, GPTVoiceSimulator) else "sim"
                 last_prompt_tok = len(ep.steps[-1].full_prompt_tokens) if ep.steps else 0
+                trunc_str = (
+                    f"  [TRUNCATED {last_prompt_tok}>{self.config.max_seq_len}]"
+                    if last_prompt_tok > self.config.max_seq_len else ""
+                )
+                eps_str = (
+                    f"  eps=fired:{ep.eps_greedy_fired}/"
+                    f"eligible:{ep.eps_greedy_eligible}"
+                    f"(vad_blocked:{ep.eps_greedy_vad_suppressed})"
+                )
                 print(
                     f"[trainer] episode={ep.episode_id}  mode={mode}  "
                     f"steps={len(ep.steps)} (non-idle={n_non_idle})  "
                     f"blocks={len(ep.blocks)}  ended={ep.terminated_reason}"
                     + (f"  src={src_id}" if src_id else "")
                     + f"  last_prompt_tok={last_prompt_tok}"
+                    + trunc_str
+                    + eps_str
                 )
                 if not self.config.debug:
                     print()
@@ -1167,11 +1200,25 @@ class FullDuplexRLTrainer:
         ep_resp_tok = sum(len(s.response_token_ids) for s in episode.steps)
         trainable = sum(1 for s in episode.steps if not s.is_idle and s.response_token_ids)
 
+        max_step_prompt = max(
+            (len(s.full_prompt_tokens) for s in episode.steps if s.full_prompt_tokens),
+            default=0,
+        )
+        trunc_str = (
+            f"  ⚠ prompt_truncated(max_step={max_step_prompt}>{self.config.max_seq_len})"
+            if max_step_prompt > self.config.max_seq_len else ""
+        )
         print(f"\n  ep={ep_idx}  episode={episode.episode_id}  "
               f"[steps={len(episode.steps)} blocks={len(episode.blocks)} "
               f"ended={episode.terminated_reason}]")
         print(f"  prompt_tok={ep_prompt_tok:,}  response_tok={ep_resp_tok:,}  "
-              f"trainable_steps={trainable}")
+              f"trainable_steps={trainable}{trunc_str}")
+        print(f"  eps: eligible={episode.eps_greedy_eligible}  "
+              f"vad_blocked={episode.eps_greedy_vad_suppressed}  "
+              f"fired={episode.eps_greedy_fired}  "
+              f"effective_rate="
+              f"{episode.eps_greedy_fired / max(episode.eps_greedy_eligible - episode.eps_greedy_vad_suppressed, 1):.0%}"
+              )
         print(f"\n  {'#':>3}  {'user':<{UW}}  {'bot':<{BW}}")
         print(f"  {'─'*3}  {'─'*UW}  {'─'*BW}")
 
