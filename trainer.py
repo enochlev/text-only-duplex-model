@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""trainer.py — entry point for full-duplex RL training.
+"""trainer.py — entry point for full-duplex training (SFT warm-up + RL).
 
-Usage:
-    python trainer.py --model Qwen/Qwen2.5-1.5B-Instruct --steps 100
+Stage 1 (SFT): collects ~150 mid-sentence silence examples and fine-tunes
+               log_π(EOS | mid-sentence) from ~-35 to ~-5 without disrupting
+               the model's normal generation behaviour.
+Stage 2 (RL):  REINFORCE training using the SFT checkpoint as both the policy
+               starting point and the KL reference model.
 
-To mix data sources, build a custom DataPool before calling the trainer:
+Typical usage (both stages):
+    CUDA_VISIBLE_DEVICES=2,3 python trainer.py \\
+        --model Qwen/Qwen3-4B-Instruct-2507 \\
+        --steps 50 --debug --gpu-mem 0.22 --episodes-per-step 8 \\
+        --embed-device cuda:0 --device cuda:1 --vllm-device cuda:0
 
-    from trainer import FullDuplexRLTrainer, TrainerConfig, DataPool
-    from trainer import ScriptTTSSource, StaticWavSource, GPTVoiceSimulator
-
-    pool = DataPool([
-        ScriptTTSSource(script_lines=["Hello!", "How are you?"]),
-        StaticWavSource(path="my_call.wav", script_lines=["Hey there"]),
-        GPTVoiceSimulator(),
-    ], weights=[0.7, 0.2, 0.1])
+Skip SFT (stage 2 only), e.g. after SFT is already done:
+    python trainer.py --model ./sft_checkpoints/final --start-stage 2 ...
 """
 
 import argparse
+import os
 
 from trainer import (
     FullDuplexRLTrainer,
     TrainerConfig,
+    SFTTrainer,
+    SFTConfig,
+    SilenceDataCollector,
     respond_after_user_reward,
     interruption_penalty,
     interruption_penalty_overlap,
@@ -37,17 +42,32 @@ def main() -> None:
     parser.add_argument(
         "--model",
         default="Qwen/Qwen3-4B-Instruct-2507",
-        help="HuggingFace model id or local path",
+        help="HuggingFace model id or local path (used as both starting policy and ref model)",
     )
-    parser.add_argument("--steps", type=int, default=10, help="Number of training steps")
+    parser.add_argument(
+        "--start-stage", type=int, default=1, choices=[1, 2],
+        help="1 = run SFT warm-up then RL (default). "
+             "2 = skip SFT and go straight to RL (--model must already be SFT-trained).",
+    )
+    # SFT options
+    parser.add_argument("--sft-steps", type=int, default=200,
+                        help="Max SFT steps (early-stops when EOS log-prob target is hit)")
+    parser.add_argument("--sft-lr", type=float, default=1e-6,
+                        help="SFT learning rate (lower = less drift from base model)")
+    parser.add_argument("--sft-output-dir", default="./sft_checkpoints",
+                        help="Directory to save the SFT checkpoint")
+    parser.add_argument("--sft-examples", type=int, default=150,
+                        help="Number of silence examples to collect for SFT")
+    parser.add_argument("--use-lora", action="store_true",
+                        help="Use LoRA for SFT (safest option; weights merged before RL)")
+    # RL options
+    parser.add_argument("--steps", type=int, default=10, help="Number of RL training steps")
     parser.add_argument("--episodes-per-step", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--lr", type=float, default=3.5e-6)
     parser.add_argument("--kl-coeff", type=float, default=0.01)
-    parser.add_argument("--ref-model", default="Qwen/Qwen3-4B-Instruct-2507-FP8",
-                        help="HF model id or local path for frozen reference model (enables kl_coherence reward)")
     parser.add_argument("--kl-ref-coeff", type=float, default=0.075,
                         help="Scale factor for KL-against-reference reward penalty")
-    parser.add_argument("--kl-ref-clip", type=float, default=5.0,
+    parser.add_argument("--kl-ref-clip", type=float, default=3.5,
                         help="Per-token KL clip value before averaging")
     parser.add_argument(
         "--max-tokens", type=int, default=60,
@@ -55,48 +75,90 @@ def main() -> None:
     )
     parser.add_argument(
         "--gpu-mem", type=float, default=0.2,
-        help="vLLM GPU memory utilisation (0–1). "
-             "Tip: export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-             "to reduce fragmentation on the training model.",
+        help="vLLM GPU memory utilisation (0–1).",
     )
     parser.add_argument("--output-dir", default="./checkpoints",
-                        help="Directory to save model checkpoints")
+                        help="Directory to save RL model checkpoints")
     parser.add_argument("--save-every", type=int, default=0,
-                        help="Save a checkpoint every N steps (0 = only save at end)")
+                        help="Save a checkpoint every N RL steps (0 = only at end)")
     parser.add_argument("--debug", action="store_true",
                         help="Print per-RM scores and export block audio each step")
-    parser.add_argument("--debug-dir", default="./debug",
-                        help="Directory for debug audio exports (default: ./debug)")
+    parser.add_argument("--debug-dir", default="./debug")
     parser.add_argument(
         "--device", default="cuda:0",
-        help="Device for the training model and optimizer (e.g. 'cuda:0', 'cuda:1'). Default: cuda:0.",
+        help="Device for the training model and optimizer (e.g. 'cuda:1')",
     )
     parser.add_argument(
         "--vllm-device", default=None,
-        help="Pin the vLLM rollout engine to a specific GPU, e.g. 'cuda:1'. "
-             "Default: same GPU as the training model.",
-    )
-    parser.add_argument(
-        "--ref-model-device", default=None,
-        help="Device for the frozen reference model, e.g. 'cuda:0'. "
-             "Default: same GPU as the training model (not vllm-device).",
+        help="Pin the vLLM rollout engine to a specific GPU (e.g. 'cuda:0')",
     )
     parser.add_argument(
         "--embed-device", default="cpu",
-        help="Device for the one-shot MiniLM embedding pass used to build the "
-             "UltraChat similarity index (e.g. 'cuda:1'). Defaults to cpu so the "
-             "~1 GB residual after deletion stays off the primary training GPU.",
+        help="Device for the MiniLM embedding pass used to build the data pool index",
     )
     args = parser.parse_args()
 
-    config = TrainerConfig(
-        model_name_or_path=args.model,
+    set_embed_device(args.embed_device)
+    data_pool = make_default_data_pool()
+
+    # -----------------------------------------------------------------------
+    # Stage 1 — SFT warm-up
+    # -----------------------------------------------------------------------
+    rl_model_path = args.model
+
+    if args.start_stage == 1:
+        sft_cfg = SFTConfig(
+            model_name_or_path=args.model,
+            output_dir=args.sft_output_dir,
+            learning_rate=args.sft_lr,
+            max_steps=args.sft_steps,
+            n_silence_examples=args.sft_examples,
+            use_lora=args.use_lora,
+            device=args.device,
+        )
+
+        print("\n" + "="*70)
+        print("STAGE 1 — SFT silence warm-up")
+        print("="*70)
+
+        sft_trainer = SFTTrainer(sft_cfg)
+
+        collector = SilenceDataCollector()
+        simulators = data_pool.sample(max(8, args.sft_examples // 10))
+        silence_data, speech_prompts = collector.collect(
+            simulators=simulators,
+            tokenizer=sft_trainer.tokenizer,
+            n_silence=sft_cfg.n_silence_examples,
+            n_speech=sft_cfg.n_speech_probes,
+            max_seq_len=sft_cfg.max_seq_len,
+        )
+
+        sft_trainer.set_speech_probes(speech_prompts)
+        sft_trainer.train(silence_data)
+
+        merged = sft_trainer.get_trained_model()
+        sft_final = os.path.join(args.sft_output_dir, "final")
+        merged.save_pretrained(sft_final)
+        sft_trainer.tokenizer.save_pretrained(sft_final)
+        print(f"[stage-1] SFT model saved → {sft_final}")
+
+        rl_model_path = sft_final
+
+    # -----------------------------------------------------------------------
+    # Stage 2 — RL fine-tuning
+    # -----------------------------------------------------------------------
+    check_rm_servers()
+
+    rl_cfg = TrainerConfig(
+        model_name_or_path=rl_model_path,
+        # The SFT (or base) model is also the KL reference — RL refines from it
+        # without fighting against the silence behavior SFT taught.
+        ref_model_name_or_path=rl_model_path,
         vllm_max_tokens=args.max_tokens,
         vllm_temperature=1.0,
         vllm_gpu_memory_utilization=args.gpu_mem,
         learning_rate=args.lr,
         kl_coeff=args.kl_coeff,
-        ref_model_name_or_path=args.ref_model,
         kl_ref_coeff=args.kl_ref_coeff,
         kl_ref_clip=args.kl_ref_clip,
         episodes_per_train_step=args.episodes_per_step,
@@ -107,41 +169,28 @@ def main() -> None:
         debug=args.debug,
         debug_dir=args.debug_dir,
         vllm_device=args.vllm_device,
-        ref_model_device=args.ref_model_device,
     )
 
-    check_rm_servers()
-
-    set_embed_device(args.embed_device)
-    data_pool = make_default_data_pool()
-
-    # Reward functions and their weights (must be same length).
-    # silence_too_long_penalty is listed twice so it can carry two different
-    # weights: a strong "first miss" tier (1.0) and a lighter "sustained" tier
-    # (0.5) — the escalation inside the function already handles run length,
-    # so the two instances give different gradient magnitudes per call site.
     reward_fns = [
-        respond_after_user_reward,    # penalise silence after user finishes
-        interruption_penalty,         # penalise talking over the user
-        interruption_penalty_overlap, # VAD-based overlap penalty
-        backchannel_loop_penalty,     # penalise consecutive backchannel loops
-        correct_idle_reward,          # reward staying silent while user is mid-sentence
+        respond_after_user_reward,
+        interruption_penalty,
+        interruption_penalty_overlap,
+        backchannel_loop_penalty,
+        correct_idle_reward,
     ]
-    reward_weights = [1.0, 1.5, 1.0, 1.0, 2.0]
+    rl_cfg.reward_fn_weights = [1.0, 1.5, 1.0, 1.0, 2.0]
 
-    config.reward_fn_weights = reward_weights
+    print("\n" + "="*70)
+    print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")
+    print("="*70)
 
-    trainer = FullDuplexRLTrainer(
-        config=config,
+    rl_trainer = FullDuplexRLTrainer(
+        config=rl_cfg,
         data_pool=data_pool,
         reward_fns=reward_fns,
     )
 
-    print(
-        f"Starting training: model={args.model}  steps={args.steps}  "
-        f"sources={len(data_pool)}"
-    )
-    history = trainer.train(args.steps)
+    history = rl_trainer.train(args.steps)
 
     avg_loss = sum(m["loss"] for m in history) / len(history) if history else 0.0
     print(f"\nTraining complete. Average loss: {avg_loss:.4f}")

@@ -4,6 +4,8 @@ Must be used from the repository root so that `full_duplex` (in the root) is
 importable. Run: `python trainer.py` from the repo root.
 """
 
+from .sft_trainer import SFTTrainer, SFTConfig, SilenceDataCollector
+from .training_utils import load_hf_model
 from .rl_trainer import (
     FullDuplexRLTrainer,
     TrainerConfig,
@@ -34,6 +36,12 @@ from .data_ingestion import (
 )
 
 __all__ = [
+    # sft_trainer
+    "SFTTrainer",
+    "SFTConfig",
+    "SilenceDataCollector",
+    # training_utils
+    "load_hf_model",
     # rl_trainer
     "FullDuplexRLTrainer",
     "TrainerConfig",

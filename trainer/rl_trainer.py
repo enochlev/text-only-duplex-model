@@ -47,6 +47,8 @@ except ImportError:
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .training_utils import load_hf_model
+
 from full_duplex import (
     ASR_SAMPLE_RATE,
     MAX_MIC_BLOCKS,
@@ -1063,15 +1065,7 @@ class FullDuplexRLTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         print("[trainer] loading HuggingFace model for gradient updates")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            config.model_name_or_path,
-            dtype=torch.bfloat16,
-        )
-        self.model.to(config.device)
-        self.model.train()
-        # Recompute activations during backward instead of caching them all.
-        # Trades ~30% extra compute for a large reduction in activation memory.
-        self.model.gradient_checkpointing_enable()
+        self.model = load_hf_model(config.model_name_or_path, config.device)
 
         self.ref_model: Optional[Any] = None
         if config.ref_model_name_or_path:
