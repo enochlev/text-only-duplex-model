@@ -395,7 +395,7 @@ class VirtualSimulationConnection:
                 _last_blk is not None
                 and _last_blk.user_text
                 and not _user_finished_in(_last_blk)
-                and np.random.random() < 0.10
+                and np.random.random() < 0.20
             )
             if _force_idle:
                 _, ptok, rtok, lps = llm_generate_train(
@@ -605,7 +605,7 @@ class RealTimeGPTEpisodeRunner:
                 _last_blk is not None
                 and _last_blk.user_text
                 and not _user_finished_in(_last_blk)
-                and np.random.random() < 0.10
+                and np.random.random() < 0.20
             )
             if _force_idle:
                 _, ptok, rtok, lps = llm_generate_train(
@@ -1252,9 +1252,9 @@ class FullDuplexRLTrainer:
                 penalty = rm1_w * (-1.0)
                 reward += penalty
                 breakdown["respond_after_user_reward"] = penalty
-            # lag=2: user finished two blocks ago, still idle → -1.3
+            # lag=2: user finished two blocks ago, still idle → -2.0
             elif len(hist) >= 3 and _user_finished_in(hist[-2]):
-                penalty = rm1_w * (-1.3)
+                penalty = rm1_w * (-2.0)
                 reward += penalty
                 breakdown["respond_after_user_reward"] = penalty
             # RM5: reward idle while user is actively mid-sentence

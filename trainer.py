@@ -127,7 +127,7 @@ def main() -> None:
         backchannel_loop_penalty,     # penalise consecutive backchannel loops
         correct_idle_reward,          # reward staying silent while user is mid-sentence
     ]
-    reward_weights = [1.0, 1.5, 1.0, 1.0, 1.0]
+    reward_weights = [1.0, 1.5, 1.0, 1.0, 2.0]
 
     config.reward_fn_weights = reward_weights
 

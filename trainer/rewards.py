@@ -190,7 +190,7 @@ _BACKCHANNEL_PREFIXES: frozenset = frozenset({
 
 def _normalize_bot_text(text: str) -> str:
     text = _re.sub(r"<[^>]+>", "", text)   # strip angle-bracket tags
-    text = _re.sub(r"[,;:]", "", text)      # strip internal punctuation (keep hyphens/apostrophes)
+    text = _re.sub(r"[,;:!?]", "", text)    # strip internal punctuation (keep hyphens/apostrophes)
     return text.lower().strip().rstrip(".,!?").strip()
 
 
