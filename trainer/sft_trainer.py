@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import math
 import os
-import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,7 +41,6 @@ from full_duplex import (
     TTS_SAMPLE_RATE,
     DuplexAudioAgent,
 )
-from .rewards import _user_finished_in
 from .training_utils import load_hf_model
 
 from dotenv import load_dotenv as _load_dotenv
@@ -127,18 +124,15 @@ class SilenceDataCollector:
 
             def dummy_llm_fn(system_prompt: str, user_message: str) -> str:
                 # Capture the current block's user state to classify the call.
-                # is_silence = user is mid-sentence at the source block
+                # is_silence = user is mid-sentence at the source block.
+                # Use text-only heuristic (terminal punctuation) — the VAD
+                # server is not available during SFT data collection.
                 last_blk = agent.blocks[-1] if agent.blocks else None
-                is_silence = (
-                    last_blk is not None
-                    and bool(last_blk.user_text)
-                    and not _user_finished_in(last_blk)
-                )
-                is_speech = (
-                    last_blk is not None
-                    and bool(last_blk.user_text)
-                    and _user_finished_in(last_blk)
-                )
+                if last_blk is None or not last_blk.user_text:
+                    return ""
+                turn_done = _is_turn_complete_text(last_blk.user_text)
+                is_silence = not turn_done
+                is_speech = turn_done
                 if is_silence or is_speech:
                     collected_this_ep.append((system_prompt, user_message, is_silence))
                 return ""  # no response — agent stays silent
@@ -195,6 +189,17 @@ class SilenceDataCollector:
         return silence_examples, speech_prompts
 
 
+def _is_turn_complete_text(user_text: str) -> bool:
+    """Text-only heuristic for whether the user has finished their turn.
+
+    Avoids calling the VAD server (which requires a running audio pipeline).
+    Simulator transcripts are complete sentences, so terminal punctuation is
+    a reliable signal.
+    """
+    text = user_text.strip()
+    return bool(text) and text[-1] in ".!?…"
+
+
 def _format_prompt(system_prompt: str, user_message: str, tokenizer: Any) -> str:
     """Build the full prompt string the same way llm_generate_train does."""
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
@@ -216,7 +221,7 @@ def _make_silent_agent(wpm: int, block_s: float, llm_fn: Any) -> DuplexAudioAgen
     """DuplexAudioAgent with silent TTS and noop ASR — no models loaded."""
     n_silent = max(1, int(block_s * TTS_SAMPLE_RATE))
 
-    def _silent_tts(text: str) -> Tuple[int, np.ndarray]:
+    def _silent_tts(_text: str) -> Tuple[int, np.ndarray]:
         return TTS_SAMPLE_RATE, np.zeros(n_silent, dtype=np.float32)
 
     def _noop_asr(_rolling: list, _agent: DuplexAudioAgent) -> None:
