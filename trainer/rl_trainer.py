@@ -262,7 +262,9 @@ def llm_generate_train(
         max_tokens=max_tokens,
         temperature=temperature,
         logprobs=1,
-        skip_special_tokens=True,
+        # When forcing a special token (e.g. EOS for idle), keep it in token_ids
+        # and logprobs so the actual log_prob is captured for REINFORCE/KL.
+        skip_special_tokens=not bool(logit_bias),
     )
     if logit_bias:
         sp_kwargs["logit_bias"] = logit_bias
