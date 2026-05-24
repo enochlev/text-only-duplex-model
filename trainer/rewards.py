@@ -76,10 +76,14 @@ def interruption_penalty(
     history: List[DuplexAudioBlock],
     is_terminal: bool,
 ) -> float:
-    """Penalise consecutive simultaneous-speech blocks.
+    """Penalise simultaneous-speech blocks.
 
-    First overlap is free (no causal visibility of the user's speech).
-    Escalates with run length:
+    First overlap is free ONLY when the user was NOT already speaking in the
+    source block (history[-1]).  history = episode.blocks[:first_covered_index],
+    so history[-1] is the source block — the moment the bot decided to generate.
+    If the user was already speaking there, the bot had causal visibility and
+    chose to interrupt; no free pass.  Escalates with run length:
+      true-interrupt (run=1, source had user): -0.5
       run=2: -0.5   run=3: -1.0   run=4+: -2.0
     """
     if not block.assistant_text or not block.user_text:
@@ -92,9 +96,10 @@ def interruption_penalty(
         else:
             break
 
-    if run == 1:
+    source_had_user = bool(history) and bool(history[-1].user_text)
+    if run == 1 and not source_had_user:
         return 0.0
-    if run == 2:
+    if run <= 2:
         return -0.5
     if run == 3:
         return -1.0

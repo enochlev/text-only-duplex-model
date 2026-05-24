@@ -1169,7 +1169,13 @@ class FullDuplexRLTrainer:
                 step.response_token_ids, skip_special_tokens=True
             ).strip()
 
-        for block in covered:
+        for blk_pos, block in enumerate(covered):
+            # Prior covered blocks are included in history for all RMs except
+            # interruption_penalty.  That RM must keep the original history so
+            # that T+2's overlap isn't penalised just because T+1 (committed at
+            # the same moment) also overlapped with the user.
+            aug_history = history + covered[:blk_pos]
+
             bot_toks = len(
                 self.tokenizer.encode(block.assistant_text or "", add_special_tokens=False)
             )
@@ -1189,7 +1195,8 @@ class FullDuplexRLTrainer:
             blk_total = 0.0
             rm_vals: List[float] = []
             for fn, w in zip(self.reward_fns, self.rm_weights):
-                score = fn(block, history, is_terminal)
+                h = history if fn.__name__ == "interruption_penalty" else aug_history
+                score = fn(block, h, is_terminal)
                 weighted = w * score
                 blk_total += weighted
                 breakdown[fn.__name__] = breakdown.get(fn.__name__, 0.0) + weighted
@@ -1326,7 +1333,14 @@ class FullDuplexRLTrainer:
             total = 0.0
             breakdown: Dict[str, float] = {}
             for fn, w in zip(self.reward_fns, self.rm_weights):
-                fn_total = sum(w * _call_fn(fn, block, history, is_terminal) for block in covered)
+                fn_total = 0.0
+                for blk_pos, block in enumerate(covered):
+                    # interruption_penalty uses original history so T+2's overlap
+                    # isn't penalised for T+1's (committed at the same decision point).
+                    # All other RMs get augmented history so consecutive-backchannel
+                    # run counts accumulate correctly across covered blocks.
+                    h = history if fn.__name__ == "interruption_penalty" else history + covered[:blk_pos]
+                    fn_total += w * _call_fn(fn, block, h, is_terminal)
                 breakdown[fn.__name__] = fn_total
                 total += fn_total
             return total, breakdown
