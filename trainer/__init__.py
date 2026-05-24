@@ -29,6 +29,7 @@ from .data_ingestion import (
     PlaybackSimulator,
     TRAINING_SCRIPTS,
     make_default_data_pool,
+    set_embed_device,
 )
 
 __all__ = [
@@ -55,4 +56,5 @@ __all__ = [
     "PlaybackSimulator",
     "TRAINING_SCRIPTS",
     "make_default_data_pool",
+    "set_embed_device",
 ]

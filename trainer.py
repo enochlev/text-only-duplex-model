@@ -27,6 +27,7 @@ from trainer import (
     backchannel_loop_penalty,
     make_default_data_pool,
     check_rm_servers,
+    set_embed_device,
 )
 
 
@@ -71,6 +72,12 @@ def main() -> None:
              "When set, vLLM and the training model run on separate GPUs. "
              "Default: same GPU as the training model.",
     )
+    parser.add_argument(
+        "--embed-device", default="cpu",
+        help="Device for the one-shot MiniLM embedding pass used to build the "
+             "UltraChat similarity index (e.g. 'cuda:1'). Defaults to cpu so the "
+             "~1 GB residual after deletion stays off the primary training GPU.",
+    )
     args = parser.parse_args()
 
     config = TrainerConfig(
@@ -95,6 +102,7 @@ def main() -> None:
 
     check_rm_servers()
 
+    set_embed_device(args.embed_device)
     data_pool = make_default_data_pool()
 
     # Reward functions and their weights (must be same length).

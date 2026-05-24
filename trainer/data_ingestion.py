@@ -273,6 +273,18 @@ def _load_ultrachat_prompts(max_prompts: int = _ULTRACHAT_MAX_CACHE) -> List[str
     return _ULTRACHAT_PROMPTS
 
 
+_ULTRACHAT_EMBED_DEVICE: str = "cpu"
+"""Device for the one-shot MiniLM embedding pass.  Default cpu avoids polluting
+the primary training GPU with the ~1 GB residual that persists after del+empty_cache.
+Set to e.g. 'cuda:1' to use a secondary GPU."""
+
+
+def set_embed_device(device: str) -> None:
+    """Call before make_default_data_pool() to redirect MiniLM to a specific device."""
+    global _ULTRACHAT_EMBED_DEVICE
+    _ULTRACHAT_EMBED_DEVICE = device
+
+
 def _get_ultrachat_embeddings() -> "np.ndarray":
     """Lazily encode all cached prompts and return L2-normalised embeddings."""
     global _ULTRACHAT_EMBEDDINGS
@@ -287,8 +299,9 @@ def _get_ultrachat_embeddings() -> "np.ndarray":
             "Similarity sampling requires sentence-transformers. "
             "pip install 'sentence-transformers<3.0'"
         )
-    print(f"[UltraChatTTSSource] encoding {len(prompts)} sentences with {_ULTRACHAT_EMBED_MODEL} …")
-    model = SentenceTransformer(_ULTRACHAT_EMBED_MODEL)
+    print(f"[UltraChatTTSSource] encoding {len(prompts)} sentences with {_ULTRACHAT_EMBED_MODEL} "
+          f"on {_ULTRACHAT_EMBED_DEVICE} …")
+    model = SentenceTransformer(_ULTRACHAT_EMBED_MODEL, device=_ULTRACHAT_EMBED_DEVICE)
     emb = model.encode(
         prompts,
         batch_size=512,
