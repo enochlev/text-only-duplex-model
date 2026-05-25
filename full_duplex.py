@@ -133,9 +133,15 @@ def local_generate(system_prompt: str, user_message: str) -> str:
       - user role    → <user>TEXT<AI>TEXT</s>...<user>CURRENT<AI> block format
     Both assembled as chat messages so the model's chat template is applied
     server-side, identical to how llm_generate_train formats them during RL.
+
+    This talks to the internal OpenAI-compatible model backend on
+    VLLM_DUPLEX_SERVER_PORT, not to the duplex websocket server on
+    WS_DUPLEX_SERVER_PORT.
     """
     import requests
-    url = f"http://localhost:{os.getenv('VLLM_PORT', '8555')}/v1/chat/completions"
+    # VLLM_DUPLEX_SERVER_PORT is the duplex runtime model backend for
+    # /v1/chat/completions, separate from any generic VLLM_PORT used elsewhere.
+    url = f"http://localhost:{os.getenv('VLLM_DUPLEX_SERVER_PORT', '8555')}/v1/chat/completions"
     payload = {
         "model": "text-duplex",
         "messages": [
@@ -205,10 +211,15 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
     system_prompt is ignored — MiniCPM uses raw <用户>/<AI> format with no system turn.
     user_message is in the standard block format; reformatted internally to CPM format.
     Stops at <用户> (the model's natural turn boundary).
+
+    This talks to the internal CPM backend on VLLM_PCM_DUPLEX_SERVER_PORT,
+    not to the duplex websocket server on WS_PCM_DUPLEX_SERVER_PORT.
     """
     import requests
     prompt = _build_cpm_prompt(user_message)
-    url = f"http://localhost:{os.getenv('CPM_PORT', '8556')}/v1/completions"
+    # VLLM_PCM_DUPLEX_SERVER_PORT is the OpenAI-compatible completion backend
+    # for MiniCPM, not the websocket server port exposed by server.py --is-cpm.
+    url = f"http://localhost:{os.getenv('VLLM_PCM_DUPLEX_SERVER_PORT', '8556')}/v1/completions"
     payload = {
         "model": "cpm-text-duplex",
         "prompt": prompt,
@@ -224,6 +235,18 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Dedicated duplex ports. Websocket ports are consumed by the UI layer; VLLM
+# ports are consumed by local_generate() / cpm_generate(). These are separate
+# from any generic training-time VLLM_PORT setting.
+WS_DUPLEX_SERVER_PORT = int(os.getenv("WS_DUPLEX_SERVER_PORT", "8998"))
+WS_PCM_DUPLEX_SERVER_PORT = int(os.getenv("WS_PCM_DUPLEX_SERVER_PORT", "8999"))
+VLLM_DUPLEX_SERVER_PORT = int(os.getenv("VLLM_DUPLEX_SERVER_PORT", "8555"))
+VLLM_PCM_DUPLEX_SERVER_PORT = int(os.getenv("VLLM_PCM_DUPLEX_SERVER_PORT", "8556"))
+
+# Backward-compatible aliases for existing imports inside the repo.
+DUPLEX_SERVER_PORT = WS_DUPLEX_SERVER_PORT
+PCM_DUPLEX_SERVER_PORT = WS_PCM_DUPLEX_SERVER_PORT
 
 DEFAULT_WPM       = 150
 DEFAULT_BLOCK_S   = 2.0

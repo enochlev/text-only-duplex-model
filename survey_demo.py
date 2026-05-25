@@ -3,13 +3,13 @@ survey_demo.py - Blind A/B survey UI for comparing two duplex voice bots.
 
 Default wiring
 --------------
-Model A -> the local trained-model websocket server on 127.0.0.1:8998
-Model B -> the MiniCPM websocket server on 127.0.0.1:8999
+Model A -> the local trained-model websocket server on 127.0.0.1:$WS_DUPLEX_SERVER_PORT
+Model B -> the MiniCPM websocket server on 127.0.0.1:$WS_PCM_DUPLEX_SERVER_PORT
 
 Example run
 -----------
-    python server.py --port 8998
-    python server.py --is-cpm --port 8999
+    python server.py --port "$WS_DUPLEX_SERVER_PORT"
+    python server.py --is-cpm --port "$WS_PCM_DUPLEX_SERVER_PORT"
     python survey_demo.py
 
 Override the defaults with SURVEY_MODEL_A_NAME / SURVEY_MODEL_A_URL and
@@ -40,7 +40,7 @@ import numpy as np
 
 from duplex_client import FullDuplexClient
 from duplex_protocol import SessionSnapshot, server_url_from_address
-from full_duplex import ASR_SAMPLE_RATE
+from full_duplex import ASR_SAMPLE_RATE, WS_DUPLEX_SERVER_PORT, WS_PCM_DUPLEX_SERVER_PORT
 
 POLL_INTERVAL_S = 0.08
 RESULTS_DIR = Path(os.getenv("SURVEY_RESULTS_DIR", "survey_results"))
@@ -438,8 +438,11 @@ window._audioEnqueue = function(channel, dataUri) {
 
 
 def _load_model_configs() -> list[dict]:
-    default_a = os.getenv("SURVEY_MODEL_A_URL", os.getenv("FULL_DUPLEX_SERVER_URL", "127.0.0.1:8998"))
-    default_b = os.getenv("SURVEY_MODEL_B_URL", "127.0.0.1:8999")
+    default_a = os.getenv(
+        "SURVEY_MODEL_A_URL",
+        os.getenv("FULL_DUPLEX_SERVER_URL", f"127.0.0.1:{WS_DUPLEX_SERVER_PORT}"),
+    )
+    default_b = os.getenv("SURVEY_MODEL_B_URL", f"127.0.0.1:{WS_PCM_DUPLEX_SERVER_PORT}")
     return [
         {
             "model_key": "A",

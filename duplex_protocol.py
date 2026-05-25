@@ -11,7 +11,7 @@ import numpy as np
 
 from full_duplex import DuplexAudioAgent, DuplexAudioBlock
 
-DEFAULT_SERVER_PORT = int(os.getenv("DUPLEX_SERVER_PORT", "8998"))
+DEFAULT_SERVER_PORT = int(os.getenv("WS_DUPLEX_SERVER_PORT", "8998"))
 DEFAULT_WS_PATH = "/ws"
 
 
