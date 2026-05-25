@@ -1,15 +1,23 @@
 """
 survey_demo.py - Blind A/B survey UI for comparing two duplex voice bots.
 
-Run
----
-    SURVEY_MODEL_A_NAME="Model A" SURVEY_MODEL_A_URL="127.0.0.1:8998" \
-    SURVEY_MODEL_B_NAME="Model B" SURVEY_MODEL_B_URL="127.0.0.1:8999" \
+Default wiring
+--------------
+Model A -> the local trained-model websocket server on 127.0.0.1:8998
+Model B -> the MiniCPM websocket server on 127.0.0.1:8999
+
+Example run
+-----------
+    python server.py --port 8998
+    python server.py --is-cpm --port 8999
     python survey_demo.py
 
-Start one websocket server per model before launching this UI. The survey tab
-keeps the model identities hidden until the final reveal screen; the free-play
-tab shows the real model names for demos and exploration.
+Override the defaults with SURVEY_MODEL_A_NAME / SURVEY_MODEL_A_URL and
+SURVEY_MODEL_B_NAME / SURVEY_MODEL_B_URL if your deployment uses different
+names or ports.
+
+The survey tab keeps the model identities hidden until the final reveal
+screen; the free-play tab shows the real model names for demos and exploration.
 """
 
 from __future__ import annotations
@@ -435,12 +443,12 @@ def _load_model_configs() -> list[dict]:
     return [
         {
             "model_key": "A",
-            "name": os.getenv("SURVEY_MODEL_A_NAME", "Model A"),
+            "name": os.getenv("SURVEY_MODEL_A_NAME", "Local duplex model"),
             "server_url": server_url_from_address(default_a),
         },
         {
             "model_key": "B",
-            "name": os.getenv("SURVEY_MODEL_B_NAME", "Model B"),
+            "name": os.getenv("SURVEY_MODEL_B_NAME", "MiniCPM duplex"),
             "server_url": server_url_from_address(default_b),
         },
     ]
