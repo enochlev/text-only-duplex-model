@@ -67,7 +67,7 @@ def main() -> None:
     # RL options
     parser.add_argument("--steps", type=int, default=10, help="Number of RL training steps")
     parser.add_argument("--episodes-per-step", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3.5e-6)
+    parser.add_argument("--lr", type=float, default=2.5e-6)
     parser.add_argument("--kl-coeff", type=float, default=0.01)
     parser.add_argument("--kl-ref-coeff", type=float, default=0.075,
                         help="Scale factor for KL-against-reference reward penalty")
@@ -189,10 +189,13 @@ def main() -> None:
         backchannel_loop_penalty,
         junk_output_penalty,
     ]
-    # Post-SFT rebalance: model already internalized silence (RM5 natural_fired ~50-70%),
-    # so RM1 (respond after turn) needs to be the dominant signal now.
-    # RM6 (junk) makes HTML/garbage tokens strictly worse than real interruptions.
-    rl_cfg.reward_fn_weights = [2.5, 1.5, 1.0, 1.0, 0.5, 1.5]
+    # Steps 1-9 analysis: model overcorrected from SFT silence → now interrupts every turn.
+    # natural_fired dropped to 0% by step 7 — model never chooses silence naturally.
+    # RM2 (interruption) is the dominant failure mode; doubled weight to 3.0 to break the pattern.
+    # RM1 weight reduced (model now speaks; block-4/5 escalation fix handles post-turn lag).
+    # RM3 (idle reward) raised to 1.5 to better reward correct mid-sentence silence.
+    # RM5 (backchannel) raised slightly. LR reduced 30% to compensate for stronger RM2 signal.
+    rl_cfg.reward_fn_weights = [1.5, 3.0, 1.5, 1.0, 0.75, 1.5]
 
     print("\n" + "="*70)
     print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")

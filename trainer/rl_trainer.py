@@ -95,8 +95,12 @@ class StepRecord:
     """True when the policy output nothing (empty or <idle> token)."""
 
     source_block_id: Optional[str] = None
-    """agent._latest_user_source_block_id at call time.
-    Used post-episode to map steps → blocks_covered."""
+    """Display anchor block (agent.blocks[-1] when user already stopped, else _latest_user_source_block_id).
+    Used for per-row debug display."""
+
+    llm_source_block_id: Optional[str] = None
+    """agent._latest_user_source_block_id at call time — matches block.response_source_block_id.
+    Used post-episode in _fill_blocks_covered to map steps → blocks_covered."""
 
     blocks_covered: List[str] = field(default_factory=list)
     """block_ids whose assistant_text originated from this LLM call."""
@@ -376,15 +380,17 @@ class VirtualSimulationConnection:
             else:
                 blocks_since_user_spoke[0] += 1
 
-            # When user is currently speaking use the user-speech block as source so
-            # RM5 lookahead works correctly.  When user has already stopped, use the
-            # CURRENT block so each call gets its own display row and escalating penalty.
+            # source_block_id: display anchor — each post-turn call gets its own row.
+            #   blocks_since_user_spoke==0 → user block (for RM5 lookahead)
+            #   blocks_since_user_spoke>0  → latest committed block (one row per block)
+            # llm_source_block_id: matches block.response_source_block_id (full_duplex uses
+            #   _latest_user_source_block_id regardless of blocks_since_user_spoke).
+            llm_src = agent._latest_user_source_block_id
+
             def _src_id() -> Optional[str]:
-                # LLM is called between block commits so _current_block is None;
-                # use the most recently committed block as the per-call source ID.
                 if blocks_since_user_spoke[0] == 0:
-                    return agent._latest_user_source_block_id
-                return agent.blocks[-1].block_id if agent.blocks else agent._latest_user_source_block_id
+                    return llm_src
+                return agent.blocks[-1].block_id if agent.blocks else llm_src
 
             if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
                 # Outside the speaking window — force idle without vLLM call.
@@ -396,6 +402,7 @@ class VirtualSimulationConnection:
                     log_probs=[],
                     is_idle=True,
                     source_block_id=_src_id(),
+                    llm_source_block_id=llm_src,
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -413,6 +420,7 @@ class VirtualSimulationConnection:
                     log_probs=[],
                     is_idle=True,
                     source_block_id=_src_id(),
+                    llm_source_block_id=llm_src,
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -480,6 +488,7 @@ class VirtualSimulationConnection:
                 log_probs=lps,
                 is_idle=(not text),
                 source_block_id=_src_id(),
+                llm_source_block_id=llm_src,
                 user_spoke_before=user_spoke,
             ))
             return text
@@ -623,12 +632,12 @@ class RealTimeGPTEpisodeRunner:
             else:
                 blocks_since_user_spoke[0] += 1
 
+            llm_src = agent._latest_user_source_block_id
+
             def _src_id() -> Optional[str]:
-                # LLM is called between block commits so _current_block is None;
-                # use the most recently committed block as the per-call source ID.
                 if blocks_since_user_spoke[0] == 0:
-                    return agent._latest_user_source_block_id
-                return agent.blocks[-1].block_id if agent.blocks else agent._latest_user_source_block_id
+                    return llm_src
+                return agent.blocks[-1].block_id if agent.blocks else llm_src
 
             if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
                 steps.append(StepRecord(
@@ -639,6 +648,7 @@ class RealTimeGPTEpisodeRunner:
                     log_probs=[],
                     is_idle=True,
                     source_block_id=_src_id(),
+                    llm_source_block_id=llm_src,
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -656,6 +666,7 @@ class RealTimeGPTEpisodeRunner:
                     log_probs=[],
                     is_idle=True,
                     source_block_id=_src_id(),
+                    llm_source_block_id=llm_src,
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -723,6 +734,7 @@ class RealTimeGPTEpisodeRunner:
                 log_probs=lps,
                 is_idle=(not text),
                 source_block_id=_src_id(),
+                llm_source_block_id=llm_src,
                 user_spoke_before=user_spoke,
             ))
             return text
@@ -903,8 +915,12 @@ def _fill_blocks_covered(
     for step in steps:
         # Idle steps produced no speech — don't assign them blocks that belong
         # to a speech step sharing the same source_block_id.
-        if step.source_block_id and not step.is_idle:
-            step.blocks_covered = source_to_blocks.get(step.source_block_id, [])
+        if not step.is_idle:
+            # Use llm_source_block_id (matches block.response_source_block_id) if available;
+            # fall back to source_block_id for older step records.
+            key = step.llm_source_block_id or step.source_block_id
+            if key:
+                step.blocks_covered = source_to_blocks.get(key, [])
 
 
 def _collapse_run(run: List[StepRecord]) -> StepRecord:
