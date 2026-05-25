@@ -29,6 +29,7 @@ from trainer import (
     block_silence_penalty,
     block_interruption_penalty,
     block_idle_reward,
+    timely_response_reward,
     backchannel_loop_penalty,
     junk_output_penalty,
     make_default_data_pool,
@@ -184,16 +185,20 @@ def main() -> None:
         block_silence_penalty,
         block_interruption_penalty,
         block_idle_reward,
+        timely_response_reward,
         # vad_overlap_penalty,  # audio-only; no-op in text-only sim — re-enable for real audio
         backchannel_loop_penalty,
         junk_output_penalty,
     ]
-    # RM1=block_silence_penalty  RM2=block_interruption_penalty  RM3=block_idle_reward
-    # RM4=backchannel_loop_penalty  RM5=junk_output_penalty
-    # vad_overlap_penalty removed: no-op in text-only sim (mic audio is silence).
-    # RM2 raised to 3.0: interruption is dominant failure mode (natural_fired→0% by step 7).
-    # RM4 backchannel raised: now penalizes run=1 when user already finished their turn.
-    rl_cfg.reward_fn_weights = [1.5, 3.0, 1.5, 0.75, 1.5]
+    # RM1=block_silence_penalty       weight=1.5  lag=1→-1.5  lag=2→-3.0  lag=3+→-4.5
+    # RM2=block_interruption_penalty  weight=3.0  run=1→-1.5  run=2→-1.5  run=3→-3.0
+    # RM3=block_idle_reward           weight=1.5  mid-sentence silence → +0.75
+    # RM6=timely_response_reward      weight=1.5  lag=1→+1.5  lag=2→+0.75
+    # RM4=backchannel_loop_penalty    weight=0.75
+    # RM5=junk_output_penalty         weight=1.5
+    # RM6 closes the reward gap: correct speech (+1.5) > silence mid-sentence (+0.75)
+    # > silence post-turn (-1.5). Without RM6 the model had zero incentive to speak.
+    rl_cfg.reward_fn_weights = [1.5, 3.0, 1.5, 1.5, 0.75, 1.5]
 
     print("\n" + "="*70)
     print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")
