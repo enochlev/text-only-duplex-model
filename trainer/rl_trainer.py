@@ -1725,8 +1725,12 @@ class FullDuplexRLTrainer:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.gradient_clip
             )
-            # Release reserved-but-unused cache before step so the optimizer's
-            # per-parameter allocations don't OOM on a fragmented heap.
+            # Synchronize both devices before empty_cache so any pending CUDA
+            # errors surface here with a useful stacktrace rather than async.
+            torch.cuda.synchronize(self.config.device)
+            vllm_dev = self.config.vllm_device or self.config.device
+            if vllm_dev != self.config.device:
+                torch.cuda.synchronize(vllm_dev)
             torch.cuda.empty_cache()
             self.optimizer.step()
 
