@@ -59,8 +59,8 @@ class SFTConfig:
     max_steps: int = 200
     eval_every_n_steps: int = 10
     target_eos_log_prob: float = -5.0  # early-stop: mean_eos_lp reaches this
-    ppl_ratio_warn: float = 1.3        # warn when speech perplexity degrades
-    ppl_ratio_stop: float = 2.0        # stop when speech perplexity degrades badly
+    ppl_ratio_warn: float = 1.5        # warn when speech perplexity degrades
+    min_gen_len: int = 5               # stop if speech probe generation collapses below this
     batch_size: int = 4
     gradient_clip: float = 1.0
     device: str = "cuda"
@@ -453,11 +453,12 @@ class SFTTrainer:
                     )
                     break
 
-                if metrics.get("ppl_ratio", 1.0) >= self.config.ppl_ratio_stop:
+                gen_len = metrics.get("gen_len", float("inf"))
+                if gen_len < self.config.min_gen_len:
                     print(
                         f"[sft] stopping at step {step}: "
-                        f"speech ppl_ratio={metrics['ppl_ratio']:.2f} "
-                        f">= {self.config.ppl_ratio_stop} (coherence degraded)"
+                        f"gen_len={gen_len:.0f} < {self.config.min_gen_len} "
+                        f"(speech generation collapsed)"
                     )
                     break
 
@@ -581,7 +582,9 @@ class SFTTrainer:
         gen_len = metrics.get("gen_len", float("nan"))
         warn = ""
         if not math.isnan(ppl_ratio) and ppl_ratio >= self.config.ppl_ratio_warn:
-            warn = "  ⚠ coherence warning"
+            warn = "  ⚠ ppl warn"
+        if not math.isnan(gen_len) and gen_len < self.config.min_gen_len * 2:
+            warn = "  ⚠ gen_len dropping"
         print(
             f"[sft-eval step={step:04d}]  "
             f"loss={loss:.4f}  "
