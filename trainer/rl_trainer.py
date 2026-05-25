@@ -1253,6 +1253,7 @@ class FullDuplexRLTrainer:
         """Print a conversation table with RM scores inline after each scored block."""
         UW, BW = 38, 32
         rm_names = [fn.__name__ for fn in self.reward_fns]
+        _block_idx = {b.block_id: i for i, b in enumerate(episode.blocks)}
 
         # Map block_id → the step that covers it (speech steps).
         # Idle steps have no covered blocks — group them by source_block_id.
