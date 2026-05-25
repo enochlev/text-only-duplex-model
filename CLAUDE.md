@@ -128,7 +128,7 @@ Active reward functions (`trainer.py`) in order, with weights `[1.5, 3.0, 1.5, 1
 | # | Function | Weight | Step type | Fires when | Raw values | Weighted values |
 |---|---|---|---|---|---|---|
 | RM1 | `block_silence_penalty` | 1.5 | **Idle** | Bot stays silent after user finishes speaking | lag=0: −1.0 / lag=1: −2.0 / lag≥2: −3.0 | −1.5 / −3.0 / −4.5 |
-| RM2 | `block_interruption_penalty` | 3.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | run≤2: −0.5 / run=3: −1.0 / run≥4: −2.0 | −1.5 / −3.0 / −6.0 |
+| RM2 | `block_interruption_penalty` | 4.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | committed(run=1,silent src): 0.0 / true-interrupt(run=1): −0.5 / run=2: −1.0 / run=3: −1.5 / run≥4: −2.0 | 0.0 / −2.0 / −4.0 / −6.0 / −8.0 |
 | RM3 | `block_idle_reward` | 1.5 | **Idle** | Bot stays silent while user is mid-sentence AND user continues in the next block (post-episode lookahead) | +0.5 | +0.75 |
 | RM4 | `timely_response_reward` | 1.5 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +1.5 / +1.125 / +0.75 |
 | RM5 | `backchannel_loop_penalty` | 0.75 | **Speech** | Bot outputs a backchannel-only response. Single backchannel during user's mid-sentence is free. | mid-sentence run=1: 0.0 / post-turn run=1: −0.5 / run N: −0.5N | 0.0 / −0.375 / −0.375N |
@@ -146,7 +146,7 @@ Active reward functions (`trainer.py`) in order, with weights `[1.5, 3.0, 1.5, 1
 
 ## 9. Epsilon-Greedy Exploration (`rl_trainer.py:390`)
 
-10 % of the time, when the user is mid-sentence, the bot is **forced silent** even if it would normally generate. This lets REINFORCE observe RM5's +0.5 reward and learn that silence during user speech is correct.
+When the user is mid-sentence, the bot is sometimes **forced silent** even if it would normally generate. This lets REINFORCE observe RM3's +0.5 reward and learn that silence during user speech is correct. The rate is **10%** for clean new-question starts (user has text, source block had no prior bot overlap) and **30%** for overlap moments (source block already had both user and bot text), where staying silent is more clearly correct.
 
 **Why `max_tokens=1` for forced-idle steps:** REINFORCE requires a log probability to compute a gradient. Even when the text output is discarded, vLLM generates one token so its log-prob is captured. Without this, `log_probs=[]` and the gradient is zero.
 
@@ -154,11 +154,26 @@ Active reward functions (`trainer.py`) in order, with weights `[1.5, 3.0, 1.5, 1
 
 ## 10. Known Issue — Fully-Idle Episodes
 
-Idle-step rewards (RM1/RM3) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the current RM weights (`[1.5, 3.0, 1.5, 1.5, 0.75, 1.5]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
+Idle-step rewards (RM1/RM3) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the current RM weights (`[1.5, 4.0, 1.5, 1.5, 0.75, 1.5]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
 
 ---
 
-## 11. Key Invariants
+## 11. Hyperparameter & RM Change Log
+
+Entries are newest-first. Format: `date | param | old → new | why (5–15 words)`.
+
+| Date | Parameter / File | Old | New | Why |
+|---|---|---|---|---|
+| 2026-05-25 | RM4 turn-complete check (`rewards.py`) | `_user_finished_in(src)` | removed | Post-episode: T+1 silent IS the lookahead; punctuation redundant |
+| 2026-05-25 | RM5 mid-sentence check (`rewards.py`) | `src.user_text[-1] not in _TERM` | `bool(block.user_text)` | Lookahead replaces punctuation; fixed "Right." false-free-pass |
+| 2026-05-25 | `baseline_ema_alpha` (`rl_trainer.py`) | 0.07 | 0.15 | Baseline drifted to −1.2; inflated advantages pushed model to over-speak |
+| 2026-05-25 | RM2 weight (`trainer.py`) | 3.0 | 4.0 | Interruption penalty not strong enough relative to timely-response reward |
+| 2026-05-25 | RM2 run=2 raw penalty (`rewards.py`) | −0.5 | −1.0 | First conscious re-interrupt decision was as cheap as committed-overlap free pass |
+| 2026-05-25 | RM2 run=3 raw penalty (`rewards.py`) | −1.0 | −1.5 | Proportionate escalation after run=2 change |
+
+---
+
+## 12. Key Invariants
 
 1. `history[-1]` passed to any reward function is always the **source block T** — the block where the generation decision was made.
 2. All covered blocks from one step share the same base history (up to T). They were committed as part of one atomic LLM call.

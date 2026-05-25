@@ -191,13 +191,13 @@ def main() -> None:
         junk_output_penalty,
     ]
     # RM1=block_silence_penalty       weight=1.5  lag=0→-1.5  lag=1→-3.0  lag≥2→-4.5
-    # RM2=block_interruption_penalty  weight=3.0  run≤2→-1.5  run=3→-3.0  run≥4→-6.0
+    # RM2=block_interruption_penalty  weight=4.0  run=1(true)→-2.0  run=2→-4.0  run=3→-6.0  run≥4→-8.0
     # RM3=block_idle_reward           weight=1.5  mid-sentence silence → +0.75
     # RM4=timely_response_reward      weight=1.5  lag=0→+1.5  lag=1→+1.125  lag=2→+0.75
     # RM5=backchannel_loop_penalty    weight=0.75 post-turn run=1→-0.375; run=N→-0.375N
     # RM6=junk_output_penalty         weight=1.5  junk tokens → -1.5
     # Note: RM4 does NOT fire for backchannel or junk blocks (guards in timely_response_reward).
-    rl_cfg.reward_fn_weights = [1.5, 3.0, 1.5, 1.5, 0.75, 1.5]
+    rl_cfg.reward_fn_weights = [1.5, 4.0, 1.5, 1.5, 0.75, 1.5]
 
     print("\n" + "="*70)
     print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")

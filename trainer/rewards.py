@@ -88,10 +88,15 @@ def block_interruption_penalty(
 
     First overlap is free ONLY when the user was NOT already speaking in the
     source block (history[-1]).  If the user was already speaking there, the bot
-    had causal visibility and chose to interrupt; no free pass.  Escalates with
-    run length:
-      true-interrupt (run=1, source had user): -0.5
-      run=2: -0.5   run=3: -1.0   run=4+: -2.0
+    had causal visibility and chose to interrupt; no free pass.
+
+    Run counter includes prior overlap blocks in history, so a committed-then-
+    overlapped block (free at run=1) means the next conscious decision to keep
+    speaking typically arrives at run=2 — which is where the steep cliff starts.
+
+      committed overlap  (run=1, source silent): 0.0  (free — no causal visibility)
+      true-interrupt     (run=1, source had user): -0.5
+      run=2: -1.0   run=3: -1.5   run=4+: -2.0
     """
     if not block.assistant_text or not block.user_text:
         return 0.0
@@ -106,10 +111,12 @@ def block_interruption_penalty(
     source_had_user = bool(history) and bool(history[-1].user_text)
     if run == 1 and not source_had_user:
         return 0.0
-    if run <= 2:
+    if run == 1:
         return -0.5
-    if run == 3:
+    if run == 2:
         return -1.0
+    if run == 3:
+        return -1.5
     return -2.0
 
 
@@ -138,15 +145,12 @@ def timely_response_reward(
 ) -> float:
     """Reward bot for responding promptly after the user finishes speaking.
 
-    lag=0: source block had user speech AND user finished there → +1.0 (ideal)
+    lag=0: source block had user speech, covered block is silent → +1.0 (ideal)
     lag=1: one silent block since user stopped                   → +0.75
     lag=2: two silent blocks since user stopped                  → +0.5
 
-    Guard: if source block had user speech but user was mid-sentence (no
-    terminal punctuation, VAD says not complete), this is a true interruption
-    and RM2 already penalises it — return 0 to avoid double-counting.
-    Also skip covered blocks that are themselves overlap blocks (user still
-    speaking there) since RM2 covers those too.
+    Covered block silent = lookahead evidence user stopped. No punctuation used.
+    Skip overlap blocks (covered block has user_text) — RM2 covers those.
     """
     if not block.assistant_text:
         return 0.0
@@ -161,11 +165,8 @@ def timely_response_reward(
         return 0.0
     src = history[-1]
     if src.user_text:
-        # Source had user speech. Only reward if the user actually finished there;
-        # mid-sentence source = true interruption = RM2's territory.
-        if not _user_finished_in(src):
-            return 0.0
-        # User finished at source block → ideal timing (lag=0).
+        # Source had user speech AND covered block has no user_text (checked above).
+        # T+1 being silent is the lookahead evidence that user stopped — lag=0.
         return +1.0
     # Source block was silent — count how many blocks since user last spoke.
     lag = _silent_blocks_since_user_spoke(history)
@@ -294,10 +295,10 @@ def backchannel_loop_penalty(
 ) -> float:
     """Penalise backchannel-only bot responses.
 
-    A single backchannel is free ONLY when the user was mid-sentence at the
-    source block (history[-1].user_text set with no terminal punctuation).
-    If the user already finished their turn (source block silent, or text ends
-    a sentence), even run=1 costs -0.5 — a backchannel is not a real answer.
+    A single backchannel is free ONLY when the covered block has user_text
+    (user was still speaking — lookahead confirms mid-sentence).
+    If the covered block is silent (user stopped), even run=1 costs -0.5
+    — a backchannel is not a real answer.
 
     Escalation:
       mid-sentence, run=1: 0.0   run=2: -0.5   run=3: -1.0  ...
@@ -319,14 +320,8 @@ def backchannel_loop_penalty(
         else:
             break
 
-    # Determine if the user was mid-sentence at the source block.
-    src = history[-1] if history else None
-    _TERM = frozenset(".!?…")
-    user_mid_sentence = bool(
-        src and src.user_text
-        and src.user_text.strip()
-        and src.user_text.strip()[-1] not in _TERM
-    )
+    # Lookahead: if the covered block has user_text, user was still speaking.
+    user_mid_sentence = bool(block.user_text)
 
     if run <= 1 and user_mid_sentence:
         return 0.0  # single backchannel during user speech is a natural filler
