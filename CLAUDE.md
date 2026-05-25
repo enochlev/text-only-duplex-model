@@ -164,6 +164,8 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
+| 2026-05-25 | `kl_ref_coeff` (`trainer.py`) | 0.075 | 0.02 | SFT ref model is silent; high KL coeff anchored student to silence, blocking RM4 |
+| 2026-05-25 | `vllm_temperature` (`trainer.py`) | 0.8 | 1.0 | Low temp sharpened EOS distribution; 1.0 restores natural sampling variance |
 | 2026-05-25 | RM4 weight (`trainer.py`) | 1.5 | 2.5 | Model converged to silence; +2.5 now clearly beats −2.0 interrupt risk |
 | 2026-05-25 | RM1 weight (`trainer.py`) | 1.5 | 2.0 | Silence penalty dominant but gradient blocked in fully-silent episodes; heavier weight improves mixed episodes |
 | 2026-05-25 | RM4 turn-complete check (`rewards.py`) | `_user_finished_in(src)` | removed | Post-episode: T+1 silent IS the lookahead; punctuation redundant |

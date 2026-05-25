@@ -74,7 +74,7 @@ def main() -> None:
     parser.add_argument("--episodes-per-step", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2.5e-6)
     parser.add_argument("--kl-coeff", type=float, default=0.01)
-    parser.add_argument("--kl-ref-coeff", type=float, default=0.075,
+    parser.add_argument("--kl-ref-coeff", type=float, default=0.04,
                         help="Scale factor for KL-against-reference reward penalty")
     parser.add_argument("--kl-ref-clip", type=float, default=3.5,
                         help="Per-token KL clip value before averaging")
@@ -169,7 +169,7 @@ def main() -> None:
         # without fighting against the silence behavior SFT taught.
         ref_model_name_or_path=rl_model_path,
         vllm_max_tokens=args.max_tokens,
-        vllm_temperature=0.8,
+        vllm_temperature=1.0,
         vllm_gpu_memory_utilization=args.gpu_mem,
         learning_rate=args.lr,
         kl_coeff=args.kl_coeff,
