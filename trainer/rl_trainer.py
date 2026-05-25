@@ -1730,6 +1730,11 @@ class FullDuplexRLTrainer:
             torch.cuda.empty_cache()
             self.optimizer.step()
 
+        # Ensure all cuda:1 kernels finish before we copy weights to cuda:0 (vLLM).
+        # Without this, the async backward on cuda:1 can still be in-flight when
+        # load_weights reads parameters, causing an illegal memory access.
+        torch.cuda.synchronize(self.config.device)
+
         # Sync updated weights → vLLM engine, then release fragmented cache
         self._sync_weights_to_vllm()
         torch.cuda.empty_cache()
