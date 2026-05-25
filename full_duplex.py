@@ -864,7 +864,13 @@ class DuplexAudioAgent:
                             f"[asr→block] block@{block_start_ts:.1f} {change_kind} "
                             f"old={old!r} new={word_text!r}"
                         )
-                        if change_kind != "punctuation":
+                        # Only trigger a context flush for mutable-window changes.
+                        # Frozen blocks (outside mutable_asr_windows) may silently
+                        # receive new text for history display, but must NOT restart
+                        # the LLM — Parakeet sometimes fills old empty frozen blocks
+                        # with hallucinated short words ("Okay.") which would cancel
+                        # an in-flight response unnecessarily.
+                        if change_kind != "punctuation" and is_mutable:
                             any_changed = True
                             if target_index is not None and (
                                 earliest_changed_index is None or target_index < earliest_changed_index
