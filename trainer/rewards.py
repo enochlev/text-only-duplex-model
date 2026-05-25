@@ -64,17 +64,17 @@ def block_silence_penalty(
     Looks back through history for how many consecutive silent blocks have
     elapsed since the user last spoke.
 
-    silent=0 (user spoke in history[-1], this is the first silence): 0.0 — free recovery window.
-    silent=1: -1.0   silent=2: -2.0   silent>=3: -3.0
+    silent=0 (user spoke last block, this is first silence): -1.0
+    silent=1: -2.0   silent>=2: -3.0
     """
     if block.user_text or block.assistant_text:
         return 0.0
     silent = _silent_blocks_since_user_spoke(history)
-    if silent is None or silent == 0:
+    if silent is None:
         return 0.0
-    if silent == 1:
+    if silent == 0:
         return -1.0
-    if silent == 2:
+    if silent == 1:
         return -2.0
     return -3.0
 
@@ -115,17 +115,20 @@ def block_interruption_penalty(
 
 def block_idle_reward(
     block: DuplexAudioBlock,
-    _history: List[DuplexAudioBlock],
+    history: List[DuplexAudioBlock],
     _is_terminal: bool,
 ) -> float:
-    """Reward bot silence while user is actively speaking. Pure block-level, no VAD.
+    """Reward bot silence while user is clearly mid-sentence. Pure block-level, no VAD.
 
-    Returns +0.5 when the bot is silent and the current block has user speech.
-    No VAD call — if the user is speaking in this block, staying silent is correct.
+    Requires BOTH the current block AND the previous block to have user speech —
+    two consecutive blocks of user text confirms the user is mid-sentence, not
+    finishing a complete single-block utterance.
     """
     if block.assistant_text:
         return 0.0
     if not block.user_text:
+        return 0.0
+    if not history or not history[-1].user_text:
         return 0.0
     return +0.5
 

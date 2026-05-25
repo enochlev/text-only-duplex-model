@@ -1366,7 +1366,9 @@ class FullDuplexRLTrainer:
                 reward += weighted
                 breakdown["block_silence_penalty"] = weighted
 
-            raw5 = _rm5(silent_blk, hist, False)
+            # Pass hist[:-1] so that history[-1] inside block_idle_reward is the block
+            # BEFORE the source block — confirming user was already speaking there.
+            raw5 = _rm5(silent_blk, hist[:-1], False)
             if raw5:
                 weighted = rm5_w * raw5
                 reward += weighted
