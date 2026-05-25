@@ -331,6 +331,8 @@ class SFTTrainer:
         self._silence_probes: List[Dict] = []
         self._speech_probes: List[Dict] = []   # {"input_ids": [...], "n_prompt": int}
         self._baseline_ppls: List[float] = []  # baseline perplexity per speech probe
+        self._baseline_samples: List[str] = [] # baseline generated text for probe[0..1]
+        self._last_sample: str = ""            # most recent generation for _log()
 
         os.makedirs(config.output_dir, exist_ok=True)
         self._init_wandb()
@@ -375,11 +377,22 @@ class SFTTrainer:
 
         self._speech_probes = probes
         self._baseline_ppls = baseline_ppls
+
+        # Capture baseline generated text for the first 2 probes so _log() can
+        # print a side-by-side comparison at each eval step.
+        self._baseline_samples = []
+        for probe in probes[:2]:
+            self._baseline_samples.append(
+                self._generate_sample(probe["input_ids"][:probe["n_prompt"]])
+            )
+
         print(
             f"[sft] baseline speech ppl: "
             f"{sum(baseline_ppls)/max(len(baseline_ppls),1):.2f} "
             f"(n={len(baseline_ppls)})"
         )
+        if self._baseline_samples:
+            print(f"[sft] baseline sample: {self._baseline_samples[0]!r}")
         self.model.train()
 
     def set_silence_probes(self, silence_examples: List[Dict]) -> None:
@@ -490,8 +503,44 @@ class SFTTrainer:
             metrics["mean_speech_ppl"] = mean_curr
             metrics["ppl_ratio"] = mean_curr / max(mean_base, 1e-6)
 
+        # Metric 3 — generation length: how many tokens the model generates on
+        # a speech prompt before stopping. Shrinking gen_len is the clearest
+        # sign the model is prematurely suppressing speech output.
+        if self._speech_probes:
+            probe0 = self._speech_probes[0]
+            prompt_tokens = probe0["input_ids"][:probe0["n_prompt"]]
+            sample = self._generate_sample(prompt_tokens)
+            self._last_sample = sample
+            # Count tokens up to (and including) the first EOS
+            eos_id = self.tokenizer.eos_token_id
+            resp_ids = self.tokenizer.encode(sample, add_special_tokens=False)
+            stop = next((i for i, t in enumerate(resp_ids) if t == eos_id), len(resp_ids))
+            metrics["gen_len"] = float(stop + 1 if stop < len(resp_ids) else len(resp_ids))
+
         self.model.train()
         return metrics
+
+    @torch.no_grad()
+    def _generate_sample(self, prompt_tokens: List[int], max_new_tokens: int = 20) -> str:
+        """Greedy decode from the current model and return the decoded response."""
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            input_ids = torch.tensor(
+                [prompt_tokens], dtype=torch.long, device=self.config.device
+            )
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = self.model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+            resp = out[0][len(prompt_tokens):]
+            return self.tokenizer.decode(resp, skip_special_tokens=False)
+        finally:
+            if was_training:
+                self.model.train()
 
     @torch.no_grad()
     def _compute_eos_lp(self, silence_ex: Dict) -> float:
@@ -529,6 +578,7 @@ class SFTTrainer:
         eos_lp = metrics.get("mean_eos_lp", float("nan"))
         ppl_ratio = metrics.get("ppl_ratio", float("nan"))
         mean_ppl = metrics.get("mean_speech_ppl", float("nan"))
+        gen_len = metrics.get("gen_len", float("nan"))
         warn = ""
         if not math.isnan(ppl_ratio) and ppl_ratio >= self.config.ppl_ratio_warn:
             warn = "  ⚠ coherence warning"
@@ -536,8 +586,13 @@ class SFTTrainer:
             f"[sft-eval step={step:04d}]  "
             f"loss={loss:.4f}  "
             f"eos_lp={eos_lp:.2f} (target={self.config.target_eos_log_prob:.1f})  "
-            f"speech_ppl={mean_ppl:.2f}  ppl_ratio={ppl_ratio:.3f}{warn}"
+            f"speech_ppl={mean_ppl:.2f}  ppl_ratio={ppl_ratio:.3f}  "
+            f"gen_len={gen_len:.0f}{warn}"
         )
+        # Show actual generated text so ppl artifacts vs real degradation are obvious
+        if self._last_sample is not None and self._baseline_samples:
+            print(f"  baseline : {self._baseline_samples[0]!r}")
+            print(f"  current  : {self._last_sample!r}")
 
     # ------------------------------------------------------------------
     # Checkpoint / export
