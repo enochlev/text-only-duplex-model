@@ -141,7 +141,13 @@ Idle steps produce no tokens, so REINFORCE can't compute a gradient directly. Th
 
 ---
 
-## 10. Key Invariants
+## 10. Known Issue — Fully-Idle Episodes
+
+Idle-step rewards (RM1/RM5) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the post-SFT RM rebalance (`rm_weights=[2.5,1.5,1.0,1.0,0.5,1.5]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
+
+---
+
+## 11. Key Invariants
 
 1. `history[-1]` passed to any reward function is always the **source block T** — the block where the generation decision was made.
 2. All covered blocks from one step share the same base history (up to T). They were committed as part of one atomic LLM call.

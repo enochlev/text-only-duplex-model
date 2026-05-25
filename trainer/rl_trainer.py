@@ -1221,12 +1221,16 @@ class FullDuplexRLTrainer:
         UW, BW = 38, 32
         rm_names = [fn.__name__ for fn in self.reward_fns]
 
-        # Map block_id → the step that covers it.
-        # Walk blocks in episode order so the last assignment is the last covered block.
+        # Map block_id → the step that covers it (speech steps).
+        # Idle steps have no covered blocks — map them by source_block_id instead.
         blk_to_step: Dict[str, "StepRecord"] = {}
+        idle_source_to_step: Dict[str, "StepRecord"] = {}
         for step in episode.steps:
-            for bid in step.blocks_covered:
-                blk_to_step[bid] = step
+            if step.is_idle:
+                idle_source_to_step[step.source_block_id] = step
+            else:
+                for bid in step.blocks_covered:
+                    blk_to_step[bid] = step
 
         # last_blk_of_step[id(step)] = block_id of that step's last covered block
         last_blk_of_step: Dict[int, str] = {}
@@ -1270,20 +1274,17 @@ class FullDuplexRLTrainer:
                 b = b[:BW - 1] + "…"
             print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
 
+            # Print idle-step reward after the source block where the decision was made.
+            idle_step = idle_source_to_step.get(blk.block_id)
+            if idle_step is not None and idle_step.reward_breakdown:
+                bd = idle_step.reward_breakdown
+                idle_parts = "  ".join(f"{k}={v:+.2f}" for k, v in bd.items() if v)
+                if idle_parts:
+                    print(f"  [idle-reward]  {idle_parts}  | TOTAL={idle_step.reward:+.3f}"
+                          f"  (no gradient — propagates via returns)")
+
             step = blk_to_step.get(blk.block_id)
             if step is None:
-                continue
-            if step.is_idle:
-                # Show idle-step reward inline so RM1/RM5 scoring is visible.
-                # Idle steps have no tokens so reward propagates via returns,
-                # not direct gradients — mark clearly so it's not confused with
-                # a backprop-able step.
-                if step.reward_breakdown:
-                    bd = step.reward_breakdown
-                    idle_parts = "  ".join(f"{k}={v:+.2f}" for k, v in bd.items() if v)
-                    if idle_parts:
-                        print(f"  [idle-reward]  {idle_parts}  | TOTAL={step.reward:+.3f}"
-                              f"  (no gradient — propagates via returns)")
                 continue
             if last_blk_of_step.get(id(step)) != blk.block_id:
                 continue  # print RM once, after the last covered block
