@@ -224,6 +224,7 @@ def vad_overlap_penalty(
 _BACKCHANNELS: frozenset = frozenset({
     # affirmations
     "ya", "yeah", "yep", "yup", "yes", "yes please", "yes sure", "yes of course",
+    "ai",  # single-token "AI" acknowledgement the model uses as a filler
     "okay", "ok",
     "right", "alright",
     "sure", "sure let's", "sure thing",
@@ -333,13 +334,17 @@ def backchannel_loop_penalty(
 # Junk output penalty
 # ---------------------------------------------------------------------------
 
-# HTML tags, lone angle-bracket fragments, and Qwen function-call tokens that
-# the model generates when it "wants to be idle" but outputs text instead of EOS.
-# These are not TTS-speakable and should be penalised harder than a real
-# interruption so the model has a clear incentive to prefer EOS over junk.
+# HTML/XML tags, lone bracket lines, and markdown formatting tokens that
+# the model generates when it "wants to be idle" but outputs text instead of EOS,
+# or when it formats output for a text interface rather than speaking naturally.
+# These are not TTS-speakable and receive an extra penalty beyond RM2.
 _JUNK_RE = _re.compile(
-    r'<[^>]{0,40}>'          # any HTML/XML tag   e.g. <i>idle</i>, <span>, <img>
+    r'<[^>]{0,40}>'          # HTML/XML tags  e.g. <i>idle</i>, <span>, <img>
     r'|^[\s<>{}\[\]|]+$'     # line that is ONLY punctuation / brackets
+    r'|\*\*'                  # **bold** markdown (double-asterisk)
+    r'|```'                   # ``` code fence
+    r'|(?m)^#{1,6} '          # markdown headers  # H1 / ## H2 / ...
+    r'|(?m)^[-*] '            # bullet list items at start of line/response
 )
 
 

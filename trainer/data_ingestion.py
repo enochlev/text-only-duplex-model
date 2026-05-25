@@ -872,7 +872,16 @@ def _load_training_scripts() -> List[List[str]]:
         return json.load(f)
 
 
+def _load_boosted_training_scripts() -> List[List[str]]:
+    json_path = os.path.join(os.path.dirname(__file__), "training_scripts_boosted.json")
+    if not os.path.exists(json_path):
+        return []
+    with open(json_path) as f:
+        return json.load(f)
+
+
 TRAINING_SCRIPTS: List[List[str]] = _load_training_scripts()
+BOOSTED_TRAINING_SCRIPTS: List[List[str]] = _load_boosted_training_scripts()
 
 
 def make_default_data_pool(
@@ -884,9 +893,16 @@ def make_default_data_pool(
     tts_model: str = "",
     device: Optional[str] = None,
 ) -> DataPool:
-    """Build a DataPool from the built-in TRAINING_SCRIPTS."""
+    """Build a DataPool from the built-in TRAINING_SCRIPTS and BOOSTED_TRAINING_SCRIPTS.
+
+    BOOSTED_TRAINING_SCRIPTS (training_scripts_boosted.json) are sampled at 2x
+    the weight of standard scripts — they are pure conversational Q&A that produce
+    richer epsilon/RM3 gradient signal than UltraChat (which suffers from
+    vad_blocked killing epsilon due to grammatically-complete sub-clauses).
+    """
     sources = []
     weights = []
+
     for i, lines in enumerate(TRAINING_SCRIPTS):
         sources.append(ScriptTTSSource(
             script_lines=lines,
@@ -901,6 +917,20 @@ def make_default_data_pool(
         ))
         is_backchannel = max(len(l.split()) for l in lines) <= 3
         weights.append(0.2 if is_backchannel else 1.0)
+
+    for i, lines in enumerate(BOOSTED_TRAINING_SCRIPTS):
+        sources.append(ScriptTTSSource(
+            script_lines=lines,
+            inter_turn_pause_s=inter_turn_pause_s,
+            silence_after_s=silence_after_s,
+            max_episode_s=max_episode_s,
+            block_s=block_s,
+            wpm=wpm,
+            source_id=f"boosted_{i:02d}",
+            tts_model=tts_model,
+            device=device,
+        ))
+        weights.append(2.0)
 
     # Give UltraChat the same total weight as all scripts combined → ~50% sampling.
     sources.append(UltraChatTTSSource(

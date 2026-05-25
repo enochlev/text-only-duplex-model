@@ -1141,6 +1141,8 @@ class FullDuplexRLTrainer:
         self._baseline: float = 0.0
         self._step_count: int = 0
         self._total_episodes: int = 0
+        self._best_avg_reward: float = -float("inf")
+        self._best_checkpoint_path: Optional[str] = None
         self._run_summary_path: str = os.path.join(config.output_dir, "run_summary.txt")
         self._init_run_summary()
 
@@ -1583,11 +1585,16 @@ class FullDuplexRLTrainer:
         """
         Accumulate REINFORCE gradients via per-step backward passes.
 
-        For each non-idle step t with advantage A_t = G_t - baseline:
+        For each non-idle step t with advantage A_t = (G_t - μ) / (σ + ε):
 
             L_t = (-A_t * log π_θ(a_t | s_t)
                    + kl_coeff * (log π_θ(a_t | s_t) - log π_old(a_t | s_t)))
                   / total_tokens
+
+        Advantages are batch-whitened (z-scored) so the scale stays consistent
+        regardless of how negative the running baseline drifts.  The EMA baseline
+        is still updated in train_step for logging; it no longer feeds into
+        advantage computation.
 
         Calling backward() immediately after each step means only one forward
         pass worth of activations lives in GPU memory at a time, cutting peak
@@ -1599,17 +1606,25 @@ class FullDuplexRLTrainer:
         if total_tokens == 0:
             return 0.0
 
-        total_loss_val = 0.0
+        # First pass: collect returns per episode for batch-level normalization.
+        episode_returns: List[List[float]] = []
         for episode in episodes:
             rewards = [s.reward or 0.0 for s in episode.steps]
-            returns = _compute_returns(rewards, self.config.gamma)
+            episode_returns.append(_compute_returns(rewards, self.config.gamma))
 
+        flat = [G for returns in episode_returns for G in returns]
+        adv_mean = sum(flat) / len(flat) if flat else 0.0
+        adv_var = sum((G - adv_mean) ** 2 for G in flat) / max(len(flat), 1)
+        adv_std = adv_var ** 0.5
+
+        total_loss_val = 0.0
+        for episode, returns in zip(episodes, episode_returns):
             for step, G in zip(episode.steps, returns):
                 if not step.response_token_ids:
                     continue
 
                 n_resp = len(step.response_token_ids)
-                advantage = G - self._baseline
+                advantage = (G - adv_mean) / (adv_std + 1e-8)
 
                 budget = self.config.max_seq_len - n_resp - 1
                 if budget < 1:
@@ -1686,7 +1701,8 @@ class FullDuplexRLTrainer:
         # KL-against-reference penalty (no-op when ref_model is None)
         episodes = self.compute_kl_ref_rewards(episodes)
 
-        # Update EMA baseline from all returns in this batch
+        # Update EMA baseline for logging only — advantage computation now uses
+        # per-batch z-scoring inside accumulate_reinforce_gradients.
         all_returns: List[float] = []
         for ep in episodes:
             rewards = [s.reward or 0.0 for s in ep.steps]
@@ -1739,6 +1755,8 @@ class FullDuplexRLTrainer:
             "eps_natural_fired_total": float(sum(e.eps_natural_fired for e in episodes)),
             "eps_eligible_total": float(sum(e.eps_greedy_eligible for e in episodes)),
         }
+        self._save_best_checkpoint(metrics["avg_reward"])
+
         _eps_elig = max(metrics["eps_eligible_total"], 1)
         natural_rate = metrics["eps_natural_fired_total"] / _eps_elig
         width = 70
@@ -1770,6 +1788,42 @@ class FullDuplexRLTrainer:
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
+
+    def _save_best_checkpoint(self, avg_reward: float) -> None:
+        """Replace the on-disk best checkpoint when avg_reward improves.
+
+        Saves only the model weights as a single fp16 .pt file — no optimizer
+        state, no shards — to minimise disk usage.  Tokenizer is written once
+        into the same directory and never overwritten.
+        """
+        if avg_reward <= self._best_avg_reward:
+            return
+
+        best_dir = os.path.join(self.config.output_dir, "best")
+        os.makedirs(best_dir, exist_ok=True)
+        weights_path = os.path.join(best_dir, "model_weights.pt")
+
+        # Delete previous best weights before writing the new one.
+        if self._best_checkpoint_path and os.path.exists(self._best_checkpoint_path):
+            os.remove(self._best_checkpoint_path)
+
+        # Cast to fp16 in-place temporarily — avoids a full copy when possible.
+        state_dict_fp16 = {k: v.half() for k, v in self.model.state_dict().items()}
+        torch.save(state_dict_fp16, weights_path)
+        del state_dict_fp16
+
+        # Tokenizer is tiny; write it once so the checkpoint is self-contained.
+        tok_marker = os.path.join(best_dir, "tokenizer_config.json")
+        if not os.path.exists(tok_marker):
+            self.tokenizer.save_pretrained(best_dir)
+
+        prev = self._best_avg_reward
+        self._best_avg_reward = avg_reward
+        self._best_checkpoint_path = weights_path
+        print(
+            f"[trainer] ★ new best avg_reward {avg_reward:+.4f}  "
+            f"(prev {prev:+.4f})  → {weights_path}"
+        )
 
     def save_checkpoint(self, tag: Optional[str] = None) -> str:
         """Save model + tokenizer to output_dir/step-NNNN (or a custom tag)."""

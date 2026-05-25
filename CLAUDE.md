@@ -170,6 +170,9 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 | 2026-05-25 | RM2 weight (`trainer.py`) | 3.0 | 4.0 | Interruption penalty not strong enough relative to timely-response reward |
 | 2026-05-25 | RM2 run=2 raw penalty (`rewards.py`) | −0.5 | −1.0 | First conscious re-interrupt decision was as cheap as committed-overlap free pass |
 | 2026-05-25 | RM2 run=3 raw penalty (`rewards.py`) | −1.0 | −1.5 | Proportionate escalation after run=2 change |
+| 2026-05-25 | Advantage computation (`rl_trainer.py`) | `G - self._baseline` (EMA) | `(G - μ) / (σ + ε)` per-batch z-score | Baseline drifted to −4.0 while avg_reward ~−0.8; inflated advantages were teaching interruptions as "above average" |
+| 2026-05-25 | RM6 junk regex (`rewards.py`) | HTML tags only | + markdown: `**`, ` ``` `, `^# `, `^- ` | Model outputting markdown formatting in later steps; not TTS-speakable |
+| 2026-05-25 | `_BACKCHANNELS` (`rewards.py`) | — | added `"ai"` | Model using single-token "AI" as a filler response; escaped RM5 and got RM4 reward |
 
 ---
 
