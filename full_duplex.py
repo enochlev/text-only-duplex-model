@@ -125,25 +125,28 @@ def llm_stream_groq(system_prompt: str, user_message: str) -> Generator[str, Non
             yield delta
 
 
-# call local vllm. Not with caht but with completion
-def local_llm_generate(system_prompt: str, user_message: str) -> str:
+def local_generate(system_prompt: str, user_message: str) -> str:
+    """Call the locally-hosted trained model via OpenAI-compatible /v1/chat/completions.
+
+    Matches the training prompt format exactly:
+      - system role  → rendered full-duplex.jinja2 content
+      - user role    → <user>TEXT<AI>TEXT</s>...<user>CURRENT<AI> block format
+    Both assembled as chat messages so the model's chat template is applied
+    server-side, identical to how llm_generate_train formats them during RL.
+    """
     import requests
-    url = f"http://localhost:{os.getenv('VLLM_PORT', '8000')}/v1/completions"
-    headers = {"Content-Type": "application/json"}
+    url = f"http://localhost:{os.getenv('VLLM_PORT', '8555')}/v1/chat/completions"
     payload = {
-        "model": "fd",
-        "prompt": user_message,
+        "model": "text-duplex",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_message},
+        ],
         "max_tokens": 60,
         "temperature": 0.0,
-        # logprobs
-        "logprobs": 5
     }
-    response = requests.post(url, json=payload, headers=headers)
-    out = response.json().get("choices", [{}])[0].get("text", "").strip()
-    return out    
-# #test it
-# response  = local_llm_generate("system prompt", "Hi how are you?")
-# print(response)
+    response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
+    return response.json()["choices"][0]["message"]["content"].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +370,7 @@ class DuplexAudioAgent:
         default_block_s: float = DEFAULT_BLOCK_S,
         tts_model: str = TTS_MODEL,
         device: Optional[str] = None,
-        llm_generate_fn: Callable = llm_stream_groq,
+        llm_generate_fn: Callable = local_generate,
         max_prompt_blocks: int = 20,
         # Injected for testing (None → use real implementations)
         tts_fn: Optional[Callable[[str], tuple]] = None,
@@ -430,7 +433,7 @@ class DuplexAudioAgent:
         # ASR windows
         self.asr_windows: List[AsrTimestampWindow] = []
         self.max_asr_windows: int = 20
-        self.mutable_asr_windows: int = 5
+        self.mutable_asr_windows: int = 2
 
         # Block timestamp tracking — carries previous block's end_ts as next start_ts
         self._block_start_ts: float = 0.0
@@ -995,7 +998,10 @@ class DuplexAudioAgent:
           0 – user is currently speaking (current block has user_text)
           1 – one block after user stopped (previous block had user_text)
           2 – two blocks after user stopped, but ONLY if the bot has not
-              yet spoken in block[-1] (i.e. bot hasn't started responding)
+              yet spoken in block[-1]
+          3 – three blocks after user stopped, but ONLY if bot has not
+              spoken in block[-1] or block[-2] (ASR churn buffer: gives one
+              extra block when word-assignment reshuffling delays the response)
         """
         current_user = self._current_block.user_text if self._current_block else ""
         if current_user:
@@ -1012,11 +1018,24 @@ class DuplexAudioAgent:
             # Two blocks after user stopped — only if bot hasn't spoken in block[-1]
             return not bool(last.assistant_text)
 
+        if len(self.blocks) >= 3 and self.blocks[-3].user_text:
+            # Three blocks after user stopped — only if bot hasn't spoken at all yet
+            return not bool(last.assistant_text) and not bool(self.blocks[-2].assistant_text)
+
         return False
 
     # ------------------------------------------------------------------
     # LLM helpers
     # ------------------------------------------------------------------
+
+    # Matches the _ROLE_RE in llm_generate_train — strips Qwen chat-template
+    # special tokens that may leak into the output if skip_special_tokens is off
+    # or if the model echoes the prompt format (e.g. <|im_end|>, <|assistant|>).
+    _ROLE_RE = re.compile(
+        r"<\|(?:im_end|im_start|system|user|assistant)\|>"
+        r"|<\|?(?:im_end|im_start|user|assistant|system)[|\s>][^>]*>?",
+        re.I,
+    )
 
     def _clean_llm_buffer(self, text: str, partial: bool) -> str:
         """Apply the standard LLM output cleaning pipeline.
@@ -1028,9 +1047,16 @@ class DuplexAudioAgent:
         cleaned = re.sub(r"<think>.*?</think>", " ", cleaned, flags=re.DOTALL)
         if partial:
             cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL)
+        # Strip Qwen/chat-template role markers before the protocol tokens so
+        # e.g. "<|im_end|></s>" doesn't leave a dangling "</s>" behind.
+        cleaned = self._ROLE_RE.sub(" ", cleaned)
         for _tok in ("</s>", "<AI>", "<user>", "<s>", "<idle>"):
             cleaned = cleaned.replace(_tok, " ")
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        # Bare "idle" / "Idle" leading word means the model chose silence —
+        # same check as llm_generate_train's post-clean guard.
+        if re.match(r"^[Ii]dle\b", cleaned):
+            return ""
         return cleaned
 
     def _drain_stream_word_queue(self) -> None:
@@ -1161,10 +1187,32 @@ class DuplexAudioAgent:
     # LLM
     # ------------------------------------------------------------------
 
+    def _has_unanswered_user_turn(self) -> bool:
+        """True if the user has spoken since the bot last committed words.
+
+        Scans backwards through historical blocks: if we find user text before
+        we find any non-stale bot text, the user's turn is unanswered. This
+        catches cases where ASR assigns words to historical blocks without
+        triggering a context_version bump (e.g. fingerprint dedup suppressed
+        the flush), which would otherwise leave context_version stale and cause
+        _maybe_run_llm to exit on the version guard.
+        """
+        for blk in reversed(self.blocks):
+            if blk.assistant_text and not blk.assistant_text_stale:
+                return False  # bot spoke more recently than user
+            if blk.user_text:
+                return True
+        return False
+
     def _maybe_run_llm(self) -> None:
         if self._llm_in_flight:
             return
-        if self._last_accepted_response_context_version == self.context_version:
+        # Bypass the version guard if there's unanswered user speech: ASR may
+        # have assigned words to a historical block without bumping context_version
+        # (fingerprint dedup suppressed the flush). Without this bypass the bot
+        # stays silent until the user speaks again.
+        unanswered = self._has_unanswered_user_turn()
+        if not unanswered and self._last_accepted_response_context_version == self.context_version:
             return
         # If the last response was idle (empty), block re-calls within the same
         # block so we don't duplicate step records intra-block.
