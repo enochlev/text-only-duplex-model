@@ -265,6 +265,41 @@ def correct_idle_reward(
 
 
 # ---------------------------------------------------------------------------
+# Junk output penalty
+# ---------------------------------------------------------------------------
+
+# HTML tags, lone angle-bracket fragments, and Qwen function-call tokens that
+# the model generates when it "wants to be idle" but outputs text instead of EOS.
+# These are not TTS-speakable and should be penalised harder than a real
+# interruption so the model has a clear incentive to prefer EOS over junk.
+_JUNK_RE = _re.compile(
+    r'<[^>]{0,40}>'          # any HTML/XML tag   e.g. <i>idle</i>, <span>, <img>
+    r'|^[\s<>{}\[\]|]+$'     # line that is ONLY punctuation / brackets
+)
+
+
+def junk_output_penalty(
+    block: DuplexAudioBlock,
+    _history: List[DuplexAudioBlock],
+    _is_terminal: bool,
+) -> float:
+    """Extra penalty when the model outputs non-TTS-valid junk instead of speech.
+
+    The model occasionally generates HTML-like tokens (<i>idle</i>, <iidle>,
+    <ul>, <img>, <span class="idle">, <Funcion>) when it wants to stay silent
+    but doesn't produce EOS.  These receive the same RM2 interruption penalty
+    as real speech, giving the model no reason to prefer genuine responses over
+    garbage.  This RM adds an additional penalty to break that tie.
+    """
+    text = block.assistant_text
+    if not text:
+        return 0.0
+    if _JUNK_RE.search(text):
+        return -1.0
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # VAD clients
 # ---------------------------------------------------------------------------
 

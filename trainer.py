@@ -31,6 +31,7 @@ from trainer import (
     interruption_penalty_overlap,
     backchannel_loop_penalty,
     correct_idle_reward,
+    junk_output_penalty,
     make_default_data_pool,
     check_rm_servers,
     set_embed_device,
@@ -50,8 +51,11 @@ def main() -> None:
              "2 = skip SFT and go straight to RL (--model must already be SFT-trained).",
     )
     # SFT options
-    parser.add_argument("--sft-steps", type=int, default=200,
+    parser.add_argument("--sft-steps", type=int, default=150,
                         help="Max SFT steps (early-stops when EOS log-prob target is hit)")
+    parser.add_argument("--sft-target-eos-lp", type=float, default=-8.0,
+                        help="SFT early-stop: mean EOS log-prob target (default -8.0; "
+                             "-5.0 is safe but risks over-silencing)")
     parser.add_argument("--sft-lr", type=float, default=1e-6,
                         help="SFT learning rate (lower = less drift from base model)")
     parser.add_argument("--sft-output-dir", default="./sft_checkpoints",
@@ -93,6 +97,10 @@ def main() -> None:
         help="Pin the vLLM rollout engine to a specific GPU (e.g. 'cuda:0')",
     )
     parser.add_argument(
+        "--ref-model-device", default=None,
+        help="Device for the frozen KL reference model (defaults to --vllm-device then --device)",
+    )
+    parser.add_argument(
         "--embed-device", default="cpu",
         help="Device for the MiniLM embedding pass used to build the data pool index",
     )
@@ -112,6 +120,7 @@ def main() -> None:
             output_dir=args.sft_output_dir,
             learning_rate=args.sft_lr,
             max_steps=args.sft_steps,
+            target_eos_log_prob=args.sft_target_eos_lp,
             n_silence_examples=args.sft_examples,
             use_lora=args.use_lora,
             device=args.device,
@@ -155,7 +164,7 @@ def main() -> None:
         # without fighting against the silence behavior SFT taught.
         ref_model_name_or_path=rl_model_path,
         vllm_max_tokens=args.max_tokens,
-        vllm_temperature=1.0,
+        vllm_temperature=0.8,
         vllm_gpu_memory_utilization=args.gpu_mem,
         learning_rate=args.lr,
         kl_coeff=args.kl_coeff,
@@ -169,6 +178,7 @@ def main() -> None:
         debug=args.debug,
         debug_dir=args.debug_dir,
         vllm_device=args.vllm_device,
+        ref_model_device=args.ref_model_device,
     )
 
     reward_fns = [
@@ -177,8 +187,12 @@ def main() -> None:
         interruption_penalty_overlap,
         backchannel_loop_penalty,
         correct_idle_reward,
+        junk_output_penalty,
     ]
-    rl_cfg.reward_fn_weights = [1.0, 1.5, 1.0, 1.0, 2.0]
+    # Post-SFT rebalance: model already internalized silence (RM5 natural_fired ~50-70%),
+    # so RM1 (respond after turn) needs to be the dominant signal now.
+    # RM6 (junk) makes HTML/garbage tokens strictly worse than real interruptions.
+    rl_cfg.reward_fn_weights = [2.5, 1.5, 1.0, 1.0, 0.5, 1.5]
 
     print("\n" + "="*70)
     print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")

@@ -1271,7 +1271,19 @@ class FullDuplexRLTrainer:
             print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
 
             step = blk_to_step.get(blk.block_id)
-            if step is None or step.is_idle:
+            if step is None:
+                continue
+            if step.is_idle:
+                # Show idle-step reward inline so RM1/RM5 scoring is visible.
+                # Idle steps have no tokens so reward propagates via returns,
+                # not direct gradients — mark clearly so it's not confused with
+                # a backprop-able step.
+                if step.reward_breakdown:
+                    bd = step.reward_breakdown
+                    idle_parts = "  ".join(f"{k}={v:+.2f}" for k, v in bd.items() if v)
+                    if idle_parts:
+                        print(f"  [idle-reward]  {idle_parts}  | TOTAL={step.reward:+.3f}"
+                              f"  (no gradient — propagates via returns)")
                 continue
             if last_blk_of_step.get(id(step)) != blk.block_id:
                 continue  # print RM once, after the last covered block
