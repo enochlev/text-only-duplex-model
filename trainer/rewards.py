@@ -343,8 +343,9 @@ _JUNK_RE = _re.compile(
     r'|^[\s<>{}\[\]|]+$'     # line that is ONLY punctuation / brackets
     r'|\*\*'                  # **bold** markdown (double-asterisk)
     r'|```'                   # ``` code fence
-    r'|(?m)^#{1,6} '          # markdown headers  # H1 / ## H2 / ...
-    r'|(?m)^[-*] '            # bullet list items at start of line/response
+    r'|^#{1,6} '              # markdown headers  # H1 / ## H2 / ...
+    r'|^[-*] ',               # bullet list items at start of line/response
+    _re.MULTILINE,
 )
 
 
