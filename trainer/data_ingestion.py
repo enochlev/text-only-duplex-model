@@ -943,6 +943,6 @@ def make_default_data_pool(
         tts_model=tts_model,
         device=device,
     ))
-    weights.append(sum(weights) * 5)
+    weights.append(sum(weights) * 4)
 
     return DataPool(sources, weights=weights)
