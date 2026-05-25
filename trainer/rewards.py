@@ -42,10 +42,10 @@ def _silent_blocks_since_user_spoke(history: List[DuplexAudioBlock]) -> Optional
     """
     silent = 0
     for b in reversed(history):
-        if b.assistant_text:
-            return None  # bot already responded — intentional silence
+        if b.assistant_text and not b.user_text:
+            return None  # bot gave a clean response — subsequent silence is intentional
         if b.user_text:
-            return silent  # found where user last spoke
+            return silent  # found where user last spoke (overlap blocks count as user speech)
         silent += 1
     return None  # no user speech found in history
 

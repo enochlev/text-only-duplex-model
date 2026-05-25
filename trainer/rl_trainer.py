@@ -1312,11 +1312,6 @@ class FullDuplexRLTrainer:
                 b = b[:BW - 1] + "…"
             print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
 
-            # Mark blocks where the model chose to generate (decision point for speech steps).
-            # for sp in speech_source_steps.get(blk.block_id, []):
-            #     n_cov = len(sp.blocks_covered)
-            #     print(f"  [→ generated]  covers {n_cov} block(s) ahead")
-
             # Print idle-step rewards after the source block where each decision was made.
             for idle_step in idle_source_to_steps.get(blk.block_id, []):
                 if idle_step.reward_breakdown:
@@ -1343,8 +1338,11 @@ class FullDuplexRLTrainer:
                 kl_str = ""
             n_blks = len(step.blocks_covered)
             rm_label = "BLOCK_RM" if n_blks == 1 else f"STEP_RM(blks={n_blks})"
+            # Annotate with source block number so the decision point is visible.
+            src_blk_num = _block_idx.get(step.source_block_id, -1) + 1
+            src_note = f"  [decided @ blk {src_blk_num}]" if src_blk_num > 0 and src_blk_num != i else ""
             print(f"   {rm_parts} | {rm_label}={rm_sum:+.3f}{kl_str}"
-                  f" | TOTAL={step.reward or 0.0:+.3f} (post weighting)")
+                  f" | TOTAL={step.reward or 0.0:+.3f} (post weighting){src_note}")
 
         print(f"  {'─'*3}  {'─'*UW}  {'─'*BW}")
 
