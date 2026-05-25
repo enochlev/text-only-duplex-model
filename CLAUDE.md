@@ -123,13 +123,24 @@ Idle steps produce no tokens, so REINFORCE can't compute a gradient directly. Th
 
 ## 8. Reward Function Reference
 
-| # | Function | Rewards / Penalises | Key condition | Notes |
-|---|---|---|---|---|
-| RM1 | `respond_after_user_reward` | Penalises bot silence after user finishes a turn | `block.user_text == "" and block.assistant_text == ""`, lag from `_blocks_since_user_finished` | lag=1 → -1.0, lag=2 → -2.0, lag=3+ → -3.0 |
-| RM2 | `interruption_penalty` | Penalises speaking while the user is also speaking | Both `block.user_text` and `block.assistant_text` set | **First overlap free only if `history[-1].user_text` was empty** (user not speaking at source block T). run=1 true-interrupt → -0.5; run=2 → -0.5; run=3 → -1.0; run=4+ → -2.0 |
-| RM3 | `interruption_penalty_overlap` | Penalises audio overlap ratio | Requires real mic/TTS audio; falls back to 0 in text-only mode | penalty = -overlap_ratio (pyannote OSD) |
-| RM4 | `backchannel_loop_penalty` | Penalises consecutive backchannel-only responses | Exact + prefix backchannel matching against `_BACKCHANNELS` / `_BACKCHANNEL_PREFIXES` | Receives `aug_history` so run counts accumulate across covered blocks of the same step; run=1 free, run=2 → -0.5, run=3 → -1.0, etc. |
-| RM5 | `correct_idle_reward` | Rewards silence while user is mid-sentence | `block.assistant_text == ""` and `block.user_text != ""` and `not _user_finished_in(block)` | +0.5; only fires for idle steps (covered blocks always have assistant_text) |
+Active reward functions (`trainer.py`) in order, with weights `[1.5, 3.0, 1.5, 1.5, 0.75, 1.5]`:
+
+| # | Function | Weight | Step type | Fires when | Raw values | Weighted values |
+|---|---|---|---|---|---|---|
+| RM1 | `block_silence_penalty` | 1.5 | **Idle** | Bot stays silent after user finishes speaking | lag=0: −1.0 / lag=1: −2.0 / lag≥2: −3.0 | −1.5 / −3.0 / −4.5 |
+| RM2 | `block_interruption_penalty` | 3.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | run≤2: −0.5 / run=3: −1.0 / run≥4: −2.0 | −1.5 / −3.0 / −6.0 |
+| RM3 | `block_idle_reward` | 1.5 | **Idle** | Bot stays silent while user is mid-sentence AND user continues in the next block (post-episode lookahead) | +0.5 | +0.75 |
+| RM4 | `timely_response_reward` | 1.5 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +1.5 / +1.125 / +0.75 |
+| RM5 | `backchannel_loop_penalty` | 0.75 | **Speech** | Bot outputs a backchannel-only response. Single backchannel during user's mid-sentence is free. | mid-sentence run=1: 0.0 / post-turn run=1: −0.5 / run N: −0.5N | 0.0 / −0.375 / −0.375N |
+| RM6 | `junk_output_penalty` | 1.5 | **Speech** | Bot outputs HTML/junk tokens (`<idle>`, `<span>`, etc.) instead of speech text | −1.0 | −1.5 |
+
+`vad_overlap_penalty` (audio overlap via pyannote OSD) is defined but commented out — no-op in text-only simulation; re-enable for real audio.
+
+**Key interactions:**
+- RM1 + RM4 are complementary: RM1 penalises idle steps that delay a response; RM4 rewards the speech step that delivers it.
+- RM2 always receives **base history** (ends at source block T). This prevents T+2 from being penalised for T+1's overlap when both were committed before the user spoke.
+- RM3 uses **post-episode lookahead** to verify the user truly continued speaking (not just a gap before a new turn).
+- RM5 receives **augmented history** so consecutive-backchannel run counts accumulate correctly across all covered blocks of the same step.
 
 ---
 
@@ -143,7 +154,7 @@ Idle steps produce no tokens, so REINFORCE can't compute a gradient directly. Th
 
 ## 10. Known Issue — Fully-Idle Episodes
 
-Idle-step rewards (RM1/RM5) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the post-SFT RM rebalance (`rm_weights=[2.5,1.5,1.0,1.0,0.5,1.5]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
+Idle-step rewards (RM1/RM3) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the current RM weights (`[1.5, 3.0, 1.5, 1.5, 0.75, 1.5]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
 
 ---
 

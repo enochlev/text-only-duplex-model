@@ -155,6 +155,10 @@ def timely_response_reward(
     # Covered block itself is an overlap (user still speaking) — let RM2 handle.
     if block.user_text:
         return 0.0
+    # Backchannel-only or junk output is not a real response — RM5/RM6 cover those.
+    norm = _normalize_bot_text(block.assistant_text)
+    if _is_backchannel(norm) or _JUNK_RE.search(block.assistant_text):
+        return 0.0
     src = history[-1]
     if src.user_text:
         # Source had user speech. Only reward if the user actually finished there;

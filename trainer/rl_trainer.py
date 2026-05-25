@@ -162,7 +162,7 @@ class TrainerConfig:
     kl_coeff: float = 0.01
     """Soft KL penalty coefficient against rollout policy."""
 
-    baseline_ema_alpha: float = 0.05
+    baseline_ema_alpha: float = 0.07
     """EMA smoothing factor for the return baseline."""
 
     episodes_per_train_step: int = 4
