@@ -128,7 +128,7 @@ Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2
 | # | Function | Weight | Step type | Fires when | Raw values | Weighted values |
 |---|---|---|---|---|---|---|
 | RM1 | `block_silence_penalty` | 2.0 | **Idle** | Bot stays silent after user finishes speaking (capped at 2 blocks; model is force-idled beyond that) | lag=0: −1.0 / lag=1: −2.0 / lag≥2: 0.0 | −2.0 / −4.0 / 0.0 |
-| RM2 | `block_interruption_penalty` | 4.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | committed(run=1,silent src): 0.0 / true-interrupt(run=1): −0.5 / run=2: −1.0 / run=3: −1.5 / run≥4: −2.0 | 0.0 / −2.0 / −4.0 / −6.0 / −8.0 |
+| RM2 | `block_interruption_penalty` | 4.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | committed(run=1,silent src): 0.0 / true-interrupt(run=1): −0.75 / run=2: −1.0 / run=3: −1.5 / run≥4: −2.0 | 0.0 / −3.0 / −4.0 / −6.0 / −8.0 |
 | RM3 | `block_idle_reward` | 1.5 | **Idle** | Bot stays silent while user is mid-sentence AND user continues in the next block (post-episode lookahead) | +0.5 | +0.75 |
 | RM4 | `timely_response_reward` | 2.5 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +2.5 / +1.875 / +1.25 |
 | RM5 | `backchannel_loop_penalty` | 0.75 | **Speech** | Bot outputs a backchannel-only response. Single backchannel during user's mid-sentence is free. | mid-sentence run=1: 0.0 / post-turn run=1: −0.5 / run N: −0.5N | 0.0 / −0.375 / −0.375N |
@@ -166,6 +166,9 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
+| 2026-05-25 | RM2 run=2 raw penalty (`rewards.py`) | −0.5 | −1.0 | First conscious re-interrupt decision was as cheap as committed-overlap free pass |
+| 2026-05-25 | RM2 run=3 raw penalty (`rewards.py`) | −1.0 | −1.5 | Proportionate escalation after run=2 change |
+| 2026-05-25 | RM2 true-interrupt run=1 raw penalty (`rewards.py`) | −0.5 | −0.75 | Model learned overlap+response (+2.5 RM4) beats first-interrupt cost (-2.0); raising to -3.0 weighted makes it unprofitable |
 | 2026-05-25 | RM7 `missed_turn_penalty` added (`rewards.py`) | — | weight=2.0 | Direct speech-step gradient for skipping prior user turns; RM1 propagates too weakly |
 | 2026-05-25 | RM1 lag≥2 penalty (`rewards.py`) | −3.0 | 0.0 | Model force-idled beyond max_blocks_after_user_speech=2; perpetual -6.0/block was noise |
 | 2026-05-25 | `kl_ref_coeff` (`trainer.py`) | 0.075 | 0.04 | SFT ref model is silent; high KL coeff anchored student to silence, blocking RM4 |

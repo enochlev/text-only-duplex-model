@@ -95,7 +95,7 @@ def block_interruption_penalty(
     speaking typically arrives at run=2 — which is where the steep cliff starts.
 
       committed overlap  (run=1, source silent): 0.0  (free — no causal visibility)
-      true-interrupt     (run=1, source had user): -0.5
+      true-interrupt     (run=1, source had user): -0.75
       run=2: -1.0   run=3: -1.5   run=4+: -2.0
     """
     if not block.assistant_text or not block.user_text:
@@ -112,7 +112,7 @@ def block_interruption_penalty(
     if run == 1 and not source_had_user:
         return 0.0
     if run == 1:
-        return -0.5
+        return -0.75
     if run == 2:
         return -1.0
     if run == 3:

@@ -364,6 +364,17 @@ def build_app() -> gr.Blocks:
                 )
 
             def _go_session(s: dict):
+                # Safety: close any lingering client before opening a new one.
+                # _advance/_disc should have already done this, but guard edge cases.
+                old_c = s.get("client")
+                if old_c is not None:
+                    try:
+                        old_c.close()
+                    except Exception:
+                        pass
+                    s["client"] = None
+                s["t0"] = None
+
                 key = _key(s)
                 if not _acquire(key):
                     s["step"] = "waiting"
