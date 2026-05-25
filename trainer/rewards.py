@@ -447,9 +447,13 @@ _TERMINAL_PUNCT = frozenset(".!?…")
 
 
 def _text_turn_complete(text: str) -> bool:
-    """Heuristic: text ends with terminal punctuation and has at least 3 words."""
+    """Heuristic: text ends with terminal punctuation and has at least 2 words.
+
+    Minimum is 2 (not 1) so single-word fillers like "Yeah?" don't trigger it,
+    but short complete phrases like "they preferred?" or "Is it?" do.
+    """
     stripped = text.strip()
-    return bool(stripped) and stripped[-1] in _TERMINAL_PUNCT and len(stripped.split()) >= 3
+    return bool(stripped) and stripped[-1] in _TERMINAL_PUNCT and len(stripped.split()) >= 2
 
 
 def _user_finished_in(block: DuplexAudioBlock) -> bool:
