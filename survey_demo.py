@@ -1094,32 +1094,32 @@ def _survey_render(state: dict, *, transport_value=gr.skip()):
 
     return (
         state,
-        gr.update(visible=intro_visible),
-        gr.update(visible=presurvey_visible),
-        gr.update(visible=conversation_visible),
-        gr.update(visible=likert_visible),
-        gr.update(visible=comparison_visible),
-        gr.update(visible=thankyou_visible),
+        gr.Column(visible=intro_visible),
+        gr.Column(visible=presurvey_visible),
+        gr.Column(visible=conversation_visible),
+        gr.Column(visible=likert_visible),
+        gr.Column(visible=comparison_visible),
+        gr.Column(visible=thankyou_visible),
         _render_intro_status(state),
         _render_presurvey_header(state),
         _render_conversation_header(state),
         _render_prompt_panel(state),
         _render_indicator(state, survey=True, speaker_label=speaker_label),
         _render_transcript(state.get("snapshot"), speaker_label),
-        gr.update(interactive=conversation_visible and state.get("client") is not None),
+        gr.Audio(interactive=conversation_visible and state.get("client") is not None),
         transport_value,
         _render_likert_header(state),
-        gr.update(choices=LIKERT_CHOICES, value=_current_likert_value(state)),
+        gr.Radio(choices=LIKERT_CHOICES, value=_current_likert_value(state)),
         _render_comparison_header(state),
         _render_thankyou(state),
-        gr.update(choices=AGE_OPTIONS, value=demographics.get("age_range")),
-        gr.update(choices=YES_NO_OPTIONS, value=demographics.get("native_english")),
-        gr.update(choices=VOICE_ASSISTANT_USE_OPTIONS, value=demographics.get("voice_assistant_frequency")),
-        gr.update(choices=COMPARISON_OPTIONS["natural"], value=comparison.get("natural")),
-        gr.update(choices=COMPARISON_OPTIONS["interruptions"], value=comparison.get("interruptions")),
-        gr.update(choices=COMPARISON_OPTIONS["promptness"], value=comparison.get("promptness")),
-        gr.update(choices=COMPARISON_OPTIONS["overall"], value=comparison.get("overall")),
-        gr.update(value=comparison.get("free_text", "")),
+        gr.Radio(choices=AGE_OPTIONS, value=demographics.get("age_range")),
+        gr.Radio(choices=YES_NO_OPTIONS, value=demographics.get("native_english")),
+        gr.Radio(choices=VOICE_ASSISTANT_USE_OPTIONS, value=demographics.get("voice_assistant_frequency")),
+        gr.Radio(choices=COMPARISON_OPTIONS["natural"], value=comparison.get("natural")),
+        gr.Radio(choices=COMPARISON_OPTIONS["interruptions"], value=comparison.get("interruptions")),
+        gr.Radio(choices=COMPARISON_OPTIONS["promptness"], value=comparison.get("promptness")),
+        gr.Radio(choices=COMPARISON_OPTIONS["overall"], value=comparison.get("overall")),
+        gr.Textbox(value=comparison.get("free_text", "")),
     )
 
 
@@ -1127,11 +1127,11 @@ def _free_play_render(state: dict, *, transport_value=gr.skip()):
     model_name = MODEL_BY_KEY.get(state.get("current_model_key"), MODEL_CONFIGS[0])["name"]
     return (
         state,
-        gr.update(interactive=state.get("client") is not None),
+        gr.Audio(interactive=state.get("client") is not None),
         _render_free_play_status_card(state),
         _render_transcript(state.get("snapshot"), model_name),
-        gr.update(interactive=state.get("client") is None),
-        gr.update(interactive=state.get("client") is not None),
+        gr.Button(interactive=state.get("client") is None),
+        gr.Button(interactive=state.get("client") is not None),
         transport_value,
     )
 
@@ -1711,4 +1711,4 @@ def build_demo() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    build_demo().launch(theme=gr.themes.Soft())
+    build_demo().launch(theme=gr.themes.Soft(), share=  True)
