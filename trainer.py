@@ -20,6 +20,11 @@ Skip SFT (stage 2 only), e.g. after SFT is already done:
 import argparse
 import os
 
+# Reduce CUDA allocator fragmentation — must be set before any CUDA allocation.
+# expandable_segments lets PyTorch grow/shrink memory blocks rather than
+# carving fixed-size chunks, which prevents OOM from fragmentation.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from trainer import (
     FullDuplexRLTrainer,
     TrainerConfig,

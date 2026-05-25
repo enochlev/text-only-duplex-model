@@ -1134,10 +1134,14 @@ class FullDuplexRLTrainer:
             local_rank=vllm_local_rank,
         )
 
+        # foreach=False: prevents _multi_tensor_adamw from allocating a batch
+        # temporary buffer for all parameters simultaneously — avoids OOM spikes
+        # on GPUs with tight headroom. Slightly slower but identical numerics.
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=config.learning_rate, weight_decay=0.0
+            self.model.parameters(), lr=config.learning_rate, weight_decay=0.0,
+            foreach=False,
         )
-        print("[trainer] using fp32 AdamW")
+        print("[trainer] using fp32 AdamW (foreach=False)")
         self._baseline: float = 0.0
         self._step_count: int = 0
         self._total_episodes: int = 0
@@ -1719,6 +1723,9 @@ class FullDuplexRLTrainer:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.gradient_clip
             )
+            # Release reserved-but-unused cache before step so the optimizer's
+            # per-parameter allocations don't OOM on a fragmented heap.
+            torch.cuda.empty_cache()
             self.optimizer.step()
 
         # Sync updated weights → vLLM engine, then release fragmented cache
