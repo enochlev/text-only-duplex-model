@@ -235,6 +235,40 @@ _ULTRACHAT_EMBEDDINGS: Optional["np.ndarray"] = None  # shape (N, D), L2-normali
 _ULTRACHAT_MAX_CACHE = 100_000
 _ULTRACHAT_SIM_TOP_K = 100
 _ULTRACHAT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Imperative generation-task verbs — these produce prompts like "Write a blog post..."
+# which are not conversational and cause the model to go fully silent (no RM1 gradient path).
+_GENERATION_PREFIXES: frozenset = frozenset([
+    "write", "create", "design", "build", "generate", "compose",
+    "code", "program", "develop", "implement", "list", "draft",
+    "make", "produce", "construct", "formulate", "outline",
+    "summarize", "rewrite", "translate", "convert", "calculate",
+    "analyze", "analyse", "describe", "compare", "evaluate",
+])
+
+_ULTRACHAT_CONV_INDICES: Optional[List[int]] = None  # cached indices of conversational prompts
+_ULTRACHAT_CONV_SET: Optional[set] = None            # same as a set for O(1) lookup in _sample_similar_idx
+
+
+def _is_generation_task(text: str) -> bool:
+    """Return True for imperative generation tasks unsuitable for voice conversation."""
+    first = text.lower().split()[0].rstrip(".,;:!?") if text.split() else ""
+    return first in _GENERATION_PREFIXES
+
+
+def _get_conversational_indices() -> List[int]:
+    """Return (and cache) the indices of UltraChat prompts that are conversational questions."""
+    global _ULTRACHAT_CONV_INDICES, _ULTRACHAT_CONV_SET
+    if _ULTRACHAT_CONV_INDICES is not None:
+        return _ULTRACHAT_CONV_INDICES
+    prompts = _load_ultrachat_prompts()
+    _ULTRACHAT_CONV_INDICES = [i for i, p in enumerate(prompts) if not _is_generation_task(p)]
+    _ULTRACHAT_CONV_SET = set(_ULTRACHAT_CONV_INDICES)
+    n = len(_ULTRACHAT_CONV_INDICES)
+    print(f"[UltraChatTTSSource] {n}/{len(prompts)} prompts are conversational ({n / len(prompts) * 100:.0f}%)")
+    return _ULTRACHAT_CONV_INDICES
+
+
 # Use sentence-transformers<3.0 to avoid pulling in a newer torch:
 #   pip install "sentence-transformers<3.0"
 
@@ -356,18 +390,28 @@ def _sample_similar_idx(
     anchor_idx: int,
     k: int = _ULTRACHAT_SIM_TOP_K,
     temperature: float = 0.1,
+    valid_set: Optional[set] = None,
 ) -> int:
     """Return an index sampled from the top-k most similar prompts to anchor_idx.
 
     Cosine similarities (embeddings are pre-normalised, so this is a dot
     product) are converted to a probability distribution via temperature-scaled
     softmax.  Lower temperature → samples cluster near the top-1 neighbour.
+
+    If valid_set is provided, only indices in that set are eligible candidates.
     """
     import numpy as _np
     emb = _get_ultrachat_embeddings()
     scores = emb @ emb[anchor_idx]          # (N,) cosine similarities
     scores[anchor_idx] = -2.0               # exclude self
-    top_idx = _np.argpartition(scores, -k)[-k:]
+    if valid_set is not None:
+        mask = _np.zeros(len(scores), dtype=bool)
+        mask[list(valid_set)] = True
+        mask[anchor_idx] = False
+        scores[~mask] = -2.0
+    top_k = min(k, int((scores > -1.5).sum()))
+    top_k = max(top_k, 1)
+    top_idx = _np.argpartition(scores, -top_k)[-top_k:]
     top_scores = scores[top_idx] / temperature
     top_scores -= top_scores.max()          # numerical stability
     probs = _np.exp(top_scores)
@@ -412,11 +456,12 @@ class UltraChatTTSSource:
 
     def load(self) -> EpisodeData:
         prompts = _load_ultrachat_prompts()
-        idx1 = random.randrange(len(prompts))
-        idx2 = _sample_similar_idx(idx1, temperature=self.similarity_temperature)
+        conv = _get_conversational_indices()  # also populates _ULTRACHAT_CONV_SET
+        idx1 = random.choice(conv)
+        idx2 = _sample_similar_idx(idx1, temperature=self.similarity_temperature, valid_set=_ULTRACHAT_CONV_SET)
         lines = [prompts[idx1], prompts[idx2]]
         if random.random() < 0.5:
-            idx3 = _sample_similar_idx(idx2, temperature=self.similarity_temperature)
+            idx3 = _sample_similar_idx(idx2, temperature=self.similarity_temperature, valid_set=_ULTRACHAT_CONV_SET)
             lines.append(prompts[idx3])
         return ScriptTTSSource(
             script_lines=lines,
