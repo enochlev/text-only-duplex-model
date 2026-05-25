@@ -37,6 +37,7 @@ from trainer import (
     timely_response_reward,
     backchannel_loop_penalty,
     junk_output_penalty,
+    missed_turn_penalty,
     make_default_data_pool,
     check_rm_servers,
     set_embed_device,
@@ -194,17 +195,20 @@ def main() -> None:
         # vad_overlap_penalty,  # audio-only; no-op in text-only sim — re-enable for real audio
         backchannel_loop_penalty,
         junk_output_penalty,
+        missed_turn_penalty,
     ]
-    # RM1=block_silence_penalty       weight=2.0  lag=0→-2.0  lag=1→-4.0  lag≥2→-6.0
+    # RM1=block_silence_penalty       weight=2.0  lag=0→-2.0  lag=1→-4.0  lag≥2→0.0
     # RM2=block_interruption_penalty  weight=4.0  run=1(true)→-2.0  run=2→-4.0  run=3→-6.0  run≥4→-8.0
     # RM3=block_idle_reward           weight=1.5  mid-sentence silence → +0.75
     # RM4=timely_response_reward      weight=2.5  lag=0→+2.5  lag=1→+1.875  lag=2→+1.25
     # RM5=backchannel_loop_penalty    weight=0.75 post-turn run=1→-0.375; run=N→-0.375N
     # RM6=junk_output_penalty         weight=1.5  junk tokens → -1.5
+    # RM7=missed_turn_penalty         weight=2.0  1 skipped turn→-2.0  2→-4.0  N→-2.0N
     # Note: RM4 does NOT fire for backchannel or junk blocks (guards in timely_response_reward).
+    # RM7 uses base history (like RM2) so prior covered blocks don't break the turn count.
     # 2026-05-25: RM1 1.5→2.0, RM4 1.5→2.5 — model converged to silence; RM4 now clearly
     #             outweighs the fear of RM2 interrupt risk (+2.5 vs -2.0), breaking the equilibrium.
-    rl_cfg.reward_fn_weights = [2.0, 4.0, 1.5, 2.5, 0.75, 1.5]
+    rl_cfg.reward_fn_weights = [2.0, 4.0, 1.5, 2.5, 0.75, 1.5, 2.0]
 
     print("\n" + "="*70)
     print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")

@@ -371,6 +371,47 @@ def junk_output_penalty(
 
 
 # ---------------------------------------------------------------------------
+# Missed-turn penalty
+# ---------------------------------------------------------------------------
+
+def missed_turn_penalty(
+    block: DuplexAudioBlock,
+    history: List[DuplexAudioBlock],
+    _is_terminal: bool,
+) -> float:
+    """Penalise a speech step that skips one or more prior unanswered user turns.
+
+    When the bot finally speaks, count distinct user turns that elapsed since
+    its last response (or episode start). Each skipped turn costs -1.0.
+
+    Fires on speech steps only → direct REINFORCE gradient, unlike RM1 which
+    propagates weakly through returns. Uses base history (ending at source
+    block T) so prior covered blocks from the same LLM call don't break the count.
+
+    A "user turn" starts when user_text appears after silence or bot speech.
+    The current turn being responded to does not count as skipped.
+    Any committed bot text (stale or not) resets the count.
+    """
+    if not block.assistant_text:
+        return 0.0
+
+    skipped = 0
+    in_user_turn = False
+    for b in reversed(history):
+        if b.assistant_text:
+            break  # any prior bot speech (stale or not) resets the window
+        if b.user_text:
+            if not in_user_turn:
+                skipped += 1
+                in_user_turn = True
+        else:
+            in_user_turn = False
+
+    skipped = max(0, skipped - 1)  # the current turn is being answered, not skipped
+    return -1.0 * skipped
+
+
+# ---------------------------------------------------------------------------
 # VAD clients
 # ---------------------------------------------------------------------------
 

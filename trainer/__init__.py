@@ -23,6 +23,7 @@ from .rewards import (
     vad_overlap_penalty,
     backchannel_loop_penalty,
     junk_output_penalty,
+    missed_turn_penalty,
     check_rm_servers,
 )
 from .data_ingestion import (
@@ -60,6 +61,7 @@ __all__ = [
     "vad_overlap_penalty",
     "backchannel_loop_penalty",
     "junk_output_penalty",
+    "missed_turn_penalty",
     "check_rm_servers",
     # data_ingestion
     "EpisodeData",

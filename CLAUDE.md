@@ -123,7 +123,7 @@ Idle steps produce no tokens, so REINFORCE can't compute a gradient directly. Th
 
 ## 8. Reward Function Reference
 
-Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2.5, 0.75, 1.5]`:
+Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2.5, 0.75, 1.5, 2.0]`:
 
 | # | Function | Weight | Step type | Fires when | Raw values | Weighted values |
 |---|---|---|---|---|---|---|
@@ -133,12 +133,14 @@ Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2
 | RM4 | `timely_response_reward` | 2.5 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +2.5 / +1.875 / +1.25 |
 | RM5 | `backchannel_loop_penalty` | 0.75 | **Speech** | Bot outputs a backchannel-only response. Single backchannel during user's mid-sentence is free. | mid-sentence run=1: 0.0 / post-turn run=1: −0.5 / run N: −0.5N | 0.0 / −0.375 / −0.375N |
 | RM6 | `junk_output_penalty` | 1.5 | **Speech** | Bot outputs HTML/junk tokens (`<idle>`, `<span>`, etc.) instead of speech text | −1.0 | −1.5 |
+| RM7 | `missed_turn_penalty` | 2.0 | **Speech** | Bot speech step follows N unanswered prior user turns. Each skipped turn costs −1.0. Current turn being answered does not count. Uses base history. | N skipped: −N | −2.0 per skipped turn |
 
 `vad_overlap_penalty` (audio overlap via pyannote OSD) is defined but commented out — no-op in text-only simulation; re-enable for real audio.
 
 **Key interactions:**
 - RM1 + RM4 are complementary: RM1 penalises idle steps that delay a response; RM4 rewards the speech step that delivers it.
-- RM2 always receives **base history** (ends at source block T). This prevents T+2 from being penalised for T+1's overlap when both were committed before the user spoke.
+- RM7 is the speech-step complement to RM1: it creates a **direct gradient** on the speech step for having skipped prior turns, which RM1 cannot do (RM1 only propagates via returns through idle steps). Responding to Q1 and Q2 earns RM7=0 both times; skipping Q1 and responding only to Q2 earns RM7=−2.0 on the Q2 speech step.
+- RM2 and RM7 both receive **base history** (ends at source block T). RM7 uses base history so prior covered blocks from the same LLM call don't falsely break the unanswered-turn count.
 - RM3 uses **post-episode lookahead** to verify the user truly continued speaking (not just a gap before a new turn).
 - RM5 receives **augmented history** so consecutive-backchannel run counts accumulate correctly across all covered blocks of the same step.
 
@@ -164,6 +166,7 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
+| 2026-05-25 | RM7 `missed_turn_penalty` added (`rewards.py`) | — | weight=2.0 | Direct speech-step gradient for skipping prior user turns; RM1 propagates too weakly |
 | 2026-05-25 | RM1 lag≥2 penalty (`rewards.py`) | −3.0 | 0.0 | Model force-idled beyond max_blocks_after_user_speech=2; perpetual -6.0/block was noise |
 | 2026-05-25 | `kl_ref_coeff` (`trainer.py`) | 0.075 | 0.04 | SFT ref model is silent; high KL coeff anchored student to silence, blocking RM4 |
 | 2026-05-25 | `vllm_temperature` (`trainer.py`) | 0.8 | 1.0 | Low temp sharpened EOS distribution; 1.0 restores natural sampling variance |

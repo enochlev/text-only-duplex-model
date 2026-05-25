@@ -1,7 +1,9 @@
 import json
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from full_duplex import DuplexAudioAgent, TTS_SAMPLE_RATE
 from server import create_app
@@ -61,3 +63,21 @@ def test_server_user_text_message_updates_snapshot():
 
             assert snapshot["snapshot"]["context_version"] == 1
             assert snapshot["snapshot"]["current_block"]["user_text"] == "hello there"
+
+
+def test_server_closes_websocket_after_audio_idle_timeout():
+    app = create_app(
+        agent_factory=make_agent,
+        poll_interval_s=0.01,
+        audio_idle_timeout_s=0.05,
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_text(json.dumps({"type": "hello", "client": "pytest"}))
+            json.loads(websocket.receive_text())
+            _recv_until_snapshot(websocket)
+
+            with pytest.raises(WebSocketDisconnect):
+                while True:
+                    websocket.receive_text()

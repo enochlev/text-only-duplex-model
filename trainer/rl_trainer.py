@@ -1461,7 +1461,7 @@ class FullDuplexRLTrainer:
                 for fn, w in zip(self.reward_fns, self.rm_weights):
                     fn_total = 0.0
                     for blk_pos, block in enumerate(covered):
-                        h = (history if fn.__name__ == "block_interruption_penalty"
+                        h = (history if fn.__name__ in ("block_interruption_penalty", "missed_turn_penalty")
                              else history + covered[:blk_pos])
                         fn_total += w * fn(block, h, is_terminal)
                     breakdown[fn.__name__] = fn_total
@@ -1493,7 +1493,8 @@ class FullDuplexRLTrainer:
                     # isn't penalised for T+1's (committed at the same decision point).
                     # All other RMs get augmented history so consecutive-backchannel
                     # run counts accumulate correctly across covered blocks.
-                    h = history if fn.__name__ == "block_interruption_penalty" else history + covered[:blk_pos]
+                    h = (history if fn.__name__ in ("block_interruption_penalty", "missed_turn_penalty")
+                         else history + covered[:blk_pos])
                     fn_total += w * _call_fn(fn, block, h, is_terminal)
                 breakdown[fn.__name__] = fn_total
                 total += fn_total

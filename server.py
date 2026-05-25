@@ -31,6 +31,7 @@ from full_duplex import (
 
 POLL_INTERVAL_S = 0.08
 SESSION_TTL_S = 900.0
+AUDIO_IDLE_TIMEOUT_S = 20.0
 
 
 class DuplexSession:
@@ -42,6 +43,7 @@ class DuplexSession:
         self.session_id = session_id
         self.started_at = time.time()
         self.last_active_at = self.started_at
+        self.last_audio_activity_at = self.started_at
         self.agent = agent_factory()
         self.lock = threading.Lock()
         self._last_snapshot_key = None
@@ -49,6 +51,14 @@ class DuplexSession:
 
     def _touch(self) -> None:
         self.last_active_at = time.time()
+
+    def _mark_audio_activity(self) -> None:
+        now = time.time()
+        self.last_active_at = now
+        self.last_audio_activity_at = now
+
+    def audio_idle_expired(self, timeout_s: float) -> bool:
+        return (time.time() - self.last_audio_activity_at) >= timeout_s
 
     def _warning_event(self) -> Optional[dict]:
         if (
@@ -84,6 +94,7 @@ class DuplexSession:
         sample_rate, audio_array = audio_chunk
         if not should_emit_audio_chunk(audio_array):
             return None
+        self._mark_audio_activity()
         payload = encode_audio_payload(
             sample_rate,
             audio_array,
@@ -96,6 +107,8 @@ class DuplexSession:
 
     def receive_audio(self, sample_rate: int, audio_array: np.ndarray) -> list[dict]:
         self._touch()
+        if should_emit_audio_chunk(audio_array):
+            self._mark_audio_activity()
         with self.lock:
             audio_chunk = self.agent.receive_mic_chunk(sample_rate, audio_array)
             events = []
@@ -205,6 +218,7 @@ def create_app(
     *,
     agent_factory: Optional[Callable[[], DuplexAudioAgent]] = None,
     poll_interval_s: float = POLL_INTERVAL_S,
+    audio_idle_timeout_s: float = AUDIO_IDLE_TIMEOUT_S,
 ) -> FastAPI:
     resolved_factory = agent_factory or DuplexAudioAgent
     manager = SessionManager(resolved_factory)
@@ -259,6 +273,10 @@ def create_app(
                     events = await asyncio.to_thread(session.poll)
                     if events:
                         await send_events(events)
+                    if session.audio_idle_expired(audio_idle_timeout_s):
+                        stop_event.set()
+                        await websocket.close(code=1000, reason="Audio idle timeout")
+                        return
                     await asyncio.sleep(poll_interval_s)
 
             poll_task = asyncio.create_task(poll_loop())
@@ -294,9 +312,10 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await poll_task
         except WebSocketDisconnect:
+            return
+        finally:
             if session is not None:
                 await asyncio.to_thread(manager.remove, session.session_id)
-            return
 
     return app
 
