@@ -380,10 +380,11 @@ class VirtualSimulationConnection:
             # RM5 lookahead works correctly.  When user has already stopped, use the
             # CURRENT block so each call gets its own display row and escalating penalty.
             def _src_id() -> Optional[str]:
+                # LLM is called between block commits so _current_block is None;
+                # use the most recently committed block as the per-call source ID.
                 if blocks_since_user_spoke[0] == 0:
                     return agent._latest_user_source_block_id
-                cur = agent._current_block
-                return cur.block_id if cur else agent._latest_user_source_block_id
+                return agent.blocks[-1].block_id if agent.blocks else agent._latest_user_source_block_id
 
             if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
                 # Outside the speaking window — force idle without vLLM call.
@@ -623,10 +624,11 @@ class RealTimeGPTEpisodeRunner:
                 blocks_since_user_spoke[0] += 1
 
             def _src_id() -> Optional[str]:
+                # LLM is called between block commits so _current_block is None;
+                # use the most recently committed block as the per-call source ID.
                 if blocks_since_user_spoke[0] == 0:
                     return agent._latest_user_source_block_id
-                cur = agent._current_block
-                return cur.block_id if cur else agent._latest_user_source_block_id
+                return agent.blocks[-1].block_id if agent.blocks else agent._latest_user_source_block_id
 
             if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
                 steps.append(StepRecord(
