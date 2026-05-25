@@ -1313,9 +1313,9 @@ class FullDuplexRLTrainer:
             print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
 
             # Mark blocks where the model chose to generate (decision point for speech steps).
-            for sp in speech_source_steps.get(blk.block_id, []):
-                n_cov = len(sp.blocks_covered)
-                print(f"  [→ generated]  covers {n_cov} block(s) ahead")
+            # for sp in speech_source_steps.get(blk.block_id, []):
+            #     n_cov = len(sp.blocks_covered)
+            #     print(f"  [→ generated]  covers {n_cov} block(s) ahead")
 
             # Print idle-step rewards after the source block where each decision was made.
             for idle_step in idle_source_to_steps.get(blk.block_id, []):
@@ -1343,7 +1343,7 @@ class FullDuplexRLTrainer:
                 kl_str = ""
             n_blks = len(step.blocks_covered)
             rm_label = "BLOCK_RM" if n_blks == 1 else f"STEP_RM(blks={n_blks})"
-            print(f"  {rm_parts} | {rm_label}={rm_sum:+.3f}{kl_str}"
+            print(f"   {rm_parts} | {rm_label}={rm_sum:+.3f}{kl_str}"
                   f" | TOTAL={step.reward or 0.0:+.3f} (post weighting)")
 
         print(f"  {'─'*3}  {'─'*UW}  {'─'*BW}")
@@ -1391,6 +1391,12 @@ class FullDuplexRLTrainer:
 
             src_blk = hist[-1]
             next_blk = episode.blocks[pos] if pos < len(episode.blocks) else None
+
+            # If the model already spoke at the source block (words committed from an
+            # earlier queued generation), this idle call was redundant — do not double-
+            # penalize for silence that didn't actually occur.
+            if src_blk.assistant_text:
+                return 0.0, {}
 
             from full_duplex import DuplexAudioBlock as _DAB
             silent_blk = _DAB(block_id="__idle__", start_ts=0.0, end_ts=0.0,
