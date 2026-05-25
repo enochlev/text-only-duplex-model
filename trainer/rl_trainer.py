@@ -47,6 +47,8 @@ except ImportError:
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from safetensors.torch import save_file as _safetensors_save
+
 from .training_utils import load_hf_model
 
 from full_duplex import (
@@ -1808,16 +1810,26 @@ class FullDuplexRLTrainer:
 
         best_dir = os.path.join(self.config.output_dir, "best")
         os.makedirs(best_dir, exist_ok=True)
-        weights_path = os.path.join(best_dir, "model_weights.pt")
 
         # Delete previous best weights before writing the new one.
         if self._best_checkpoint_path and os.path.exists(self._best_checkpoint_path):
             os.remove(self._best_checkpoint_path)
 
-        # Cast to fp16 in-place temporarily — avoids a full copy when possible.
-        state_dict_fp16 = {k: v.half() for k, v in self.model.state_dict().items()}
-        torch.save(state_dict_fp16, weights_path)
+        # Always convert on CPU to avoid allocating a second copy on the GPU.
+        torch.cuda.empty_cache()
+        state_dict_fp16 = {
+            k: v.detach().to("cpu", dtype=torch.float16)
+            for k, v in self.model.state_dict().items()
+        }
+
+        weights_path = os.path.join(best_dir, "model.safetensors")
+        _safetensors_save(state_dict_fp16, weights_path)
         del state_dict_fp16
+
+        # Write config.json once so the dir is directly loadable by HF.
+        cfg_marker = os.path.join(best_dir, "config.json")
+        if not os.path.exists(cfg_marker):
+            self.model.config.save_pretrained(best_dir)
 
         # Tokenizer is tiny; write it once so the checkpoint is self-contained.
         tok_marker = os.path.join(best_dir, "tokenizer_config.json")
