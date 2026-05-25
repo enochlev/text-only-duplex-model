@@ -396,6 +396,10 @@ class DuplexAudioAgent:
         self._pending_response_source_block_id: Optional[str] = None
         self._latest_user_source_block_id: Optional[str] = None
         self._last_accepted_response_context_version: Optional[int] = None
+        # Number of committed blocks at the time of the last idle (empty) response.
+        # Prevents duplicate LLM calls within the same block period when the model
+        # chose silence but _last_accepted_response_context_version is not set.
+        self._last_idle_call_n_blocks: int = -1
         self._last_ctx_flush_user_fingerprint: str = ""
         self.last_llm_error: Optional[str] = None
         self.last_llm_error_seq: int = 0
@@ -1162,6 +1166,10 @@ class DuplexAudioAgent:
             return
         if self._last_accepted_response_context_version == self.context_version:
             return
+        # If the last response was idle (empty), block re-calls within the same
+        # block so we don't duplicate step records intra-block.
+        if self._last_idle_call_n_blocks == len(self.blocks):
+            return
         has_user_input = any(b.user_text for b in self.blocks)
         if not has_user_input and (
             self._current_block is None or not self._current_block.user_text
@@ -1218,7 +1226,14 @@ class DuplexAudioAgent:
             if not proposal_words:
                 self._clear_pending_response_timing()
                 self._pending_words = []
-                self._last_accepted_response_context_version = generation_context_version
+                # Do NOT set _last_accepted_response_context_version here.
+                # For idle (empty) responses the model chose silence; subsequent
+                # blocks within _within_generation_window() should still be
+                # allowed to call the LLM so that escalating RM1 penalties can
+                # fire if the model keeps failing to respond.
+                # Use block-count guard to prevent duplicate calls within the
+                # same block period (intra-block poll ticks).
+                self._last_idle_call_n_blocks = len(self.blocks)
                 return
 
             source_block = self._get_block_by_id(generation_source_block_id)
