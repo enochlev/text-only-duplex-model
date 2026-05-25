@@ -53,20 +53,22 @@ def respond_after_user_reward(
 ) -> float:
     """Penalise bot silence after the user finishes a turn.
 
-    lag=1 (first silent block): -1.0
-    lag=2: -2.0
-    lag=3+: -3.0
+    lag=1: 0.0  — free recovery window; wrong decision was made when user was finishing,
+                  but the model gets one block to correct course without extra punishment.
+    lag=2: -1.0
+    lag=3: -2.0
+    lag=4+: -3.0
 
     No penalty while the user is still speaking or the bot already responded.
     """
     if block.user_text or block.assistant_text:
         return 0.0
     lag = _blocks_since_user_finished(history)
-    if lag is None:
+    if lag is None or lag <= 1:
         return 0.0
-    if lag == 1:
-        return -1.0
     if lag == 2:
+        return -1.0
+    if lag == 3:
         return -2.0
     return -3.0
 

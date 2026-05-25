@@ -1222,12 +1222,13 @@ class FullDuplexRLTrainer:
         rm_names = [fn.__name__ for fn in self.reward_fns]
 
         # Map block_id → the step that covers it (speech steps).
-        # Idle steps have no covered blocks — map them by source_block_id instead.
+        # Idle steps have no covered blocks — group them by source_block_id (multiple
+        # idle steps can share the same source block when the window spans several calls).
         blk_to_step: Dict[str, "StepRecord"] = {}
-        idle_source_to_step: Dict[str, "StepRecord"] = {}
+        idle_source_to_steps: Dict[str, List["StepRecord"]] = {}
         for step in episode.steps:
             if step.is_idle:
-                idle_source_to_step[step.source_block_id] = step
+                idle_source_to_steps.setdefault(step.source_block_id, []).append(step)
             else:
                 for bid in step.blocks_covered:
                     blk_to_step[bid] = step
@@ -1274,14 +1275,14 @@ class FullDuplexRLTrainer:
                 b = b[:BW - 1] + "…"
             print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
 
-            # Print idle-step reward after the source block where the decision was made.
-            idle_step = idle_source_to_step.get(blk.block_id)
-            if idle_step is not None and idle_step.reward_breakdown:
-                bd = idle_step.reward_breakdown
-                idle_parts = "  ".join(f"{k}={v:+.2f}" for k, v in bd.items() if v)
-                if idle_parts:
-                    print(f"  [idle-reward]  {idle_parts}  | TOTAL={idle_step.reward:+.3f}"
-                          f"  (no gradient — propagates via returns)")
+            # Print idle-step rewards after the source block where each decision was made.
+            for idle_step in idle_source_to_steps.get(blk.block_id, []):
+                if idle_step.reward_breakdown:
+                    bd = idle_step.reward_breakdown
+                    idle_parts = "  ".join(f"{k}={v:+.2f}" for k, v in bd.items() if v)
+                    if idle_parts:
+                        print(f"  [idle-reward]  {idle_parts}  | TOTAL={idle_step.reward:+.3f}"
+                              f"  (no gradient — propagates via returns)")
 
             step = blk_to_step.get(blk.block_id)
             if step is None:
@@ -1328,11 +1329,14 @@ class FullDuplexRLTrainer:
             return fn(block, hist, terminal)
 
         def _idle_rm1_reward(step: "StepRecord") -> Tuple[float, Dict[str, float]]:
-            """Apply respond_after_user_reward directly to an idle step.
+            """Apply RM1/RM5 directly to an idle step.
 
             Silence has no token output so REINFORCE can't compute a gradient
             for this step, but setting its reward propagates back through
             _compute_returns and reduces the advantage of preceding speech steps.
+
+            Uses a synthetic DuplexAudioBlock (no audio) so we can call the
+            real reward functions and stay consistent with speech-step scoring.
             """
             pos = (
                 _block_idx[step.source_block_id] + 1
@@ -1342,26 +1346,32 @@ class FullDuplexRLTrainer:
             hist = episode.blocks[:pos]
             if len(hist) < 2:
                 return 0.0, {}
+
+            # Synthetic block: no assistant text (idle), but carry user_text from
+            # the source block so RM5 can detect mid-sentence user speech.
+            from full_duplex import DuplexAudioBlock as _DAB
+            src_blk = episode.blocks[pos - 1] if pos > 0 else None
+            src_user = src_blk.user_text if src_blk else ""
+            silent_blk = _DAB(block_id="__idle__", user_text=src_user, assistant_text="")
+
             rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
+            rm5_w = self.rm_weights[4] if len(self.rm_weights) > 4 else 1.0
             reward = 0.0
             breakdown: Dict[str, float] = {}
-            last_finished = _user_finished_in(hist[-1])
-            # lag=1: user just finished, first missed window → -1.0
-            if last_finished:
-                penalty = rm1_w * (-1.0)
-                reward += penalty
-                breakdown["respond_after_user_reward"] = penalty
-            # lag=2: user finished two blocks ago, still idle → -2.0
-            elif len(hist) >= 3 and _user_finished_in(hist[-2]):
-                penalty = rm1_w * (-2.0)
-                reward += penalty
-                breakdown["respond_after_user_reward"] = penalty
-            # RM5: reward idle while user is actively mid-sentence
-            if hist[-1].user_text and not last_finished:
-                rm5_w = self.rm_weights[4] if len(self.rm_weights) > 4 else 1.0
-                bonus = rm5_w * 0.5
-                reward += bonus
-                breakdown["correct_idle_reward"] = bonus
+
+            from .rewards import respond_after_user_reward as _rm1, correct_idle_reward as _rm5
+            raw1 = _rm1(silent_blk, hist, False)
+            if raw1:
+                weighted = rm1_w * raw1
+                reward += weighted
+                breakdown["respond_after_user_reward"] = weighted
+
+            raw5 = _rm5(silent_blk, hist, False)
+            if raw5:
+                weighted = rm5_w * raw5
+                reward += weighted
+                breakdown["correct_idle_reward"] = weighted
+
             return reward, breakdown
 
         if self.config.debug:
