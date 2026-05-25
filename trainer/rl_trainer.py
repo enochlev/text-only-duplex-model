@@ -1352,7 +1352,7 @@ class FullDuplexRLTrainer:
             from full_duplex import DuplexAudioBlock as _DAB
             src_blk = episode.blocks[pos - 1] if pos > 0 else None
             src_user = src_blk.user_text if src_blk else ""
-            silent_blk = _DAB(block_id="__idle__", user_text=src_user, assistant_text="")
+            silent_blk = _DAB(block_id="__idle__", start_ts=0.0, end_ts=0.0, user_text=src_user, assistant_text="")
 
             rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
             rm5_w = self.rm_weights[4] if len(self.rm_weights) > 4 else 1.0
