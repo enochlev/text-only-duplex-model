@@ -1329,14 +1329,14 @@ class FullDuplexRLTrainer:
             return fn(block, hist, terminal)
 
         def _idle_rm1_reward(step: "StepRecord") -> Tuple[float, Dict[str, float]]:
-            """Apply RM1/RM5 directly to an idle step.
+            """Score an idle step using all reward functions with post-episode lookahead.
 
-            Silence has no token output so REINFORCE can't compute a gradient
-            for this step, but setting its reward propagates back through
-            _compute_returns and reduces the advantage of preceding speech steps.
+            Scoring is post-episode so we can look at episode.blocks[pos] (the block
+            AFTER the decision) to determine whether the user continued speaking or
+            stopped — replacing the unreliable lookbehind heuristic.
 
-            Uses a synthetic DuplexAudioBlock (no audio) so we can call the
-            real reward functions and stay consistent with speech-step scoring.
+            Silence produces no tokens so REINFORCE can't compute a gradient here;
+            the reward propagates back via _compute_returns onto adjacent speech steps.
             """
             pos = (
                 _block_idx[step.source_block_id] + 1
@@ -1344,37 +1344,52 @@ class FullDuplexRLTrainer:
                 else len(episode.blocks)
             )
             hist = episode.blocks[:pos]
-            if len(hist) < 2:
+            if not hist:
                 return 0.0, {}
 
-            # Synthetic block: no assistant text (idle), but carry user_text from
-            # the source block so RM5 can detect mid-sentence user speech.
-            from full_duplex import DuplexAudioBlock as _DAB
-            src_blk = episode.blocks[pos - 1] if pos > 0 else None
-            src_user = src_blk.user_text if src_blk else ""
-            silent_blk = _DAB(block_id="__idle__", start_ts=0.0, end_ts=0.0, user_text=src_user, assistant_text="")
+            src_blk = hist[-1]
+            next_blk = episode.blocks[pos] if pos < len(episode.blocks) else None
 
-            rm1_w = self.rm_weights[0] if self.rm_weights else 1.0
-            rm5_w = self.rm_weights[4] if len(self.rm_weights) > 4 else 1.0
-            reward = 0.0
+            from full_duplex import DuplexAudioBlock as _DAB
+            silent_blk = _DAB(block_id="__idle__", start_ts=0.0, end_ts=0.0,
+                              user_text=src_blk.user_text, assistant_text="")
+
+            total = 0.0
             breakdown: Dict[str, float] = {}
 
-            from .rewards import block_silence_penalty as _rm1, block_idle_reward as _rm5
-            raw1 = _rm1(silent_blk, hist, False)
-            if raw1:
-                weighted = rm1_w * raw1
-                reward += weighted
-                breakdown["block_silence_penalty"] = weighted
+            for fn, w in zip(self.reward_fns, self.rm_weights):
+                if fn.__name__ == "block_idle_reward":
+                    # Lookahead: reward silence only if user continued speaking next block.
+                    if src_blk.user_text and next_blk and next_blk.user_text:
+                        val = w * 0.5
+                        total += val
+                        breakdown["block_idle_reward"] = val
 
-            # Pass hist[:-1] so that history[-1] inside block_idle_reward is the block
-            # BEFORE the source block — confirming user was already speaking there.
-            raw5 = _rm5(silent_blk, hist[:-1], False)
-            if raw5:
-                weighted = rm5_w * raw5
-                reward += weighted
-                breakdown["block_idle_reward"] = weighted
+                elif fn.__name__ == "block_silence_penalty":
+                    if src_blk.user_text and (next_blk is None or not next_blk.user_text):
+                        # User just finished at source block — penalize immediately.
+                        val = w * (-1.0)
+                        total += val
+                        breakdown["block_silence_penalty"] = val
+                    elif not src_blk.user_text:
+                        # User already stopped before source — history-based lag penalty.
+                        raw = fn(silent_blk, hist, False)
+                        if raw:
+                            val = w * raw
+                            total += val
+                            breakdown["block_silence_penalty"] = val
 
-            return reward, breakdown
+                else:
+                    # All other RMs (block_interruption_penalty, vad_overlap_penalty,
+                    # backchannel_loop_penalty, junk_output_penalty) all check
+                    # block.assistant_text first and return 0 for idle blocks.
+                    raw = fn(silent_blk, hist, False)
+                    if raw:
+                        val = w * raw
+                        total += val
+                        breakdown[fn.__name__] = val
+
+            return total, breakdown
 
         if self.config.debug:
             # Score all steps first (no printing), then render one combined table.

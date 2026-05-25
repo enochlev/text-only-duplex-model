@@ -115,20 +115,18 @@ def block_interruption_penalty(
 
 def block_idle_reward(
     block: DuplexAudioBlock,
-    history: List[DuplexAudioBlock],
+    _history: List[DuplexAudioBlock],
     _is_terminal: bool,
 ) -> float:
-    """Reward bot silence while user is clearly mid-sentence. Pure block-level, no VAD.
+    """Reward bot silence while user is speaking. Pure block-level, no VAD.
 
-    Requires BOTH the current block AND the previous block to have user speech —
-    two consecutive blocks of user text confirms the user is mid-sentence, not
-    finishing a complete single-block utterance.
+    Mid-sentence determination (lookahead) is handled by the caller (_idle_rm1_reward)
+    which has access to the full episode. This function is the raw +0.5 signal;
+    the caller gates when it fires.
     """
     if block.assistant_text:
         return 0.0
     if not block.user_text:
-        return 0.0
-    if not history or not history[-1].user_text:
         return 0.0
     return +0.5
 
