@@ -461,6 +461,10 @@ MODEL_CONFIGS = _load_model_configs()
 MODEL_BY_KEY = {config["model_key"]: config for config in MODEL_CONFIGS}
 FREE_PLAY_CHOICES = [(config["name"], config["model_key"]) for config in MODEL_CONFIGS]
 
+# Gradio deep-copies gr.State values between events, so live websocket clients
+# must stay in process-local runtime storage instead of the state dict itself.
+_RUNTIME_CLIENTS: dict[str, FullDuplexClient] = {}
+
 
 def _audio_to_data_uri(audio: np.ndarray, sample_rate: int) -> str:
     arr = np.asarray(audio)
@@ -630,6 +634,7 @@ def _default_survey_state() -> dict:
         "likert_index": 0,
         "demographics": {},
         "comparison": {},
+        "client_token": None,
         "client": None,
         "snapshot": None,
         "last_warning_key": None,
@@ -642,6 +647,7 @@ def _default_survey_state() -> dict:
 
 def _default_free_play_state() -> dict:
     return {
+        "client_token": None,
         "client": None,
         "snapshot": None,
         "current_model_key": MODEL_CONFIGS[0]["model_key"],
@@ -666,9 +672,56 @@ def _close_client(client: Optional[FullDuplexClient]) -> None:
         client.close()
 
 
-def _reset_survey_runtime(state: dict) -> None:
-    _close_client(state.get("client"))
+def _runtime_client(state: Optional[dict]) -> Optional[FullDuplexClient]:
+    if not state:
+        return None
+
+    client_token = state.get("client_token")
+    if client_token:
+        client = _RUNTIME_CLIENTS.get(client_token)
+        if client is not None:
+            return client
+
+    legacy_client = state.get("client")
+    if isinstance(legacy_client, FullDuplexClient):
+        return legacy_client
+    return None
+
+
+def _set_runtime_client(state: dict, client: FullDuplexClient) -> None:
+    client_token = state.get("client_token") or uuid.uuid4().hex
+    _RUNTIME_CLIENTS[client_token] = client
+    state["client_token"] = client_token
     state["client"] = None
+
+
+def _pop_runtime_client(state: dict) -> Optional[FullDuplexClient]:
+    client = None
+    client_token = state.get("client_token")
+    if client_token:
+        client = _RUNTIME_CLIENTS.pop(client_token, None)
+        state["client_token"] = None
+
+    legacy_client = state.get("client")
+    state["client"] = None
+    if client is not None:
+        return client
+    if isinstance(legacy_client, FullDuplexClient):
+        return legacy_client
+    return None
+
+
+def _close_runtime_client(state: dict) -> None:
+    _close_client(_pop_runtime_client(state))
+
+
+def _has_runtime_client(state: Optional[dict]) -> bool:
+    client = _runtime_client(state)
+    return client is not None and client.connected
+
+
+def _reset_survey_runtime(state: dict) -> None:
+    _close_runtime_client(state)
     state["snapshot"] = None
     state["last_warning_key"] = None
     state["last_mic_at"] = 0.0
@@ -745,7 +798,7 @@ def _probe_hidden_backends() -> tuple[bool, str]:
 
 
 def _conversation_status(state: dict) -> tuple[str, str]:
-    client = state.get("client")
+    client = _runtime_client(state)
     if client is None or not client.connected:
         return "ready", "Preparing the session. The microphone will activate when the bot connects."
 
@@ -761,7 +814,7 @@ def _conversation_status(state: dict) -> tuple[str, str]:
 
 
 def _free_play_status(state: dict) -> tuple[str, str]:
-    client = state.get("client")
+    client = _runtime_client(state)
     if client is None or not client.connected:
         return "ready", "Pick a model, connect, and start talking. Nothing from this tab is saved."
 
@@ -860,7 +913,7 @@ def _render_indicator(state: dict, *, survey: bool, speaker_label: str) -> str:
     kind, message = _conversation_status(state) if survey else _free_play_status(state)
     subtitle = (
         f"Live with {_html.escape(speaker_label)}"
-        if state.get("client") is not None
+        if _has_runtime_client(state)
         else "Connect to start audio streaming"
     )
     return (
@@ -989,7 +1042,7 @@ def _start_survey_session(state: dict) -> tuple[bool, Optional[str]]:
         client.close()
         return False, f"{type(exc).__name__}: {exc}"
 
-    state["client"] = client
+    _set_runtime_client(state, client)
     state["snapshot"] = client.get_latest_snapshot()
     state["active_session"] = {
         "bot_label": bot["bot_label"],
@@ -1094,32 +1147,32 @@ def _survey_render(state: dict, *, transport_value=gr.skip()):
 
     return (
         state,
-        gr.Column(visible=intro_visible),
-        gr.Column(visible=presurvey_visible),
-        gr.Column(visible=conversation_visible),
-        gr.Column(visible=likert_visible),
-        gr.Column(visible=comparison_visible),
-        gr.Column(visible=thankyou_visible),
+        gr.update(visible=intro_visible),
+        gr.update(visible=presurvey_visible),
+        gr.update(visible=conversation_visible),
+        gr.update(visible=likert_visible),
+        gr.update(visible=comparison_visible),
+        gr.update(visible=thankyou_visible),
         _render_intro_status(state),
         _render_presurvey_header(state),
         _render_conversation_header(state),
         _render_prompt_panel(state),
         _render_indicator(state, survey=True, speaker_label=speaker_label),
         _render_transcript(state.get("snapshot"), speaker_label),
-        gr.Audio(interactive=conversation_visible and state.get("client") is not None),
+        gr.update(interactive=conversation_visible and _has_runtime_client(state)),
         transport_value,
         _render_likert_header(state),
-        gr.Radio(choices=LIKERT_CHOICES, value=_current_likert_value(state)),
+        gr.update(choices=LIKERT_CHOICES, value=_current_likert_value(state)),
         _render_comparison_header(state),
         _render_thankyou(state),
-        gr.Radio(choices=AGE_OPTIONS, value=demographics.get("age_range")),
-        gr.Radio(choices=YES_NO_OPTIONS, value=demographics.get("native_english")),
-        gr.Radio(choices=VOICE_ASSISTANT_USE_OPTIONS, value=demographics.get("voice_assistant_frequency")),
-        gr.Radio(choices=COMPARISON_OPTIONS["natural"], value=comparison.get("natural")),
-        gr.Radio(choices=COMPARISON_OPTIONS["interruptions"], value=comparison.get("interruptions")),
-        gr.Radio(choices=COMPARISON_OPTIONS["promptness"], value=comparison.get("promptness")),
-        gr.Radio(choices=COMPARISON_OPTIONS["overall"], value=comparison.get("overall")),
-        gr.Textbox(value=comparison.get("free_text", "")),
+        gr.update(choices=AGE_OPTIONS, value=demographics.get("age_range")),
+        gr.update(choices=YES_NO_OPTIONS, value=demographics.get("native_english")),
+        gr.update(choices=VOICE_ASSISTANT_USE_OPTIONS, value=demographics.get("voice_assistant_frequency")),
+        gr.update(choices=COMPARISON_OPTIONS["natural"], value=comparison.get("natural")),
+        gr.update(choices=COMPARISON_OPTIONS["interruptions"], value=comparison.get("interruptions")),
+        gr.update(choices=COMPARISON_OPTIONS["promptness"], value=comparison.get("promptness")),
+        gr.update(choices=COMPARISON_OPTIONS["overall"], value=comparison.get("overall")),
+        gr.update(value=comparison.get("free_text", "")),
     )
 
 
@@ -1127,11 +1180,11 @@ def _free_play_render(state: dict, *, transport_value=gr.skip()):
     model_name = MODEL_BY_KEY.get(state.get("current_model_key"), MODEL_CONFIGS[0])["name"]
     return (
         state,
-        gr.Audio(interactive=state.get("client") is not None),
+        gr.update(interactive=_has_runtime_client(state)),
         _render_free_play_status_card(state),
         _render_transcript(state.get("snapshot"), model_name),
-        gr.Button(interactive=state.get("client") is None),
-        gr.Button(interactive=state.get("client") is not None),
+        gr.update(interactive=not _has_runtime_client(state)),
+        gr.update(interactive=_has_runtime_client(state)),
         transport_value,
     )
 
@@ -1145,7 +1198,7 @@ def initialize_app():
 
 def start_survey(session_state):
     previous_state = _ensure_survey_state(session_state)
-    _close_client(previous_state.get("client"))
+    _close_runtime_client(previous_state)
 
     state = _default_survey_state()
     state["backend_ready"], state["backend_message"] = _probe_hidden_backends()
@@ -1198,7 +1251,8 @@ def submit_presurvey(age_range, native_english, voice_assistant_frequency, sessi
 
 def receive_survey_mic(audio, session_state):
     state = _ensure_survey_state(session_state)
-    if audio is None or state.get("client") is None:
+    client = _runtime_client(state)
+    if audio is None or client is None:
         return state
 
     sample_rate, audio_array = audio
@@ -1206,7 +1260,7 @@ def receive_survey_mic(audio, session_state):
     state["last_mic_at"] = time.time()
     _append_audio_segment(state["active_audio"]["mic_segments"], sample_rate, audio_float)
     try:
-        state["client"].send_audio_chunk(sample_rate, audio_float)
+        client.send_audio_chunk(sample_rate, audio_float)
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         active_session = state.get("active_session")
@@ -1227,7 +1281,7 @@ def receive_survey_mic(audio, session_state):
 
 def poll_survey(session_state):
     state = _ensure_survey_state(session_state)
-    client = state.get("client")
+    client = _runtime_client(state)
     speaker_label = (_current_bot(state) or {}).get("bot_label", "Bot")
     if client is None:
         return state, gr.skip(), _render_indicator(state, survey=True, speaker_label=speaker_label), _render_transcript(state.get("snapshot"), speaker_label)
@@ -1361,7 +1415,7 @@ def submit_comparison(natural, interruptions, promptness, overall, free_text, se
 
 def connect_free_play(model_key, free_play_state):
     state = _ensure_free_play_state(free_play_state)
-    _close_client(state.get("client"))
+    _close_runtime_client(state)
 
     resolved_key = model_key or MODEL_CONFIGS[0]["model_key"]
     config = MODEL_BY_KEY[resolved_key]
@@ -1370,6 +1424,7 @@ def connect_free_play(model_key, free_play_state):
         client.connect(client_name=f"free-play-{resolved_key.lower()}")
     except Exception as exc:
         client.close()
+        state["client_token"] = None
         state["client"] = None
         state["snapshot"] = None
         state["current_model_key"] = resolved_key
@@ -1381,7 +1436,7 @@ def connect_free_play(model_key, free_play_state):
             )
         return _free_play_render(state, transport_value="__reset__")
 
-    state["client"] = client
+    _set_runtime_client(state, client)
     state["snapshot"] = client.get_latest_snapshot()
     state["current_model_key"] = resolved_key
     state["last_warning_key"] = None
@@ -1392,8 +1447,7 @@ def connect_free_play(model_key, free_play_state):
 
 def disconnect_free_play(free_play_state):
     state = _ensure_free_play_state(free_play_state)
-    _close_client(state.get("client"))
-    state["client"] = None
+    _close_runtime_client(state)
     state["snapshot"] = None
     state["last_warning_key"] = None
     state["last_mic_at"] = 0.0
@@ -1403,14 +1457,15 @@ def disconnect_free_play(free_play_state):
 
 def receive_free_play_mic(audio, free_play_state):
     state = _ensure_free_play_state(free_play_state)
-    if audio is None or state.get("client") is None:
+    client = _runtime_client(state)
+    if audio is None or client is None:
         return state
 
     sample_rate, audio_array = audio
     audio_float = _normalize_input_audio(audio_array)
     state["last_mic_at"] = time.time()
     try:
-        state["client"].send_audio_chunk(sample_rate, audio_float)
+        client.send_audio_chunk(sample_rate, audio_float)
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         if _push_warning(state, "client", message):
@@ -1420,7 +1475,7 @@ def receive_free_play_mic(audio, free_play_state):
 
 def poll_free_play(free_play_state):
     state = _ensure_free_play_state(free_play_state)
-    client = state.get("client")
+    client = _runtime_client(state)
     if client is None:
         return state, gr.skip(), _render_free_play_status_card(state), _render_transcript(state.get("snapshot"), MODEL_BY_KEY[state.get("current_model_key")]["name"])
 
