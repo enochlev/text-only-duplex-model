@@ -32,59 +32,64 @@ Returns:
 """
 
 
-def _blocks_since_user_finished(history: List[DuplexAudioBlock]) -> Optional[int]:
-    """Blocks of consecutive bot-silence since the most recent user turn-complete.
+def _silent_blocks_since_user_spoke(history: List[DuplexAudioBlock]) -> Optional[int]:
+    """Count trailing consecutive silent blocks (no user_text) since user last spoke.
 
-    Returns None if the user hasn't finished or the bot already responded.
-    Returns 1 if the user finished in the immediately preceding block, etc.
+    Pure block-level: no VAD calls.
+    Returns None if bot already responded (silence is intentional) or user never spoke.
+    Returns 0 if user spoke in the immediately preceding block (history[-1].user_text set).
+    Returns 1 if one silent block elapsed since user last spoke, etc.
     """
-    for lag, b in enumerate(reversed(history), start=1):
+    silent = 0
+    for b in reversed(history):
         if b.assistant_text:
-            return None  # bot already spoke — silence is intentional
-        if _user_finished_in(b):
-            return lag
-    return None
+            return None  # bot already responded — intentional silence
+        if b.user_text:
+            return silent  # found where user last spoke
+        silent += 1
+    return None  # no user speech found in history
 
 
-def respond_after_user_reward(
+# ---------------------------------------------------------------------------
+# Block-level turn-taking rewards (no VAD calls)
+# ---------------------------------------------------------------------------
+
+def block_silence_penalty(
     block: DuplexAudioBlock,
     history: List[DuplexAudioBlock],
     is_terminal: bool,
 ) -> float:
-    """Penalise bot silence after the user finishes a turn.
+    """Penalise bot silence after user stops speaking. Pure block-level, no VAD.
 
-    lag=1: 0.0  — free recovery window; wrong decision was made when user was finishing,
-                  but the model gets one block to correct course without extra punishment.
-    lag=2: -1.0
-    lag=3: -2.0
-    lag=4+: -3.0
+    Looks back through history for how many consecutive silent blocks have
+    elapsed since the user last spoke.
 
-    No penalty while the user is still speaking or the bot already responded.
+    silent=0 (user spoke in history[-1], this is the first silence): 0.0 — free recovery window.
+    silent=1: -1.0   silent=2: -2.0   silent>=3: -3.0
     """
     if block.user_text or block.assistant_text:
         return 0.0
-    lag = _blocks_since_user_finished(history)
-    if lag is None or lag <= 1:
+    silent = _silent_blocks_since_user_spoke(history)
+    if silent is None or silent == 0:
         return 0.0
-    if lag == 2:
+    if silent == 1:
         return -1.0
-    if lag == 3:
+    if silent == 2:
         return -2.0
     return -3.0
 
 
-def interruption_penalty(
+def block_interruption_penalty(
     block: DuplexAudioBlock,
     history: List[DuplexAudioBlock],
     is_terminal: bool,
 ) -> float:
-    """Penalise simultaneous-speech blocks.
+    """Penalise bot speaking while user is also speaking. Pure block-level, no VAD.
 
     First overlap is free ONLY when the user was NOT already speaking in the
-    source block (history[-1]).  history = episode.blocks[:first_covered_index],
-    so history[-1] is the source block — the moment the bot decided to generate.
-    If the user was already speaking there, the bot had causal visibility and
-    chose to interrupt; no free pass.  Escalates with run length:
+    source block (history[-1]).  If the user was already speaking there, the bot
+    had causal visibility and chose to interrupt; no free pass.  Escalates with
+    run length:
       true-interrupt (run=1, source had user): -0.5
       run=2: -0.5   run=3: -1.0   run=4+: -2.0
     """
@@ -108,12 +113,33 @@ def interruption_penalty(
     return -2.0
 
 
-def interruption_penalty_overlap(
+def block_idle_reward(
     block: DuplexAudioBlock,
     _history: List[DuplexAudioBlock],
-    is_terminal: bool,
+    _is_terminal: bool,
 ) -> float:
-    """Progressive VAD penalty proportional to the pyannote overlap ratio.
+    """Reward bot silence while user is actively speaking. Pure block-level, no VAD.
+
+    Returns +0.5 when the bot is silent and the current block has user speech.
+    No VAD call — if the user is speaking in this block, staying silent is correct.
+    """
+    if block.assistant_text:
+        return 0.0
+    if not block.user_text:
+        return 0.0
+    return +0.5
+
+
+# ---------------------------------------------------------------------------
+# VAD-based rewards (require running VAD server)
+# ---------------------------------------------------------------------------
+
+def vad_overlap_penalty(
+    block: DuplexAudioBlock,
+    _history: List[DuplexAudioBlock],
+    _is_terminal: bool,
+) -> float:
+    """Progressive penalty proportional to pyannote audio overlap ratio.
 
     Only fires when BOTH user AND bot have text AND audio is non-silent.
     Falls back to 0.0 when audio is zeroed (simulation) or server is down.
@@ -247,25 +273,6 @@ def backchannel_loop_penalty(
     return -1.0 * (run - 1)
 
 
-def correct_idle_reward(
-    block: DuplexAudioBlock,
-    _history: List[DuplexAudioBlock],
-    _is_terminal: bool,
-) -> float:
-    """Reward choosing idle while the user is actively mid-sentence.
-
-    Returns +0.5 when the bot is silent and the user is still speaking
-    (user_text present but turn not yet complete). Returns 0.0 otherwise.
-    """
-    if block.assistant_text:
-        return 0.0
-    if not block.user_text:
-        return 0.0
-    if _user_finished_in(block):
-        return 0.0
-    return +0.5
-
-
 # ---------------------------------------------------------------------------
 # Junk output penalty
 # ---------------------------------------------------------------------------
@@ -379,13 +386,33 @@ def _vad_overlap_score(mic_audio: np.ndarray, tts_audio: np.ndarray) -> Optional
         return None
 
 
+_TERMINAL_PUNCT = frozenset(".!?…")
+
+
+def _text_turn_complete(text: str) -> bool:
+    """Heuristic: text ends with terminal punctuation and has at least 3 words."""
+    stripped = text.strip()
+    return bool(stripped) and stripped[-1] in _TERMINAL_PUNCT and len(stripped.split()) >= 3
+
+
 def _user_finished_in(block: DuplexAudioBlock) -> bool:
-    """True if the user's utterance in this block is a complete conversational turn."""
+    """True if the user's utterance in this block is a complete conversational turn.
+
+    Terminal-punctuation heuristic overrides VAD when the text clearly ends a sentence.
+    VAD is consulted for ambiguous cases (no terminal punctuation).
+    """
+    text = block.user_text or ""
+    if not text.strip():
+        return False
+    # Clear sentence-ending punctuation: trust the text signal — VAD is unreliable here.
+    if _text_turn_complete(text):
+        return True
     mic = block.mic_audio if (block.mic_audio is not None and len(block.mic_audio) > 0) else None
-    result = _vad_turn_complete(block.user_text or "", mic_audio=mic)
+    result = _vad_turn_complete(text, mic_audio=mic)
     if result is not None:
         return result
-    return len((block.user_text or "").split()) >= 1
+    # Fallback: any text without punctuation is treated as mid-sentence.
+    return False
 
 
 # ---------------------------------------------------------------------------

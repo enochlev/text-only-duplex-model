@@ -16,11 +16,11 @@ from .rl_trainer import (
 )
 from .rewards import (
     RewardFn,
-    respond_after_user_reward,
-    interruption_penalty,
-    interruption_penalty_overlap,
+    block_silence_penalty,
+    block_interruption_penalty,
+    block_idle_reward,
+    vad_overlap_penalty,
     backchannel_loop_penalty,
-    correct_idle_reward,
     junk_output_penalty,
     check_rm_servers,
 )
@@ -52,11 +52,11 @@ __all__ = [
     "VirtualSimulationConnection",
     # rewards
     "RewardFn",
-    "respond_after_user_reward",
-    "interruption_penalty",
-    "interruption_penalty_overlap",
+    "block_silence_penalty",
+    "block_interruption_penalty",
+    "block_idle_reward",
+    "vad_overlap_penalty",
     "backchannel_loop_penalty",
-    "correct_idle_reward",
     "junk_output_penalty",
     "check_rm_servers",
     # data_ingestion

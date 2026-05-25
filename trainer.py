@@ -26,11 +26,11 @@ from trainer import (
     SFTTrainer,
     SFTConfig,
     SilenceDataCollector,
-    respond_after_user_reward,
-    interruption_penalty,
-    interruption_penalty_overlap,
+    block_silence_penalty,
+    block_interruption_penalty,
+    block_idle_reward,
+    vad_overlap_penalty,
     backchannel_loop_penalty,
-    correct_idle_reward,
     junk_output_penalty,
     make_default_data_pool,
     check_rm_servers,
@@ -182,11 +182,11 @@ def main() -> None:
     )
 
     reward_fns = [
-        respond_after_user_reward,
-        interruption_penalty,
-        interruption_penalty_overlap,
+        block_silence_penalty,
+        block_interruption_penalty,
+        block_idle_reward,
+        vad_overlap_penalty,
         backchannel_loop_penalty,
-        correct_idle_reward,
         junk_output_penalty,
     ]
     # Post-SFT rebalance: model already internalized silence (RM5 natural_fired ~50-70%),

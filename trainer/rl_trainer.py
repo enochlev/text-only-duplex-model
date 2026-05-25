@@ -1359,18 +1359,18 @@ class FullDuplexRLTrainer:
             reward = 0.0
             breakdown: Dict[str, float] = {}
 
-            from .rewards import respond_after_user_reward as _rm1, correct_idle_reward as _rm5
+            from .rewards import block_silence_penalty as _rm1, block_idle_reward as _rm5
             raw1 = _rm1(silent_blk, hist, False)
             if raw1:
                 weighted = rm1_w * raw1
                 reward += weighted
-                breakdown["respond_after_user_reward"] = weighted
+                breakdown["block_silence_penalty"] = weighted
 
             raw5 = _rm5(silent_blk, hist, False)
             if raw5:
                 weighted = rm5_w * raw5
                 reward += weighted
-                breakdown["correct_idle_reward"] = weighted
+                breakdown["block_idle_reward"] = weighted
 
             return reward, breakdown
 
@@ -1389,7 +1389,7 @@ class FullDuplexRLTrainer:
                 for fn, w in zip(self.reward_fns, self.rm_weights):
                     fn_total = 0.0
                     for blk_pos, block in enumerate(covered):
-                        h = (history if fn.__name__ == "interruption_penalty"
+                        h = (history if fn.__name__ == "block_interruption_penalty"
                              else history + covered[:blk_pos])
                         fn_total += w * fn(block, h, is_terminal)
                     breakdown[fn.__name__] = fn_total
@@ -1421,7 +1421,7 @@ class FullDuplexRLTrainer:
                     # isn't penalised for T+1's (committed at the same decision point).
                     # All other RMs get augmented history so consecutive-backchannel
                     # run counts accumulate correctly across covered blocks.
-                    h = history if fn.__name__ == "interruption_penalty" else history + covered[:blk_pos]
+                    h = history if fn.__name__ == "block_interruption_penalty" else history + covered[:blk_pos]
                     fn_total += w * _call_fn(fn, block, h, is_terminal)
                 breakdown[fn.__name__] = fn_total
                 total += fn_total
