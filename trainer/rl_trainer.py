@@ -1069,7 +1069,7 @@ class FullDuplexRLTrainer:
 
         self.ref_model: Optional[Any] = None
         if config.ref_model_name_or_path:
-            ref_device = config.ref_model_device or config.device
+            ref_device = config.ref_model_device or config.vllm_device or config.device
             print(f"[trainer] loading frozen reference model ({ref_device}): {config.ref_model_name_or_path}")
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 config.ref_model_name_or_path,
