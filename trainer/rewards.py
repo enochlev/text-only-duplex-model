@@ -138,30 +138,38 @@ def timely_response_reward(
 ) -> float:
     """Reward bot for responding promptly after the user finishes speaking.
 
-    Fires when:
-    - bot produced real text (assistant_text set)
-    - source block was silent (user was NOT speaking when LLM was called,
-      so no interruption risk — RM2 handles the overlap case separately)
-    - user spoke recently: lag=1 (one silent block ago) → +1.0
-                           lag=2 (two silent blocks ago) → +0.5
+    lag=0: source block had user speech AND user finished there → +1.0 (ideal)
+    lag=1: one silent block since user stopped                   → +0.75
+    lag=2: two silent blocks since user stopped                  → +0.5
 
-    This ensures correct speech (e.g. +1.5 after weighting) beats mid-sentence
-    silence (+0.75 from block_idle_reward) and silence after user stops (-1.5).
-    Without this reward, the model has no incentive to ever speak.
+    Guard: if source block had user speech but user was mid-sentence (no
+    terminal punctuation, VAD says not complete), this is a true interruption
+    and RM2 already penalises it — return 0 to avoid double-counting.
+    Also skip covered blocks that are themselves overlap blocks (user still
+    speaking there) since RM2 covers those too.
     """
     if not block.assistant_text:
         return 0.0
     if not history:
         return 0.0
-    # Source block had user speech → RM2 already handles interruption; skip here.
-    if history[-1].user_text:
+    # Covered block itself is an overlap (user still speaking) — let RM2 handle.
+    if block.user_text:
         return 0.0
+    src = history[-1]
+    if src.user_text:
+        # Source had user speech. Only reward if the user actually finished there;
+        # mid-sentence source = true interruption = RM2's territory.
+        if not _user_finished_in(src):
+            return 0.0
+        # User finished at source block → ideal timing (lag=0).
+        return +1.0
+    # Source block was silent — count how many blocks since user last spoke.
     lag = _silent_blocks_since_user_spoke(history)
     if lag is None or lag > 2:
         return 0.0
     if lag == 1:
-        return +1.0  # user stopped one block ago — ideal timing
-    return +0.5       # user stopped two blocks ago — acceptable
+        return +0.75
+    return +0.5
 
 
 # ---------------------------------------------------------------------------

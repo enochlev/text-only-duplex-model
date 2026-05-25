@@ -193,11 +193,11 @@ def main() -> None:
     # RM1=block_silence_penalty       weight=1.5  lag=1→-1.5  lag=2→-3.0  lag=3+→-4.5
     # RM2=block_interruption_penalty  weight=3.0  run=1→-1.5  run=2→-1.5  run=3→-3.0
     # RM3=block_idle_reward           weight=1.5  mid-sentence silence → +0.75
-    # RM6=timely_response_reward      weight=1.5  lag=1→+1.5  lag=2→+0.75
+    # RM6=timely_response_reward      weight=1.5  lag=0→+1.5  lag=1→+1.125  lag=2→+0.75
     # RM4=backchannel_loop_penalty    weight=0.75
     # RM5=junk_output_penalty         weight=1.5
-    # RM6 closes the reward gap: correct speech (+1.5) > silence mid-sentence (+0.75)
-    # > silence post-turn (-1.5). Without RM6 the model had zero incentive to speak.
+    # Reward ordering: timely speech (+1.5) > mid-sentence silence (+0.75)
+    #   > silence post-turn (-1.5). lag=0 fires when user finishes at source block.
     rl_cfg.reward_fn_weights = [1.5, 3.0, 1.5, 1.5, 0.75, 1.5]
 
     print("\n" + "="*70)
