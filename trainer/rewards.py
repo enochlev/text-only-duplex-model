@@ -65,7 +65,7 @@ def block_silence_penalty(
     elapsed since the user last spoke.
 
     silent=0 (user spoke last block, this is first silence): -1.0
-    silent=1: -2.0   silent>=2: -3.0
+    silent=1: -2.0   silent>=2: 0.0 (model is force-idled beyond response window)
     """
     if block.user_text or block.assistant_text:
         return 0.0
@@ -76,7 +76,7 @@ def block_silence_penalty(
         return -1.0
     if silent == 1:
         return -2.0
-    return -3.0
+    return 0.0
 
 
 def block_interruption_penalty(

@@ -127,7 +127,7 @@ Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2
 
 | # | Function | Weight | Step type | Fires when | Raw values | Weighted values |
 |---|---|---|---|---|---|---|
-| RM1 | `block_silence_penalty` | 2.0 | **Idle** | Bot stays silent after user finishes speaking | lag=0: −1.0 / lag=1: −2.0 / lag≥2: −3.0 | −2.0 / −4.0 / −6.0 |
+| RM1 | `block_silence_penalty` | 2.0 | **Idle** | Bot stays silent after user finishes speaking (capped at 2 blocks; model is force-idled beyond that) | lag=0: −1.0 / lag=1: −2.0 / lag≥2: 0.0 | −2.0 / −4.0 / 0.0 |
 | RM2 | `block_interruption_penalty` | 4.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | committed(run=1,silent src): 0.0 / true-interrupt(run=1): −0.5 / run=2: −1.0 / run=3: −1.5 / run≥4: −2.0 | 0.0 / −2.0 / −4.0 / −6.0 / −8.0 |
 | RM3 | `block_idle_reward` | 1.5 | **Idle** | Bot stays silent while user is mid-sentence AND user continues in the next block (post-episode lookahead) | +0.5 | +0.75 |
 | RM4 | `timely_response_reward` | 2.5 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +2.5 / +1.875 / +1.25 |
@@ -164,7 +164,8 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
-| 2026-05-25 | `kl_ref_coeff` (`trainer.py`) | 0.075 | 0.02 | SFT ref model is silent; high KL coeff anchored student to silence, blocking RM4 |
+| 2026-05-25 | RM1 lag≥2 penalty (`rewards.py`) | −3.0 | 0.0 | Model force-idled beyond max_blocks_after_user_speech=2; perpetual -6.0/block was noise |
+| 2026-05-25 | `kl_ref_coeff` (`trainer.py`) | 0.075 | 0.04 | SFT ref model is silent; high KL coeff anchored student to silence, blocking RM4 |
 | 2026-05-25 | `vllm_temperature` (`trainer.py`) | 0.8 | 1.0 | Low temp sharpened EOS distribution; 1.0 restores natural sampling variance |
 | 2026-05-25 | RM4 weight (`trainer.py`) | 1.5 | 2.5 | Model converged to silence; +2.5 now clearly beats −2.0 interrupt risk |
 | 2026-05-25 | RM1 weight (`trainer.py`) | 1.5 | 2.0 | Silence penalty dominant but gradient blocked in fully-silent episodes; heavier weight improves mixed episodes |

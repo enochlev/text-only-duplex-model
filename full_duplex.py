@@ -1274,7 +1274,14 @@ class DuplexAudioAgent:
         triggering a context_version bump (e.g. fingerprint dedup suppressed
         the flush), which would otherwise leave context_version stale and cause
         _maybe_run_llm to exit on the version guard.
+
+        Returns False if _pending_words is non-empty — a response is already
+        in the queue waiting to be committed. Without this check the version
+        guard is bypassed on every poll tick until words drain, causing the
+        LLM to fire in an infinite tight loop.
         """
+        if self._pending_words:
+            return False
         for blk in reversed(self.blocks):
             if blk.assistant_text and not blk.assistant_text_stale:
                 return False  # bot spoke more recently than user
