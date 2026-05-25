@@ -29,7 +29,6 @@ from trainer import (
     block_silence_penalty,
     block_interruption_penalty,
     block_idle_reward,
-    vad_overlap_penalty,
     backchannel_loop_penalty,
     junk_output_penalty,
     make_default_data_pool,
@@ -185,17 +184,16 @@ def main() -> None:
         block_silence_penalty,
         block_interruption_penalty,
         block_idle_reward,
-        vad_overlap_penalty,
+        # vad_overlap_penalty,  # audio-only; no-op in text-only sim — re-enable for real audio
         backchannel_loop_penalty,
         junk_output_penalty,
     ]
-    # Steps 1-9 analysis: model overcorrected from SFT silence → now interrupts every turn.
-    # natural_fired dropped to 0% by step 7 — model never chooses silence naturally.
-    # RM2 (interruption) is the dominant failure mode; doubled weight to 3.0 to break the pattern.
-    # RM1 weight reduced (model now speaks; block-4/5 escalation fix handles post-turn lag).
-    # RM3 (idle reward) raised to 1.5 to better reward correct mid-sentence silence.
-    # RM5 (backchannel) raised slightly. LR reduced 30% to compensate for stronger RM2 signal.
-    rl_cfg.reward_fn_weights = [1.5, 3.0, 1.5, 1.0, 0.75, 1.5]
+    # RM1=block_silence_penalty  RM2=block_interruption_penalty  RM3=block_idle_reward
+    # RM4=backchannel_loop_penalty  RM5=junk_output_penalty
+    # vad_overlap_penalty removed: no-op in text-only sim (mic audio is silence).
+    # RM2 raised to 3.0: interruption is dominant failure mode (natural_fired→0% by step 7).
+    # RM4 backchannel raised: now penalizes run=1 when user already finished their turn.
+    rl_cfg.reward_fn_weights = [1.5, 3.0, 1.5, 0.75, 1.5]
 
     print("\n" + "="*70)
     print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")

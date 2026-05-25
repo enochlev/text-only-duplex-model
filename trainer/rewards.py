@@ -247,11 +247,16 @@ def backchannel_loop_penalty(
     history: List[DuplexAudioBlock],
     _is_terminal: bool,
 ) -> float:
-    """Penalise consecutive backchannel-only bot blocks.
+    """Penalise backchannel-only bot responses.
 
-    A single backchannel is natural and free. Penalty escalates at -0.5
-    per additional consecutive backchannel block:
-      run=1: 0.0   run=2: -0.5   run=3: -1.0   run=4: -1.5 ...
+    A single backchannel is free ONLY when the user was mid-sentence at the
+    source block (history[-1].user_text set with no terminal punctuation).
+    If the user already finished their turn (source block silent, or text ends
+    a sentence), even run=1 costs -0.5 — a backchannel is not a real answer.
+
+    Escalation:
+      mid-sentence, run=1: 0.0   run=2: -0.5   run=3: -1.0  ...
+      post-turn,    run=1: -0.5  run=2: -1.0   run=3: -1.5  ...
     """
     if not block.assistant_text:
         return 0.0
@@ -269,9 +274,19 @@ def backchannel_loop_penalty(
         else:
             break
 
-    if run <= 1:
-        return 0.0
-    return -1.0 * (run - 1)
+    # Determine if the user was mid-sentence at the source block.
+    src = history[-1] if history else None
+    _TERM = frozenset(".!?…")
+    user_mid_sentence = bool(
+        src and src.user_text
+        and src.user_text.strip()
+        and src.user_text.strip()[-1] not in _TERM
+    )
+
+    if run <= 1 and user_mid_sentence:
+        return 0.0  # single backchannel during user speech is a natural filler
+    # run=1 post-turn OR any run>1: escalate starting at -0.5
+    return -0.5 * run
 
 
 # ---------------------------------------------------------------------------
