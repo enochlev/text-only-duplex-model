@@ -92,7 +92,7 @@ def llm_generate_groq(system_prompt: str, user_message: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
-        "max_tokens": 60,
+        "max_tokens": 80,
         "temperature": 0.0,
     }
     request_params.update(config["params"])
@@ -147,6 +147,78 @@ def local_generate(system_prompt: str, user_message: str) -> str:
     }
     response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
     return response.json()["choices"][0]["message"]["content"].strip()
+
+
+# ---------------------------------------------------------------------------
+# MiniCPM-duplex generate function
+# ---------------------------------------------------------------------------
+
+# Matches completed blocks: <user>U<AI>A</s>  and the trailing open block: <user>U<AI>
+_CPM_BLOCK_RE = re.compile(r"<user>(.*?)<AI>(.*?)(?:</s>|$)", re.DOTALL)
+
+
+def _build_cpm_prompt(user_message: str) -> str:
+    """Convert block-format history to MiniCPM <用户>/<AI> turn format.
+
+    Input (block format):  <user>U<AI>A</s>...<user>CURRENT<AI>
+    Output (CPM format):   <用户>USER_TURN<AI>AI_TURN<用户>USER_TURN<AI>
+
+    Consecutive user blocks are aggregated into one user turn; consecutive AI
+    blocks into one AI turn. <idle> blocks are skipped. The output always ends
+    with <AI> so the model continues the assistant's response.
+    """
+    result = ""
+    u_buf: list = []
+    a_buf: list = []
+
+    for raw_u, raw_a in _CPM_BLOCK_RE.findall(user_message):
+        u = raw_u.strip()
+        a = raw_a.strip()
+        if u == "<idle>":
+            u = ""
+
+        if u:
+            if a_buf:
+                result += " ".join(a_buf)
+                a_buf = []
+            u_buf.append(u)
+
+        if a:
+            if u_buf:
+                result += "<用户>" + " ".join(u_buf) + "<AI>"
+                u_buf = []
+            a_buf.append(a)
+
+    # Flush final user buffer — the trailing open <user>CURRENT<AI> block
+    if u_buf:
+        result += "<用户>" + " ".join(u_buf) + "<AI>"
+    elif a_buf:
+        # AI was speaking last with no new user turn (shouldn't happen normally)
+        result += " ".join(a_buf) + "<用户><AI>"
+
+    return result or "<用户><AI>"
+
+
+def cpm_generate(system_prompt: str, user_message: str) -> str:
+    """Call MiniCPM-duplex via vLLM /v1/completions at port 8556.
+
+    system_prompt is ignored — MiniCPM uses raw <用户>/<AI> format with no system turn.
+    user_message is in the standard block format; reformatted internally to CPM format.
+    Stops at <用户> (the model's natural turn boundary).
+    """
+    import requests
+    prompt = _build_cpm_prompt(user_message)
+    url = f"http://localhost:{os.getenv('CPM_PORT', '8556')}/v1/completions"
+    payload = {
+        "model": "cpm-text-duplex",
+        "prompt": prompt,
+        "max_tokens": 80,
+        "temperature": 0.0,
+        "stop": ["<用户>"],
+    }
+    resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["text"].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1301,11 @@ class DuplexAudioAgent:
             self._current_block is None or not self._current_block.user_text
         ):
             return
-        if not self._within_generation_window():
+        # Also bypass the window guard when there's unanswered user speech.
+        # The window check prevents chatty bot behavior after long silence, but
+        # when the user asked something the bot never answered (words assigned to
+        # a block >3 deep by ASR churn), we must still generate.
+        if not unanswered and not self._within_generation_window():
             return
 
         generation_context_version = self.context_version

@@ -21,7 +21,7 @@ from duplex_protocol import (
     snapshot_fingerprint,
     snapshot_from_agent,
 )
-from full_duplex import DuplexAudioAgent, preload_duplex_models
+from full_duplex import DuplexAudioAgent, cpm_generate, preload_duplex_models
 
 POLL_INTERVAL_S = 0.08
 SESSION_TTL_S = 900.0
@@ -299,13 +299,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Full-duplex audio websocket server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8998)
+    parser.add_argument(
+        "--is-cpm",
+        action="store_true",
+        default=False,
+        help="Use MiniCPM-duplex (port 8556) instead of the trained model. "
+             "Reformats prompts to <用户>/<AI> format and calls /v1/completions.",
+    )
     args = parser.parse_args()
 
     print("[boot] preloading Piper TTS and Parakeet ASR...")
     preload_duplex_models()
     print(f"[boot] models ready, starting websocket server on ws://{args.host}:{args.port}/ws")
 
-    app = create_app()
+    if args.is_cpm:
+        print("[boot] CPM mode: using MiniCPM-duplex at port 8556")
+        agent_factory = lambda: DuplexAudioAgent(llm_generate_fn=cpm_generate)
+        app = create_app(agent_factory=agent_factory)
+    else:
+        app = create_app()
     uvicorn.run(app, host=args.host, port=args.port)
 
 
