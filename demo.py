@@ -28,7 +28,10 @@ from duplex_protocol import BlockSnapshot, SessionSnapshot, server_url_from_addr
 from full_duplex import ASR_SAMPLE_RATE, DuplexAudioAgent, DuplexAudioBlock
 
 POLL_INTERVAL_S = 0.08
-DEFAULT_SERVER_URL = os.getenv("FULL_DUPLEX_SERVER_URL", "127.0.0.1:8998")
+DEFAULT_SERVER_URL = os.getenv(
+    "FULL_DUPLEX_SERVER_URL",
+    f"127.0.0.1:{os.getenv('WS_DUPLEX_SERVER_PORT', '8998')}",
+)
 
 _LOADING_HTML = (
     "<div style='padding:20px;color:#aaa;font-family:monospace;font-size:13px'>"
