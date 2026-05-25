@@ -376,6 +376,15 @@ class VirtualSimulationConnection:
             else:
                 blocks_since_user_spoke[0] += 1
 
+            # When user is currently speaking use the user-speech block as source so
+            # RM5 lookahead works correctly.  When user has already stopped, use the
+            # CURRENT block so each call gets its own display row and escalating penalty.
+            def _src_id() -> Optional[str]:
+                if blocks_since_user_spoke[0] == 0:
+                    return agent._latest_user_source_block_id
+                cur = agent._current_block
+                return cur.block_id if cur else agent._latest_user_source_block_id
+
             if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
                 # Outside the speaking window — force idle without vLLM call.
                 steps.append(StepRecord(
@@ -385,7 +394,7 @@ class VirtualSimulationConnection:
                     response_token_ids=[],
                     log_probs=[],
                     is_idle=True,
-                    source_block_id=agent._latest_user_source_block_id,
+                    source_block_id=_src_id(),
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -402,7 +411,7 @@ class VirtualSimulationConnection:
                     response_token_ids=[],
                     log_probs=[],
                     is_idle=True,
-                    source_block_id=agent._latest_user_source_block_id,
+                    source_block_id=_src_id(),
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -469,7 +478,7 @@ class VirtualSimulationConnection:
                 response_token_ids=rtok,
                 log_probs=lps,
                 is_idle=(not text),
-                source_block_id=agent._latest_user_source_block_id,
+                source_block_id=_src_id(),
                 user_spoke_before=user_spoke,
             ))
             return text
@@ -613,6 +622,12 @@ class RealTimeGPTEpisodeRunner:
             else:
                 blocks_since_user_spoke[0] += 1
 
+            def _src_id() -> Optional[str]:
+                if blocks_since_user_spoke[0] == 0:
+                    return agent._latest_user_source_block_id
+                cur = agent._current_block
+                return cur.block_id if cur else agent._latest_user_source_block_id
+
             if blocks_since_user_spoke[0] > self.max_blocks_after_user_speech:
                 steps.append(StepRecord(
                     step_id=str(uuid.uuid4())[:8],
@@ -621,7 +636,7 @@ class RealTimeGPTEpisodeRunner:
                     response_token_ids=[],
                     log_probs=[],
                     is_idle=True,
-                    source_block_id=agent._latest_user_source_block_id,
+                    source_block_id=_src_id(),
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -638,7 +653,7 @@ class RealTimeGPTEpisodeRunner:
                     response_token_ids=[],
                     log_probs=[],
                     is_idle=True,
-                    source_block_id=agent._latest_user_source_block_id,
+                    source_block_id=_src_id(),
                     user_spoke_before=user_spoke,
                 ))
                 return ""
@@ -705,7 +720,7 @@ class RealTimeGPTEpisodeRunner:
                 response_token_ids=rtok,
                 log_probs=lps,
                 is_idle=(not text),
-                source_block_id=agent._latest_user_source_block_id,
+                source_block_id=_src_id(),
                 user_spoke_before=user_spoke,
             ))
             return text
@@ -1222,16 +1237,20 @@ class FullDuplexRLTrainer:
         rm_names = [fn.__name__ for fn in self.reward_fns]
 
         # Map block_id → the step that covers it (speech steps).
-        # Idle steps have no covered blocks — group them by source_block_id (multiple
-        # idle steps can share the same source block when the window spans several calls).
+        # Idle steps have no covered blocks — group them by source_block_id.
+        # speech_source_steps: source_block_id → speech steps that were triggered there
+        #   (used to print a "→ generated" marker at the decision block).
         blk_to_step: Dict[str, "StepRecord"] = {}
         idle_source_to_steps: Dict[str, List["StepRecord"]] = {}
+        speech_source_steps: Dict[str, List["StepRecord"]] = {}
         for step in episode.steps:
             if step.is_idle:
                 idle_source_to_steps.setdefault(step.source_block_id, []).append(step)
             else:
                 for bid in step.blocks_covered:
                     blk_to_step[bid] = step
+                if step.source_block_id:
+                    speech_source_steps.setdefault(step.source_block_id, []).append(step)
 
         # last_blk_of_step[id(step)] = block_id of that step's last covered block
         last_blk_of_step: Dict[int, str] = {}
@@ -1274,6 +1293,11 @@ class FullDuplexRLTrainer:
             if len(b) > BW:
                 b = b[:BW - 1] + "…"
             print(f"  {i:>3}  {u:<{UW}}  {b:<{BW}}")
+
+            # Mark blocks where the model chose to generate (decision point for speech steps).
+            for sp in speech_source_steps.get(blk.block_id, []):
+                n_cov = len(sp.blocks_covered)
+                print(f"  [→ generated]  covers {n_cov} block(s) ahead")
 
             # Print idle-step rewards after the source block where each decision was made.
             for idle_step in idle_source_to_steps.get(blk.block_id, []):
