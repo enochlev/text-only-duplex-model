@@ -39,7 +39,6 @@ from trainer import (
     junk_output_penalty,
     missed_turn_penalty,
     make_default_data_pool,
-    check_rm_servers,
     set_embed_device,
 )
 
@@ -162,7 +161,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Stage 2 — RL fine-tuning
     # -----------------------------------------------------------------------
-    check_rm_servers()
+    # check_rm_servers()  # VAD server not used in text-only sim
 
     rl_cfg = TrainerConfig(
         model_name_or_path=rl_model_path,

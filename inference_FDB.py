@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import json
+import sys
 import time
 from glob import glob
 from pathlib import Path
@@ -24,21 +25,55 @@ __MACOSX   candor_pause_handling  icc_backchannel     synthetic_user_interruptio
 """
 root_dir_path = Path("v1_v1.5/dataset")
 tasks = [
-    #"background_speech",
+    #"background_speech",#use clean also
     #"candor_pause_handling",
-    "candor_turn_taking",
-    "icc_backchannel",
-    "synthetic_pause_handling",
-    "synthetic_user_interruption",
-    "talking_to_other",
-    "user_backchannel",
-    "user_interruption",
+    #"candor_turn_taking",
+    #"icc_backchannel",
+    #"synthetic_pause_handling",
+    #"synthetic_user_interruption",
+    #"talking_to_other",#use clean also
+    "user_backchannel",#use clean also
+    "user_interruption",#use clean also
 
 ]
-prefix = ""  # "" or "clean_": the prefix for input wav files
+clean_tasks = [
+    #"background_speech", 
+    "talking_to_other", 
+    "user_backchannel", 
+    "user_interruption"
+    ]
+prefix = "clean_"  # "" or "clean_": the prefix for input wav files
 overwrite = True  # Whether to overwrite existing output files
 MAX_EVAL_COUNT = None  # Max files to process per task (None = all)
+if prefix == "clean_":
+    tasks = clean_tasks
+
+assert prefix in {"", "clean_"}, "prefix must be '' or 'clean_'"
+
 #####################
+
+
+LOG_PATH = Path("log.txt")
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+def _setup_log() -> None:
+    log_file = LOG_PATH.open("w")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
 
 
 CHUNK_MS = 80       # audio chunk duration sent per frame
@@ -192,6 +227,7 @@ def _input_files() -> List[Path]:
 
 
 def main() -> None:
+    _setup_log()
     ap = argparse.ArgumentParser("fdb_batch_client")
     ap.add_argument("--server_ip", required=True, help="host[:port] or http(s):// URL")
     args = ap.parse_args()
