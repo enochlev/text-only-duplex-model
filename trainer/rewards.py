@@ -505,21 +505,13 @@ def _text_turn_complete(text: str) -> bool:
 def _user_finished_in(block: DuplexAudioBlock) -> bool:
     """True if the user's utterance in this block is a complete conversational turn.
 
-    Terminal-punctuation heuristic overrides VAD when the text clearly ends a sentence.
-    VAD is consulted for ambiguous cases (no terminal punctuation).
+    Text-only: terminal-punctuation heuristic only. No VAD.
+    No punctuation → treated as mid-sentence (False).
     """
     text = block.user_text or ""
     if not text.strip():
         return False
-    # Clear sentence-ending punctuation: trust the text signal — VAD is unreliable here.
-    if _text_turn_complete(text):
-        return True
-    mic = block.mic_audio if (block.mic_audio is not None and len(block.mic_audio) > 0) else None
-    result = _vad_turn_complete(text, mic_audio=mic)
-    if result is not None:
-        return result
-    # Fallback: any text without punctuation is treated as mid-sentence.
-    return False
+    return _text_turn_complete(text)
 
 
 # ---------------------------------------------------------------------------
