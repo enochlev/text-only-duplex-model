@@ -355,6 +355,7 @@ class VirtualSimulationConnection:
         tts_model: str = "",
         device: Optional[str] = None,
         max_blocks_after_user_speech: int = 2,
+        is_minicpm: bool = False,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -364,6 +365,7 @@ class VirtualSimulationConnection:
         self.tts_model = tts_model
         self.device = device
         self.max_blocks_after_user_speech = max_blocks_after_user_speech
+        self.is_minicpm = is_minicpm
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -613,6 +615,7 @@ class RealTimeGPTEpisodeRunner:
         tts_model: str = "",
         device: Optional[str] = None,
         max_blocks_after_user_speech: int = 2,
+        is_minicpm: bool = False,
     ) -> None:
         self.simulator = simulator
         self.vllm_engine = vllm_engine
@@ -622,6 +625,7 @@ class RealTimeGPTEpisodeRunner:
         self.tts_model = tts_model
         self.device = device
         self.max_blocks_after_user_speech = max_blocks_after_user_speech
+        self.is_minicpm = is_minicpm
 
     def run_episode(self) -> Episode:
         episode_id = str(uuid.uuid4())[:8]
@@ -1215,6 +1219,7 @@ class FullDuplexRLTrainer:
                     tts_model=self.config.tts_model,
                     device=self.config.device,
                     max_blocks_after_user_speech=self.config.max_blocks_after_user_speech,
+                    is_minicpm=self.is_minicpm,
                 )
             else:
                 runner = VirtualSimulationConnection(
@@ -1226,6 +1231,7 @@ class FullDuplexRLTrainer:
                     tts_model=self.config.tts_model,
                     device=self.config.device,
                     max_blocks_after_user_speech=self.config.max_blocks_after_user_speech,
+                    is_minicpm=self.is_minicpm,
                 )
             try:
                 ep = runner.run_episode()
