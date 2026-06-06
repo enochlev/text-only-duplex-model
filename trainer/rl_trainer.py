@@ -1024,7 +1024,8 @@ def _create_vllm_engine(
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             dtype=dtype,
-            enforce_eager=True
+            enforce_eager=True,
+            trust_remote_code=True,  # MiniCPM ships custom modeling code
 
         )
 
@@ -1062,6 +1063,7 @@ def _create_vllm_engine(
             max_model_len=max_model_len,
             dtype=dtype,
             enforce_eager=True,
+            trust_remote_code=True,  # MiniCPM ships custom modeling code
         )
     finally:
         if _orig_create is not None:
@@ -1113,7 +1115,9 @@ class FullDuplexRLTrainer:
             print("[trainer] Detected MiniCPM — using MiniCPM <用户>/<AI> prompt format (no system prompt)")
 
         print(f"[trainer] loading tokenizer: {config.model_name_or_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name_or_path, trust_remote_code=True
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -1128,6 +1132,7 @@ class FullDuplexRLTrainer:
                 config.ref_model_name_or_path,
                 torch_dtype=torch.bfloat16,
                 device_map=ref_device,
+                trust_remote_code=True,  # MiniCPM ships custom modeling code
             )
             self.ref_model.eval()
             for p in self.ref_model.parameters():

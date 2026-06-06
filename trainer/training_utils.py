@@ -16,6 +16,7 @@ def load_hf_model(
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=dtype,
+        trust_remote_code=True,  # MiniCPM ships custom modeling code
     )
     model.to(device)
     model.train()
