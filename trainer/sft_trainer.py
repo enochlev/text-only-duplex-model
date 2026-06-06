@@ -303,7 +303,9 @@ class SFTTrainer:
         self._step = 0
 
         print(f"[sft] loading tokenizer: {config.model_name_or_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name_or_path, trust_remote_code=True
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 

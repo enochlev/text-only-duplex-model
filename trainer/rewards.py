@@ -166,6 +166,11 @@ def timely_response_reward(
     src = history[-1]
     if src.user_text:
         # Source had user speech AND covered block has no user_text (checked above).
+        if src.assistant_text:
+            # Bot was ALREADY speaking at the source block → this is an interruption
+            # that the user happened to stop during, not a polite wait-then-respond.
+            # RM2 penalises the overlap; do not also hand out the timely-response bonus.
+            return 0.0
         # T+1 being silent is the lookahead evidence that user stopped — lag=0.
         return +1.0
     # Source block was silent — count how many blocks since user last spoke.

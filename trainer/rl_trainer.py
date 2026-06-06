@@ -451,7 +451,7 @@ class VirtualSimulationConnection:
                 else:
                     # Crossover: bot was also speaking → model should stop and listen.
                     # Higher epsilon at overlap moments; lower at clean new-question starts.
-                    _eps_rate = 0.30 if _last_blk.assistant_text else 0.10
+                    _eps_rate = 0.30 if _last_blk.assistant_text else 0.20
                     if np.random.random() < _eps_rate:
                         eps_fired[0] += 1
                         _force_idle = True
@@ -701,7 +701,7 @@ class RealTimeGPTEpisodeRunner:
                 else:
                     # Crossover: bot was also speaking → model should stop and listen.
                     # Higher epsilon at overlap moments; lower at clean new-question starts.
-                    _eps_rate = 0.30 if _last_blk.assistant_text else 0.10
+                    _eps_rate = 0.30 if _last_blk.assistant_text else 0.20
                     if np.random.random() < _eps_rate:
                         eps_fired[0] += 1
                         _force_idle = True

@@ -123,24 +123,26 @@ Idle steps produce no tokens, so REINFORCE can't compute a gradient directly. Th
 
 ## 8. Reward Function Reference
 
-Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2.5, 0.75, 1.5, 2.0]`:
+Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2.5, 0.75, 2.0]`:
 
 | # | Function | Weight | Step type | Fires when | Raw values | Weighted values |
 |---|---|---|---|---|---|---|
 | RM1 | `block_silence_penalty` | 2.0 | **Idle** | Bot stays silent after user finishes speaking (capped at 2 blocks; model is force-idled beyond that) | lag=0: −1.0 / lag=1: −2.0 / lag≥2: 0.0 | −2.0 / −4.0 / 0.0 |
 | RM2 | `block_interruption_penalty` | 4.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | committed(run=1,silent src): 0.0 / true-interrupt(run=1): −0.75 / run=2: −1.0 / run=3: −1.5 / run≥4: −2.0 | 0.0 / −3.0 / −4.0 / −6.0 / −8.0 |
 | RM3 | `block_idle_reward` | 1.5 | **Idle** | Bot stays silent while user is mid-sentence AND user continues in the next block (post-episode lookahead) | +0.5 | +0.75 |
-| RM4 | `timely_response_reward` | 2.5 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +2.5 / +1.875 / +1.25 |
+| RM4 | `timely_response_reward` | 2.5 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn. **No bonus if the source block already had bot speech** (that's an interruption, not a polite wait — RM2 handles it). | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +2.5 / +1.875 / +1.25 |
 | RM5 | `backchannel_loop_penalty` | 0.75 | **Speech** | Bot outputs a backchannel-only response. Single backchannel during user's mid-sentence is free. | mid-sentence run=1: 0.0 / post-turn run=1: −0.5 / run N: −0.5N | 0.0 / −0.375 / −0.375N |
-| RM6 | `junk_output_penalty` | 1.5 | **Speech** | Bot outputs HTML/junk tokens (`<idle>`, `<span>`, etc.) instead of speech text | −1.0 | −1.5 |
-| RM7 | `missed_turn_penalty` | 2.0 | **Speech** | Bot speech step follows N unanswered prior user turns. Each skipped turn costs −1.0. Current turn being answered does not count. Uses base history. | N skipped: −N | −2.0 per skipped turn |
+| RM6 | `missed_turn_penalty` | 2.0 | **Speech** | Bot speech step follows N unanswered prior user turns. Each skipped turn costs −1.0. Current turn being answered does not count. Uses base history. | N skipped: −N | −2.0 per skipped turn |
 
 `vad_overlap_penalty` (audio overlap via pyannote OSD) is defined but commented out — no-op in text-only simulation; re-enable for real audio.
 
+`junk_output_penalty` (HTML/markdown junk, was RM6) is **commented out** as of 2026-06-06 — the MiniCPM base no longer emits junk tokens, and the regex penalised the model's natural markdown/list formatting. `missed_turn_penalty` is now RM6 (was RM7). The `_JUNK_RE` guard inside `timely_response_reward` still suppresses RM4 for junk blocks even though the standalone RM is off. Re-enable if a future base model regresses to outputting tags/markdown.
+
 **Key interactions:**
 - RM1 + RM4 are complementary: RM1 penalises idle steps that delay a response; RM4 rewards the speech step that delivers it.
-- RM7 is the speech-step complement to RM1: it creates a **direct gradient** on the speech step for having skipped prior turns, which RM1 cannot do (RM1 only propagates via returns through idle steps). Responding to Q1 and Q2 earns RM7=0 both times; skipping Q1 and responding only to Q2 earns RM7=−2.0 on the Q2 speech step.
-- RM2 and RM7 both receive **base history** (ends at source block T). RM7 uses base history so prior covered blocks from the same LLM call don't falsely break the unanswered-turn count.
+- RM6 (`missed_turn_penalty`) is the speech-step complement to RM1: it creates a **direct gradient** on the speech step for having skipped prior turns, which RM1 cannot do (RM1 only propagates via returns through idle steps). Responding to Q1 and Q2 earns RM6=0 both times; skipping Q1 and responding only to Q2 earns RM6=−2.0 on the Q2 speech step.
+- RM2 and RM6 (`missed_turn_penalty`) both receive **base history** (ends at source block T). `missed_turn_penalty` uses base history so prior covered blocks from the same LLM call don't falsely break the unanswered-turn count.
+- RM2 + RM4 are now strictly complementary on interruptions: an interrupt is penalised by RM2 and earns **no** RM4 offset (RM4's source-block guard), so barging in is unprofitable. Previously a barge-in collected +2.5 the moment the user stopped, netting only ≈−0.5.
 - RM3 uses **post-episode lookahead** to verify the user truly continued speaking (not just a gap before a new turn).
 - RM5 receives **augmented history** so consecutive-backchannel run counts accumulate correctly across all covered blocks of the same step.
 
@@ -148,7 +150,7 @@ Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 1.5, 2
 
 ## 9. Epsilon-Greedy Exploration (`rl_trainer.py:390`)
 
-When the user is mid-sentence, the bot is sometimes **forced silent** even if it would normally generate. This lets REINFORCE observe RM3's +0.5 reward and learn that silence during user speech is correct. The rate is **10%** for clean new-question starts (user has text, source block had no prior bot overlap) and **30%** for overlap moments (source block already had both user and bot text), where staying silent is more clearly correct.
+When the user is mid-sentence, the bot is sometimes **forced silent** even if it would normally generate. This lets REINFORCE observe RM3's +0.5 reward and learn that silence during user speech is correct. The rate is **20%** for clean new-question starts (user has text, source block had no prior bot overlap) and **30%** for overlap moments (source block already had both user and bot text), where staying silent is more clearly correct. (Clean-start rate was raised 10%→20% on 2026-06-06: the verbose MiniCPM base jumps in after the first fragment of a multi-block question, so more forced-idle samples are needed to teach it to wait for the full question.)
 
 **Why `max_tokens=1` for forced-idle steps:** REINFORCE requires a log probability to compute a gradient. Even when the text output is discarded, vLLM generates one token so its log-prob is captured. Without this, `log_probs=[]` and the gradient is zero.
 
@@ -156,7 +158,7 @@ When the user is mid-sentence, the bot is sometimes **forced silent** even if it
 
 ## 10. Known Issue — Fully-Idle Episodes
 
-Idle-step rewards (RM1/RM3) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the current RM weights (`[2.0, 4.0, 1.5, 2.5, 0.75, 1.5]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
+Idle-step rewards (RM1/RM3) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the current RM weights (`[2.0, 4.0, 1.5, 2.5, 0.75, 2.0]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
 
 ---
 
@@ -166,6 +168,9 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
+| 2026-06-06 | RM4 source-block guard (`rewards.py`) | +1.0 whenever src had user_text | +1.0 only if src had no bot speech | Barge-in (interrupt) collected the timely +2.5 the moment user stopped, halving RM2's deterrent; now interrupts are strictly unprofitable |
+| 2026-06-06 | RM6 `junk_output_penalty` (`trainer.py`) | active, weight=1.5 | commented out | MiniCPM base is clean; RM6 penalised its natural markdown/list formatting. missed_turn renumbered RM7→RM6 |
+| 2026-06-06 | Epsilon-greedy clean-start rate (`rl_trainer.py`) | 0.10 | 0.20 | Verbose MiniCPM jumps in after first question fragment; more forced-idle needed to teach waiting through multi-block questions |
 | 2026-05-25 | RM2 run=2 raw penalty (`rewards.py`) | −0.5 | −1.0 | First conscious re-interrupt decision was as cheap as committed-overlap free pass |
 | 2026-05-25 | RM2 run=3 raw penalty (`rewards.py`) | −1.0 | −1.5 | Proportionate escalation after run=2 change |
 | 2026-05-25 | RM2 true-interrupt run=1 raw penalty (`rewards.py`) | −0.5 | −0.75 | Model learned overlap+response (+2.5 RM4) beats first-interrupt cost (-2.0); raising to -3.0 weighted makes it unprofitable |
