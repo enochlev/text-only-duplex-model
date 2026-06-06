@@ -60,6 +60,7 @@ from full_duplex import (
     DuplexAudioBlock,
     preload_piper_voice,
     _resample,
+    _build_cpm_prompt,
 )
 
 from .data_ingestion import DataPool, GPTVoiceSimulator, _wpm_duration_s
@@ -237,6 +238,7 @@ def llm_generate_train(
     max_tokens: int = 16,
     temperature: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    is_minicpm: bool = False,
 ) -> Tuple[str, List[int], List[int], List[float]]:
     """
     Generate a response with the vLLM engine and return training metadata.
@@ -250,7 +252,10 @@ def llm_generate_train(
     if not HAS_VLLM:
         raise RuntimeError("vLLM is required for llm_generate_train. pip install vllm")
 
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+    if is_minicpm:
+        # MiniCPM uses raw <用户>/<AI> completion format — no system prompt, no chat template.
+        full_prompt = _build_cpm_prompt(user_message)
+    elif hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -276,21 +281,26 @@ def llm_generate_train(
     )
     if logit_bias:
         sp_kwargs["logit_bias"] = logit_bias
+    if is_minicpm:
+        sp_kwargs["stop"] = ["<用户>"]
     sampling_params = VLLMSamplingParams(**sp_kwargs)
     outputs = vllm_engine.generate([full_prompt], sampling_params, use_tqdm=False)
     out = outputs[0].outputs[0]
 
-    _ROLE_RE = re.compile(
-        r'<\|?(?:im_end|im_start|user|assistant|system)[|\s>][^>]*>?'
-        r'|</?(?:AI|s|user|idle)>',
-        re.I,
-    )
-    text = _ROLE_RE.sub("", out.text or "")
-    text = text.replace("</s>", "").replace("<s>", "").strip()
-    # Strip Qwen3 thinking blocks: <think>...</think> and any orphaned tags.
-    # vLLM's skip_special_tokens removes <think> (special token) but not </think>.
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    text = re.sub(r'</?think>', '', text).strip()
+    if is_minicpm:
+        text = re.sub(r'<用户>|<AI>|</s>|<s>', '', out.text or '').strip()
+    else:
+        _ROLE_RE = re.compile(
+            r'<\|?(?:im_end|im_start|user|assistant|system)[|\s>][^>]*>?'
+            r'|</?(?:AI|s|user|idle)>',
+            re.I,
+        )
+        text = _ROLE_RE.sub("", out.text or "")
+        text = text.replace("</s>", "").replace("<s>", "").strip()
+        # Strip Qwen3 thinking blocks: <think>...</think> and any orphaned tags.
+        # vLLM's skip_special_tokens removes <think> (special token) but not </think>.
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        text = re.sub(r'</?think>', '', text).strip()
 
     response_token_ids: List[int] = list(out.token_ids)
 
@@ -449,6 +459,7 @@ class VirtualSimulationConnection:
                     self.vllm_engine, self.tokenizer,
                     max_tokens=1, temperature=self.vllm_temperature,
                     logit_bias={self.tokenizer.eos_token_id: 100},
+                    is_minicpm=self.is_minicpm,
                 )
                 # vLLM may strip EOS from token_ids (skip_special_tokens).
                 # Without it, accumulate_reinforce_gradients skips this step.
@@ -468,6 +479,7 @@ class VirtualSimulationConnection:
                     self.tokenizer,
                     max_tokens=self.vllm_max_tokens,
                     temperature=self.vllm_temperature,
+                    is_minicpm=self.is_minicpm,
                 )
                 if not text:
                     eps_natural_fired[0] += 1
@@ -695,6 +707,7 @@ class RealTimeGPTEpisodeRunner:
                     self.vllm_engine, self.tokenizer,
                     max_tokens=1, temperature=self.vllm_temperature,
                     logit_bias={self.tokenizer.eos_token_id: 100},
+                    is_minicpm=self.is_minicpm,
                 )
                 # vLLM may strip EOS from token_ids (skip_special_tokens).
                 # Without it, accumulate_reinforce_gradients skips this step.
@@ -714,6 +727,7 @@ class RealTimeGPTEpisodeRunner:
                     self.tokenizer,
                     max_tokens=self.vllm_max_tokens,
                     temperature=self.vllm_temperature,
+                    is_minicpm=self.is_minicpm,
                 )
                 if not text:
                     eps_natural_fired[0] += 1
@@ -1093,6 +1107,10 @@ class FullDuplexRLTrainer:
                 f"reward_fn_weights length ({len(self.rm_weights)}) must match "
                 f"reward_fns length ({len(self.reward_fns)})"
             )
+
+        self.is_minicpm: bool = "MiniCPM" in config.model_name_or_path
+        if self.is_minicpm:
+            print("[trainer] Detected MiniCPM — using MiniCPM <用户>/<AI> prompt format (no system prompt)")
 
         print(f"[trainer] loading tokenizer: {config.model_name_or_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
