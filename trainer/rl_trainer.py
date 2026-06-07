@@ -319,6 +319,16 @@ def llm_generate_train(
             lp_val = lp_obj.logprob if hasattr(lp_obj, "logprob") else float(lp_obj)
             log_probs.append(lp_val)
 
+    # vLLM can return one more entry in token_ids than in logprobs when a terminal
+    # EOS/stop token is appended to the output without a sampling logprob. The extra
+    # token is always trailing (generation order), so align both lists to the tokens
+    # that actually carry a logprob — keeps REINFORCE/KL indexing consistent and
+    # avoids training over a token we have no rollout probability for.
+    if log_probs and len(response_token_ids) != len(log_probs):
+        n = min(len(response_token_ids), len(log_probs))
+        response_token_ids = response_token_ids[:n]
+        log_probs = log_probs[:n]
+
     text_clean = text.replace("<idle>", "").strip()
     # If the model leads with "idle"/"Idle", it decided to be silent — discard
     # everything that follows too (the continuation is post-idle garbage).
@@ -1552,7 +1562,10 @@ class FullDuplexRLTrainer:
         if self.ref_model is None or step.is_idle or not step.response_token_ids or not step.log_probs:
             return 0.0, 0.0
 
-        n_resp = len(step.response_token_ids)
+        # Defensive: response_token_ids and log_probs should already be equal length
+        # (reconciled in llm_generate_train), but clamp to the shorter so a future
+        # regression degrades gracefully instead of crashing the per-token subtraction.
+        n_resp = min(len(step.response_token_ids), len(step.log_probs))
         budget = self.config.max_seq_len - n_resp - 1
         if budget < 1:
             return 0.0, 0.0
