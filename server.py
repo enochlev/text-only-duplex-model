@@ -21,12 +21,13 @@ from duplex_protocol import (
     snapshot_fingerprint,
     snapshot_from_agent,
 )
-from full_duplex import DuplexAudioAgent, cpm_generate, preload_duplex_models
+import full_duplex
 from full_duplex import (
-    VLLM_DUPLEX_SERVER_PORT,
-    VLLM_PCM_DUPLEX_SERVER_PORT,
-    WS_DUPLEX_SERVER_PORT,
-    WS_PCM_DUPLEX_SERVER_PORT,
+    DuplexAudioAgent,
+    SERVER_PORT,
+    VLLM_PORT,
+    cpm_generate,
+    preload_duplex_models,
 )
 
 POLL_INTERVAL_S = 0.08
@@ -329,38 +330,37 @@ def main() -> None:
         dest="is_cpm",
         action="store_true",
         default=False,
-        help="Use MiniCPM-duplex instead of the trained local model. "
-             "Defaults to WS_PCM_DUPLEX_SERVER_PORT and VLLM_PCM_DUPLEX_SERVER_PORT.",
+        help="Use MiniCPM-duplex instead of the trained local model.",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=None,
-        help="Override the websocket server port. Defaults to WS_DUPLEX_SERVER_PORT "
-             "or WS_PCM_DUPLEX_SERVER_PORT depending on mode.",
+        default=SERVER_PORT,
+        help=f"Websocket server port that UI clients connect to (default {SERVER_PORT}).",
+    )
+    parser.add_argument(
+        "--vllm-port",
+        type=int,
+        default=VLLM_PORT,
+        help=f"OpenAI-compatible model backend port (default {VLLM_PORT}).",
     )
     args = parser.parse_args()
 
-    resolved_port = args.port
-    if resolved_port is None:
-        resolved_port = WS_PCM_DUPLEX_SERVER_PORT if args.is_cpm else WS_DUPLEX_SERVER_PORT
-
-    resolved_backend_port = (
-        VLLM_PCM_DUPLEX_SERVER_PORT if args.is_cpm else VLLM_DUPLEX_SERVER_PORT
-    )
+    # Point the generate functions at the chosen model backend.
+    full_duplex.VLLM_PORT = args.vllm_port
 
     print("[boot] preloading Piper TTS and Parakeet ASR...")
     preload_duplex_models()
-    print(f"[boot] models ready, starting websocket server on ws://{args.host}:{resolved_port}/ws")
+    print(f"[boot] models ready, starting websocket server on ws://{args.host}:{args.port}/ws")
 
     if args.is_cpm:
-        print(f"[boot] CPM mode: using MiniCPM-duplex backend on port {resolved_backend_port}")
+        print(f"[boot] CPM mode: using MiniCPM-duplex backend on port {args.vllm_port}")
         agent_factory = lambda: DuplexAudioAgent(llm_generate_fn=cpm_generate)
         app = create_app(agent_factory=agent_factory)
     else:
-        print(f"[boot] local mode: using trained model backend on port {resolved_backend_port}")
+        print(f"[boot] local mode: using trained model backend on port {args.vllm_port}")
         app = create_app()
-    uvicorn.run(app, host=args.host, port=resolved_port)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

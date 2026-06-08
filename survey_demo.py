@@ -5,9 +5,9 @@ Tab 1: Structured survey (demographics → 6 voice sessions → Likert → compa
 Tab 2: Free-play voice chat for demos.
 
 Run after starting both servers:
-    python server.py                      # Model A  on WS_DUPLEX_SERVER_PORT     (8998)
-    python server.py --cpm                # Model B  on WS_PCM_DUPLEX_SERVER_PORT  (8999)
-    python survey_demo.py
+    python server.py --port 8998                   # Model A on port 8998
+    python server.py --cpm --port 8999 --vllm-port 8556   # Model B on port 8999
+    python survey_demo.py --model-a-port 8998 --model-b-port 8999
 """
 from __future__ import annotations
 
@@ -31,11 +31,13 @@ from duplex_client import FullDuplexClient
 from duplex_protocol import server_url_from_address
 
 # ── Config ────────────────────────────────────────────────────────────────────
-_PORT_A  = int(os.getenv("WS_DUPLEX_SERVER_PORT",     "8998"))
-_PORT_B  = int(os.getenv("WS_PCM_DUPLEX_SERVER_PORT", "8999"))
+# Two server.py instances are compared. Each port points at one server's
+# websocket. Override with --model-a-port / --model-b-port (see __main__).
+MODEL_A_PORT = int(os.getenv("MODEL_A_PORT", "8998"))
+MODEL_B_PORT = int(os.getenv("MODEL_B_PORT", "8999"))
 _URLS    = {
-    "A": server_url_from_address(f"127.0.0.1:{_PORT_A}"),
-    "B": server_url_from_address(f"127.0.0.1:{_PORT_B}"),
+    "A": server_url_from_address(f"127.0.0.1:{MODEL_A_PORT}"),
+    "B": server_url_from_address(f"127.0.0.1:{MODEL_B_PORT}"),
 }
 _NAMES   = {"A": "Duplex (Trained)", "B": "MiniCPM-Duplex"}
 MAX_CALL = 45.0
@@ -622,8 +624,8 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 fp_model = gr.Dropdown(
                     choices=[
-                        (f"Model A — {_NAMES['A']} (port {_PORT_A})", "A"),
-                        (f"Model B — {_NAMES['B']} (port {_PORT_B})", "B"),
+                        (f"Model A — {_NAMES['A']} (port {MODEL_A_PORT})", "A"),
+                        (f"Model B — {_NAMES['B']} (port {MODEL_B_PORT})", "B"),
                     ],
                     value="A",
                     label="Model",
@@ -746,4 +748,27 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Blind A/B survey for two duplex servers")
+    parser.add_argument(
+        "--model-a-port",
+        type=int,
+        default=MODEL_A_PORT,
+        help=f"Websocket port of the Model A server.py instance (default {MODEL_A_PORT}).",
+    )
+    parser.add_argument(
+        "--model-b-port",
+        type=int,
+        default=MODEL_B_PORT,
+        help=f"Websocket port of the Model B server.py instance (default {MODEL_B_PORT}).",
+    )
+    args = parser.parse_args()
+    MODEL_A_PORT = args.model_a_port
+    MODEL_B_PORT = args.model_b_port
+    _URLS = {
+        "A": server_url_from_address(f"127.0.0.1:{MODEL_A_PORT}"),
+        "B": server_url_from_address(f"127.0.0.1:{MODEL_B_PORT}"),
+    }
+
     build_app().launch(share=True, theme=gr.themes.Soft())

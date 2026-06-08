@@ -28,10 +28,11 @@ from duplex_protocol import BlockSnapshot, SessionSnapshot, server_url_from_addr
 from full_duplex import ASR_SAMPLE_RATE, DuplexAudioAgent, DuplexAudioBlock
 
 POLL_INTERVAL_S = 0.08
-DEFAULT_SERVER_URL = os.getenv(
-    "FULL_DUPLEX_SERVER_URL",
-    f"127.0.0.1:{os.getenv('WS_DUPLEX_SERVER_PORT', '8998')}",
-)
+
+# Port of the full-duplex websocket server (server.py) this client connects to.
+# Override with --port on the CLI or the FULL_DUPLEX_PORT env var.
+FULL_DUPLEX_PORT = int(os.getenv("FULL_DUPLEX_PORT", "8998"))
+DEFAULT_SERVER_URL = f"127.0.0.1:{FULL_DUPLEX_PORT}"
 
 _LOADING_HTML = (
     "<div style='padding:20px;color:#aaa;font-family:monospace;font-size:13px'>"
@@ -517,4 +518,17 @@ def build_demo() -> gr.Blocks:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Gradio client for the full-duplex server")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=FULL_DUPLEX_PORT,
+        help=f"Port of the full-duplex websocket server to connect to (default {FULL_DUPLEX_PORT}).",
+    )
+    args = parser.parse_args()
+    FULL_DUPLEX_PORT = args.port
+    DEFAULT_SERVER_URL = f"127.0.0.1:{FULL_DUPLEX_PORT}"
+
     build_demo().launch(theme=gr.themes.Soft())
