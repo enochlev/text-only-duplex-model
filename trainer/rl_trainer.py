@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import shutil
 from dotenv import load_dotenv as _load_dotenv
 _load_dotenv()
 
@@ -1853,14 +1854,16 @@ class FullDuplexRLTrainer:
     def _save_best_checkpoint(self, avg_reward: float) -> None:
         """Replace the on-disk best checkpoint when avg_reward improves.
 
-        Saves only the model weights as a single fp16 .pt file — no optimizer
-        state, no shards — to minimise disk usage.  Tokenizer is written once
-        into the same directory and never overwritten.
+        Saves only the model weights as a single fp16 file — no optimizer
+        state, no shards — to minimise disk usage. The whole directory is
+        refreshed on each new best so config/tokenizer metadata never goes
+        stale across runs that reuse the same output_dir.
         """
         if avg_reward <= self._best_avg_reward:
             return
 
         best_dir = os.path.join(self.config.output_dir, "best")
+        shutil.rmtree(best_dir, ignore_errors=True)
         os.makedirs(best_dir, exist_ok=True)
 
         # Delete previous best weights before writing the new one.
@@ -1878,15 +1881,11 @@ class FullDuplexRLTrainer:
         _safetensors_save(state_dict_fp16, weights_path)
         del state_dict_fp16
 
-        # Write config.json once so the dir is directly loadable by HF.
-        cfg_marker = os.path.join(best_dir, "config.json")
-        if not os.path.exists(cfg_marker):
-            self.model.config.save_pretrained(best_dir)
+        self.model.config.save_pretrained(best_dir)
+        if getattr(self.model, "generation_config", None) is not None:
+            self.model.generation_config.save_pretrained(best_dir)
 
-        # Tokenizer is tiny; write it once so the checkpoint is self-contained.
-        tok_marker = os.path.join(best_dir, "tokenizer_config.json")
-        if not os.path.exists(tok_marker):
-            self.tokenizer.save_pretrained(best_dir)
+        self.tokenizer.save_pretrained(best_dir)
 
         prev = self._best_avg_reward
         self._best_avg_reward = avg_reward
