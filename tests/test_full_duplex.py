@@ -1211,3 +1211,99 @@ def test_trim_at_first_sentence_end_after_160_chars():
         b.assistant_text for b in agent.blocks if b.assistant_text
     )
     assert "should be dropped" not in all_text
+
+
+# ---------------------------------------------------------------------------
+# Whole-response TTS synthesis + per-block slicing (seamless playback)
+# ---------------------------------------------------------------------------
+
+def _ramp_tts_agent():
+    """Agent whose mock TTS returns a position-encoding ramp proportional to the
+    word count, and counts how many times it is called. Lets us prove the whole
+    response is synthesized ONCE and the per-block chunks are contiguous slices.
+    """
+    calls = {"n": 0, "texts": []}
+    SAMPLES_PER_WORD = 4000  # 0.25s/word @ 16 kHz
+
+    def mock_tts(text):
+        calls["n"] += 1
+        calls["texts"].append(text)
+        n = max(1, len(text.split()))
+        total = n * SAMPLES_PER_WORD
+        # Distinct per-sample values so concatenation equality is meaningful.
+        ramp = (np.arange(total) % 30000 - 15000).astype(np.int16)
+        return TTS_SAMPLE_RATE, ramp
+
+    agent = DuplexAudioAgent(
+        wpm=150, default_block_s=2.0,
+        llm_generate_fn=lambda *_: "",
+        tts_fn=mock_tts,
+    )
+    agent._seal_mic_block = lambda *_: None
+    agent._frozen_time = 1000.0
+    agent._now = lambda: agent._frozen_time
+    return agent, calls
+
+
+def test_response_synthesized_once_and_sliced_contiguously():
+    """A multi-block response is synthesized in ONE TTS call; the per-block audio
+    chunks are contiguous slices that reassemble the original waveform exactly."""
+    agent, calls = _ramp_tts_agent()
+    # 12 words → ceil(12/5)=3 blocks of 4 words each.
+    words = [f"w{i}" for i in range(12)]
+    agent._pending_words = list(words)
+    full_text = " ".join(words)
+
+    chunks = []
+    for _ in range(3):
+        result = force_block(agent)           # force_block resets next_block_ts and polls
+        assert result is not None, "expected an audio chunk for a speech block"
+        sr, arr = result
+        assert sr == TTS_SAMPLE_RATE
+        chunks.append(arr)
+
+    # Synthesized exactly once, for the whole response — not once per block.
+    assert calls["n"] == 1
+    assert calls["texts"] == [full_text]
+
+    # Slices are contiguous and reassemble the single synthesis sample-for-sample.
+    _, expected = agent._tts_fn(full_text)    # deterministic ramp for the same text
+    reassembled = np.concatenate(chunks)
+    assert len(reassembled) == len(expected)
+    assert np.array_equal(reassembled, expected)
+
+    # Cache is released once the response is fully spoken.
+    assert agent._full_tts_audio is None
+    assert agent._pending_words == []
+
+
+def test_single_block_response_uses_whole_synthesis():
+    """A response that fits one block (≤ self._n words) yields audio identical to
+    synthesizing the whole text — no behavioural change vs. the old path."""
+    agent, calls = _ramp_tts_agent()
+    agent._pending_words = ["hello", "world", "how", "are", "you"]  # == self._n (5)
+    sr, arr = force_block(agent)
+    _, expected = agent._tts_fn("hello world how are you")
+    assert np.array_equal(arr, expected)
+
+
+def test_barge_in_flushes_cache_and_audio_queue():
+    """A user barge-in drops the whole-response synthesis AND any queued bot audio
+    so playback stops immediately instead of finishing the stale response."""
+    agent, _ = _ramp_tts_agent()
+    # Simulate an in-flight response: cache populated and a slice already queued.
+    agent._pending_words = ["more", "words", "to", "say", "later"]
+    agent._full_tts_audio = np.zeros(8000, dtype=np.int16)
+    agent._full_tts_words = ["more", "words"]
+    agent._full_tts_cursor_words = 1
+    agent._full_tts_cursor_samples = 4000
+    agent._audio_queue.put((TTS_SAMPLE_RATE, np.zeros(4000, dtype=np.int16)))
+
+    agent.receive_text_message("actually stop")  # text barge-in path
+
+    assert agent._full_tts_audio is None
+    assert agent._full_tts_words == []
+    assert agent._full_tts_cursor_words == 0
+    assert agent._full_tts_cursor_samples == 0
+    assert agent._pending_words == []
+    assert agent._audio_queue.empty()

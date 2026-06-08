@@ -508,6 +508,17 @@ class DuplexAudioAgent:
         self._piper_voice = None
         self._audio_queue: queue.Queue[tuple] = queue.Queue()
 
+        # Whole-response TTS cache: the entire LLM response is synthesized in ONE
+        # Piper call, then sliced into block-sized pieces (see _slice_response_audio)
+        # so playback is one continuous waveform instead of stuttering per-fragment
+        # utterances. Cleared on barge-in / ASR flush and after the response is fully
+        # spoken (_reset_full_tts_cache).
+        self._full_tts_sr: Optional[int] = None
+        self._full_tts_audio: Optional[np.ndarray] = None
+        self._full_tts_words: List[str] = []
+        self._full_tts_cursor_words: int = 0
+        self._full_tts_cursor_samples: int = 0
+
         # Logging
         self.quiet: bool = False
 
@@ -570,6 +581,15 @@ class DuplexAudioAgent:
         self._pending_words = []
         self._committed_words = []
         self._clear_pending_response_timing()
+        # Flushed words → flushed audio: drop the whole-response synthesis and any
+        # already-queued bot audio so a barge-in stops playback immediately instead
+        # of finishing the now-stale response.
+        self._reset_full_tts_cache()
+        while True:
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _mark_assistant_history_stale_from(self, start_index: int) -> None:
         for block in self.blocks[start_index:]:
@@ -712,6 +732,97 @@ class DuplexAudioAgent:
         elapsed = time.perf_counter() - t0
         self._vlog(f"[tts] {repr(text)} → {len(arr)/sr:.2f}s audio  (synthesized in {elapsed:.3f}s)")
         return sr, arr, elapsed
+
+    # ------------------------------------------------------------------
+    # Whole-response TTS cache + per-block slicing
+    # ------------------------------------------------------------------
+
+    def _reset_full_tts_cache(self) -> None:
+        self._full_tts_sr = None
+        self._full_tts_audio = None
+        self._full_tts_words = []
+        self._full_tts_cursor_words = 0
+        self._full_tts_cursor_samples = 0
+
+    def _ensure_full_tts_cache(self) -> None:
+        """Synthesize the entire pending response in ONE Piper call, once.
+
+        Building a single continuous waveform for the whole response is what lets
+        the per-block slices taken from it (see _slice_response_audio) play back
+        seamlessly instead of as independent, stuttering fragments. Re-synthesis
+        only happens after a flush (_reset_full_tts_cache) clears the cache.
+
+        Must run before _commit_block_words pops any words, so _pending_words still
+        holds the complete response. While the streaming LLM path is still
+        assembling the response (_llm_in_flight), we skip — the per-fragment
+        fallback in poll() covers those blocks, and the cache engages once the
+        stream completes. The deployed sync path always has the full response ready.
+        """
+        if self._full_tts_audio is not None:
+            return  # already synthesized for this response — valid until flush
+        if not self._pending_words or self._llm_in_flight:
+            return
+        sr, audio, _ = self._generate_tts(" ".join(self._pending_words))
+        self._full_tts_sr = sr
+        self._full_tts_audio = audio
+        self._full_tts_words = list(self._pending_words)
+        self._full_tts_cursor_words = 0
+        self._full_tts_cursor_samples = 0
+
+    def _snap_to_silence(self, ideal: int) -> int:
+        """Nudge a slice boundary to the nearest low-energy trough within ±150ms.
+
+        Inter-slice playback stays seamless (the shared boundary just moves to a
+        quieter sample), while a barge-in cut lands on a word gap rather than
+        mid-phoneme. Falls back to `ideal` (clamped) if the search window is empty.
+        """
+        audio = self._full_tts_audio
+        sr = self._full_tts_sr or TTS_SAMPLE_RATE
+        n = len(audio)
+        w = int(0.15 * sr)
+        lo = max(self._full_tts_cursor_samples + 1, ideal - w)
+        hi = min(n - 1, ideal + w)
+        if hi <= lo:
+            return min(max(ideal, self._full_tts_cursor_samples + 1), n)
+        window = np.abs(audio[lo:hi].astype(np.float32))
+        frame = max(1, int(0.005 * sr))
+        if frame > 1 and len(window) >= frame:
+            window = np.convolve(window, np.ones(frame) / frame, mode="same")
+        return lo + int(np.argmin(window))
+
+    def _slice_response_audio(self, text: str) -> tuple:
+        """Return (sr, int16 slice) for the words committed this block, taken from
+        the single whole-response synthesis.
+
+        Returns (None, None) on a cache miss / edge so the caller falls back to
+        per-fragment synthesis (no regression). Boundaries are computed against the
+        absolute (total_words, total_samples) and each slice starts exactly where
+        the previous one ended, so consecutive slices are sample-contiguous and
+        reassemble the original waveform when played in order.
+        """
+        if self._full_tts_audio is None:
+            return None, None
+        n = len(text.split())
+        total_words = len(self._full_tts_words)
+        total_samples = len(self._full_tts_audio)
+        if n == 0 or total_words == 0:
+            return None, None
+        end_word = self._full_tts_cursor_words + n
+        if end_word > total_words:
+            return None, None  # committed text doesn't match the cache — fall back
+        if end_word >= total_words:
+            end_sample = total_samples  # final slice: true utterance end, no snap
+        else:
+            ideal = round(end_word / total_words * total_samples)
+            end_sample = self._snap_to_silence(ideal)
+        start_sample = self._full_tts_cursor_samples
+        chunk = self._full_tts_audio[start_sample:end_sample]
+        sr = self._full_tts_sr
+        self._full_tts_cursor_words = end_word
+        self._full_tts_cursor_samples = end_sample
+        if not self._pending_words and self._full_tts_cursor_words >= total_words:
+            self._reset_full_tts_cache()  # response fully spoken — next response re-synthesizes
+        return sr, chunk
 
     # ------------------------------------------------------------------
     # Mic ASR
@@ -1490,6 +1601,7 @@ class DuplexAudioAgent:
         # Use previous block's end time as this block's start (0.0 → use now on first poll)
         block_start = self._block_start_ts if self._block_start_ts else now
         self._ensure_current_block(block_start)
+        self._ensure_full_tts_cache()   # synthesize whole response once, before committing
         self._commit_block_words()
 
         finalized = self._current_block
@@ -1501,9 +1613,18 @@ class DuplexAudioAgent:
         self._vlog(f"[poll] block#{len(self.blocks)} user={repr(finalized.user_text)} ai={repr(finalized.assistant_text)}")
 
         if finalized.assistant_text:
-            sr, playback_audio, tts_latency = self._generate_tts(finalized.assistant_text)
+            sr, playback_audio = self._slice_response_audio(finalized.assistant_text)
+            if playback_audio is None:
+                # Cache miss / edge (e.g. streaming response not yet complete) —
+                # fall back to per-fragment synthesis so behaviour never regresses.
+                sr, playback_audio, finalized.tts_latency_s = self._generate_tts(finalized.assistant_text)
+            else:
+                finalized.tts_latency_s = 0.0  # synthesis cost was paid once at cache build
+                self._vlog(
+                    f"[slice] block#{len(self.blocks)} {finalized.assistant_text!r} "
+                    f"→ {len(playback_audio)/sr:.2f}s audio"
+                )
             finalized.tts_sr = sr
-            finalized.tts_latency_s = tts_latency
             source_block = self._get_block_by_id(finalized.response_source_block_id)
             if source_block is not None and source_block.asr_started_perf_s is not None:
                 finalized.total_latency_s = time.perf_counter() - source_block.asr_started_perf_s
@@ -1511,18 +1632,11 @@ class DuplexAudioAgent:
             duration = len(playback_audio) / sr
             if duration > 4.0:
                 self._vlog(f"[tts] WARNING: block {duration:.2f}s > 4s for {repr(finalized.assistant_text)}")
-            elif duration < 1.0:
-                self._vlog(f"[tts] WARNING: block {duration:.2f}s < 1s for {repr(finalized.assistant_text)}")
-            if finalized.assistant_text[-1] in ".!?,;:" and duration < self._default_block_s:
-                padding = np.zeros(int((self._default_block_s - duration) * sr), dtype=np.int16)
-                audio = np.concatenate([audio, padding])
-                duration = self._default_block_s
-                self._vlog(f"[tts] padded to {duration:.2f}s (sentence boundary)")
             finalized.lead_silence_s = finalized.total_latency_s or 0.0
             if finalized.lead_silence_s > 0.0:
                 lead_silence = np.zeros(int(finalized.lead_silence_s * sr), dtype=np.int16)
                 finalized.tts_audio = np.concatenate([lead_silence, audio])
-                reply_ready_ts = now + tts_latency
+                reply_ready_ts = now + (finalized.tts_latency_s or 0.0)
                 finalized.timeline_start_ts = reply_ready_ts - finalized.lead_silence_s
                 finalized.timeline_end_ts = reply_ready_ts + (len(audio) / sr)
             else:
