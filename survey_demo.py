@@ -44,6 +44,23 @@ MAX_CALL = 45.0
 POLL_S   = 0.08
 RESULTS  = Path("survey_results")
 
+# ── Theme ─────────────────────────────────────────────────────────────────────
+# Warm, friendly orange palette. primary_hue drives buttons/accents, neutral_hue
+# "stone" gives warm-grey text/borders instead of the default cool grey.
+THEME = gr.themes.Soft(
+    primary_hue="orange",
+    secondary_hue="amber",
+    neutral_hue="stone",
+)
+
+def _warn(msg: str) -> str:
+    """High-contrast inline validation banner (dark red on warm cream)."""
+    return (
+        "<div style='color:#b91c1c;background:#fff7ed;border:1px solid #fdba74;"
+        "border-radius:6px;padding:8px 12px;margin:6px 0;font-weight:600'>"
+        f"⚠ {msg}</div>"
+    )
+
 # ── Per-model concurrency (one active call each) ──────────────────────────────
 _locks     = {"A": threading.Lock(), "B": threading.Lock()}
 _lock_time = {"A": 0.0, "B": 0.0}   # monotonic time of last acquire
@@ -216,7 +233,7 @@ def _disc(s: dict) -> None:
 
 # ── App ───────────────────────────────────────────────────────────────────────
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="Voice Bot Study", js=_JS, theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="Voice Bot Study", js=_JS, theme=THEME) as app:
 
         # ═══════════════════════════ SURVEY TAB ══════════════════════════════
         with gr.Tab("Survey"):
@@ -449,7 +466,7 @@ def build_app() -> gr.Blocks:
                         gr.update(active=False), gr.update(active=False),
                         gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
                         gr.skip(),
-                        gr.update(value="Please answer all questions before continuing.", visible=True),
+                        gr.update(value=_warn("Please answer all questions before continuing."), visible=True),
                     )
                 s = dict(s)
                 s["demo"] = {"age": age, "native_english": native, "va_usage": va}
@@ -548,7 +565,7 @@ def build_app() -> gr.Blocks:
                         gr.update(active=False), gr.update(active=False),
                         gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
                         gr.skip(),
-                        gr.update(value="Please answer all questions before submitting.", visible=True),
+                        gr.update(value=_warn("Please answer all questions before submitting."), visible=True),
                     )
                 s = dict(s)
                 bk = "bot1" if s["mi"] == 0 else "bot2"
@@ -578,7 +595,7 @@ def build_app() -> gr.Blocks:
                     return (
                         s, *_show(P_compare),
                         gr.skip(),   # rev_html unchanged
-                        gr.update(value="Please answer all comparison questions.", visible=True),
+                        gr.update(value=_warn("Please answer all comparison questions."), visible=True),
                     )
                 s = dict(s)
                 for (k, _, _), v in zip(COMPARE_QS, cvals):
@@ -594,9 +611,9 @@ def build_app() -> gr.Blocks:
                     "<h2 style='margin-bottom:16px'>🎉 The Reveal!</h2>"
                     "<table style='margin:0 auto;border-collapse:collapse;font-size:17px'>"
                     "<tr><td style='padding:8px 20px;text-align:right'><b>Bot 1</b></td>"
-                    f"<td style='padding:8px 20px;color:#2563eb'>{b1}</td></tr>"
+                    f"<td style='padding:8px 20px;color:#ea580c'>{b1}</td></tr>"
                     "<tr><td style='padding:8px 20px;text-align:right'><b>Bot 2</b></td>"
-                    f"<td style='padding:8px 20px;color:#16a34a'>{b2}</td></tr>"
+                    f"<td style='padding:8px 20px;color:#0d9488'>{b2}</td></tr>"
                     "</table></div>"
                 )
                 return (
@@ -771,4 +788,4 @@ if __name__ == "__main__":
         "B": server_url_from_address(f"127.0.0.1:{MODEL_B_PORT}"),
     }
 
-    build_app().launch(share=True, theme=gr.themes.Soft())
+    build_app().launch(share=True)
