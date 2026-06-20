@@ -220,9 +220,13 @@ def create_app(
     agent_factory: Optional[Callable[[], DuplexAudioAgent]] = None,
     poll_interval_s: float = POLL_INTERVAL_S,
     audio_idle_timeout_s: float = AUDIO_IDLE_TIMEOUT_S,
+    public_url: Optional[str] = None,
 ) -> FastAPI:
     resolved_factory = agent_factory or DuplexAudioAgent
     manager = SessionManager(resolved_factory)
+    # When tunneled (--share), echo the public wss:// URL so clients that read the
+    # ready event connect through the tunnel instead of localhost.
+    resolved_server_url = server_url_from_address(public_url or "127.0.0.1")
 
     app = FastAPI(title="Full-Duplex Audio Server")
 
@@ -263,7 +267,7 @@ def create_app(
                         "type": "ready",
                         "session_id": session.session_id,
                         "poll_interval_s": poll_interval_s,
-                        "server_url": server_url_from_address("127.0.0.1"),
+                        "server_url": resolved_server_url,
                     }
                 )
             )
@@ -344,6 +348,12 @@ def main() -> None:
         default=VLLM_PORT,
         help=f"OpenAI-compatible model backend port (default {VLLM_PORT}).",
     )
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        default=False,
+        help="Expose the server publicly via a Gradio FRP tunnel (*.gradio.live, expires ~1 week).",
+    )
     args = parser.parse_args()
 
     # Point the generate functions at the chosen model backend.
@@ -353,13 +363,37 @@ def main() -> None:
     preload_duplex_models()
     print(f"[boot] models ready, starting websocket server on ws://{args.host}:{args.port}/ws")
 
+    public_url = None
+    if args.share:
+        # Same mechanism as gradio's launch(share=True): an outbound FRP tunnel to
+        # Hugging Face's free *.gradio.live relay. setup_tunnel forwards any local TCP
+        # port, not just a gradio app. The frpc subprocess it starts is kept alive by
+        # the blocking uvicorn.run() below.
+        import secrets
+
+        from gradio.networking import setup_tunnel
+
+        try:
+            # share_server_address=None / cert=None -> auto-fetch a free relay from
+            # https://api.gradio.app/v3/tunnel-request (downloads frpc on first use).
+            public_url = setup_tunnel(
+                args.host, args.port, secrets.token_urlsafe(32), None, None
+            )
+            ws_url = server_url_from_address(public_url)  # https://host -> wss://host/ws
+            print(f"[share] public URL : {public_url}")
+            print(f"[share] websocket  : {ws_url}")
+            print("[share] expires in ~1 week; point any client (browser/Python) at the wss:// URL")
+        except Exception as exc:
+            public_url = None
+            print(f"[share] tunnel failed ({type(exc).__name__}: {exc}); serving locally only")
+
     if args.is_cpm:
         print(f"[boot] CPM mode: using MiniCPM-duplex backend on port {args.vllm_port}")
         agent_factory = lambda: DuplexAudioAgent(llm_generate_fn=cpm_generate)
-        app = create_app(agent_factory=agent_factory)
+        app = create_app(agent_factory=agent_factory, public_url=public_url)
     else:
         print(f"[boot] local mode: using trained model backend on port {args.vllm_port}")
-        app = create_app()
+        app = create_app(public_url=public_url)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
