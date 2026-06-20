@@ -45,13 +45,8 @@ POLL_S   = 0.08
 RESULTS  = Path("survey_results")
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
-# Warm, friendly orange palette. primary_hue drives buttons/accents, neutral_hue
-# "stone" gives warm-grey text/borders instead of the default cool grey.
-THEME = gr.themes.Soft(
-    primary_hue="orange",
-    secondary_hue="amber",
-    neutral_hue="stone",
-)
+# Theme pulled from the Gradio gallery: gradio.app/themes/gallery?id=harsh8001/minimal-orange
+THEME = gr.Theme.from_hub("harsh8001/minimal-orange")
 
 def _warn(msg: str) -> str:
     """High-contrast inline validation banner (dark red on warm cream)."""

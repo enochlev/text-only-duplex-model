@@ -318,7 +318,9 @@ def _render_disconnected() -> tuple[str, str]:
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="Full-Duplex Agent Client", js=_INIT_JS) as demo:
+    # Theme pulled from the Gradio gallery: gradio.app/themes/gallery?id=harsh8001/minimal-orange
+    theme = gr.Theme.from_hub("harsh8001/minimal-orange")
+    with gr.Blocks(title="Full-Duplex Agent Client", js=_INIT_JS, theme=theme) as demo:
         gr.Markdown("## Full-Duplex Audio Agent Client")
         gr.Markdown(
             "Start the standalone audio server first, then connect this Gradio client to it. "
@@ -531,4 +533,4 @@ if __name__ == "__main__":
     FULL_DUPLEX_PORT = args.port
     DEFAULT_SERVER_URL = f"127.0.0.1:{FULL_DUPLEX_PORT}"
 
-    build_demo().launch(theme=gr.themes.Soft())
+    build_demo().launch()
