@@ -159,6 +159,19 @@ def local_generate(system_prompt: str, user_message: str) -> str:
 # Matches completed blocks: <user>U<AI>A</s>  and the trailing open block: <user>U<AI>
 _CPM_BLOCK_RE = re.compile(r"<user>(.*?)<AI>(.*?)(?:</s>|$)", re.DOTALL)
 
+# MiniCPM-duplex has no system-prompt slot — the format is a raw <用户>/<AI> turn
+# sequence (see _build_cpm_prompt). To still give the model a persona we inject one
+# leading turn pair (a user instruction + a short assistant ack) at the front of
+# every prompt. Both deployment (cpm_generate) and RL training (llm_generate_train,
+# which imports _build_cpm_prompt) go through this single builder, so the persona is
+# applied identically — tuned and non-tuned, train and inference stay in sync.
+_CPM_SYSTEM_PROMPT = (
+    "You are a friendly, helpful voice assistant in a live spoken conversation. "
+    "Talk naturally and casually, keep replies short — usually a sentence or two — "
+    "and never say you're an AI language model or that you don't have feelings."
+)
+_CPM_SYSTEM_PREFIX = f"<用户>{_CPM_SYSTEM_PROMPT}<AI>Sounds good!"
+
 
 def _build_cpm_prompt(user_message: str) -> str:
     """Convert block-format history to MiniCPM <用户>/<AI> turn format.
@@ -169,6 +182,10 @@ def _build_cpm_prompt(user_message: str) -> str:
     Consecutive user blocks are aggregated into one user turn; consecutive AI
     blocks into one AI turn. <idle> blocks are skipped. The output always ends
     with <AI> so the model continues the assistant's response.
+
+    Every prompt is prefixed with _CPM_SYSTEM_PREFIX — a faked "system prompt"
+    (MiniCPM has no system slot) injected as a leading instruction turn — so the
+    persona conditions both deployment and training identically.
     """
     result = ""
     u_buf: list = []
@@ -199,7 +216,7 @@ def _build_cpm_prompt(user_message: str) -> str:
         # AI was speaking last with no new user turn (shouldn't happen normally)
         result += " ".join(a_buf) + "<用户><AI>"
 
-    return result or "<用户><AI>"
+    return _CPM_SYSTEM_PREFIX + (result or "<用户><AI>")
 
 
 def cpm_generate(system_prompt: str, user_message: str) -> str:
