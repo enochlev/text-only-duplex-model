@@ -76,28 +76,23 @@ def check_server() -> None:
 # ---------------------------------------------------------------------------
 
 def synthesize(text: str) -> np.ndarray:
-    """Return float32 PCM at 16 kHz using the project's Piper voice."""
+    """Return float32 PCM at 16 kHz using the project's Kokoro voice."""
     import os, sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from full_duplex import preload_piper_voice, TTS_MODEL
+    from full_duplex import (
+        preload_kokoro_voice,
+        kokoro_synthesize,
+        TTS_MODEL,
+        ASR_SAMPLE_RATE,
+        _resample,
+    )
 
-    voice = preload_piper_voice(tts_model=TTS_MODEL, device="cpu")
-
-    if hasattr(voice, "synthesize"):
-        chunks = [getattr(c, "audio_int16_bytes", b"") for c in voice.synthesize(text)]
-        int16 = np.frombuffer(b"".join(chunks), dtype=np.int16)
-    elif hasattr(voice, "synthesize_stream_raw"):
-        int16 = np.frombuffer(b"".join(voice.synthesize_stream_raw(text)), dtype=np.int16)
-    else:
-        import io, wave
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            voice.synthesize_wav(text, wf)
-        buf.seek(0)
-        with wave.open(buf, "rb") as wf:
-            int16 = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-
-    return int16.astype(np.float32) / 32768.0
+    voice = preload_kokoro_voice(tts_model=TTS_MODEL, device="cpu")
+    sr, int16 = kokoro_synthesize(voice, text)
+    audio = int16.astype(np.float32) / 32768.0
+    if sr != ASR_SAMPLE_RATE:  # Kokoro is 24 kHz; VAD models expect 16 kHz
+        audio = _resample(audio, sr, ASR_SAMPLE_RATE)
+    return audio
 
 
 def to_b64(audio: np.ndarray) -> str:

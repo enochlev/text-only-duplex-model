@@ -59,7 +59,7 @@ from full_duplex import (
     TTS_MODEL,
     DuplexAudioAgent,
     DuplexAudioBlock,
-    preload_piper_voice,
+    preload_kokoro_voice,
     _resample,
     _build_cpm_prompt,
 )
@@ -196,8 +196,8 @@ class TrainerConfig:
     0 = auto (min(32, cpu_count)). Set to 1 to disable parallelism."""
 
     tts_model: str = ""
-    """Piper TTS model path used for GPTVoiceSimulator real-time episodes.
-    Defaults to the full_duplex module default (en_US-danny-low) when empty."""
+    """Kokoro voice id used for GPTVoiceSimulator real-time episodes.
+    Defaults to the full_duplex module default (af_heart) when empty."""
 
     vllm_device: Optional[str] = None
     """Pin the vLLM inference engine to a specific GPU, e.g. 'cuda:3'.
@@ -606,12 +606,12 @@ class VirtualSimulationConnection:
 # ---------------------------------------------------------------------------
 
 class RealTimeGPTEpisodeRunner:
-    """Drives a GPTVoiceSimulator episode at wall-clock speed with real Piper TTS.
+    """Drives a GPTVoiceSimulator episode at wall-clock speed with real Kokoro TTS.
 
     Key differences from VirtualSimulationConnection:
     - agent._now() uses real time.time() — block timestamps are absolute.
-    - Real Piper TTS so GPT hears actual speech (not silence).
-    - Both send and receive paths resample between Piper 16 kHz and GPT 24 kHz.
+    - Real Kokoro TTS so GPT hears actual speech (not silence).
+    - Kokoro already outputs 24 kHz (== GPT rate); the mic path resamples to 16 kHz for ASR.
     - get_transcript_at_time receives episode-relative timestamps (GPT's frame)
       derived by subtracting simulator._episode_start_real from block timestamps.
     """
@@ -774,7 +774,7 @@ class RealTimeGPTEpisodeRunner:
         block_s = self.simulator.block_s
         max_episode_s = self.simulator.max_episode_s
 
-        # Real Piper TTS; Parakeet ASR skipped (overridden below).
+        # Real Kokoro TTS; Parakeet ASR skipped (overridden below).
         agent = _make_realtime_training_agent(
             wpm, block_s, intercepted_llm_fn,
             tts_model=self.tts_model,
@@ -829,7 +829,8 @@ class RealTimeGPTEpisodeRunner:
             tts_out = agent.poll()
             if tts_out is not None:
                 sr, tts_audio = tts_out
-                # Resample Piper 16 kHz → GPT 24 kHz so GPT hears correct-speed speech.
+                # Match GPT's rate so it hears correct-speed speech. Kokoro is already
+                # 24 kHz (== _GPT_SAMPLE_RATE), so this resample is normally a no-op.
                 if sr != _GPT_SAMPLE_RATE:
                     audio_f32 = tts_audio.astype(np.float32) / 32767.0
                     audio_f32 = _resample(audio_f32, sr, _GPT_SAMPLE_RATE)
@@ -864,7 +865,7 @@ def _make_training_agent(
     device: Optional[str] = None,
     quiet: bool = False,
 ) -> DuplexAudioAgent:
-    """Create a training agent with real Piper TTS and no Parakeet ASR.
+    """Create a training agent with real Kokoro TTS and no Parakeet ASR.
 
     Real TTS is required so block.tts_audio is non-silent, enabling pyannote
     overlap detection and smart-turn VAD in the reward models.
@@ -881,14 +882,14 @@ def _make_realtime_training_agent(
     device: Optional[str] = None,
     quiet: bool = False,
 ) -> DuplexAudioAgent:
-    """Create a DuplexAudioAgent with real Piper TTS for GPT Voice episodes.
+    """Create a DuplexAudioAgent with real Kokoro TTS for GPT Voice episodes.
 
-    Uses real Piper so GPT actually hears speech audio instead of silence.
+    Uses real Kokoro so GPT actually hears speech audio instead of silence.
     Parakeet ASR is skipped — _seal_mic_block is overridden by the caller
     to read transcripts directly from GPTVoiceSimulator.
     """
     resolved_tts = tts_model or TTS_MODEL
-    preload_piper_voice(tts_model=resolved_tts, device=device)
+    preload_kokoro_voice(tts_model=resolved_tts, device=device)
 
     def _dummy_asr(rolling: list, agent: DuplexAudioAgent) -> None:
         pass  # _seal_mic_block overridden; this path never executes
@@ -897,13 +898,13 @@ def _make_realtime_training_agent(
         wpm=wpm,
         default_block_s=block_s,
         llm_generate_fn=llm_generate_fn,
-        tts_fn=None,        # real Piper
+        tts_fn=None,        # real Kokoro
         asr_fn=_dummy_asr,  # suppresses Parakeet preload
         tts_model=resolved_tts,
         device=device,
     )
     agent.quiet = quiet
-    agent._get_piper_voice()  # warm from cache now rather than first block
+    agent._get_kokoro_voice()  # warm from cache now rather than first block
     return agent
 
 

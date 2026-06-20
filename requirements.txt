@@ -1,0 +1,74 @@
+# ============================================================================
+# Full-Duplex model — pip requirements (intern / fresh-box install)
+# ============================================================================
+#
+#   python -m venv .venv && source .venv/bin/activate     # Python 3.12
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# This is the GPU SERVING + DEMO stack. It targets a Linux box with an NVIDIA
+# GPU and CUDA 12.4 (the +cu124 wheels below). If your box has a different CUDA
+# version, change the index URL tag (e.g. cu121) and drop the "+cu124" suffixes.
+#
+# These pins are the known-good versions the project is served with. vLLM is
+# picky about its torch version, so torch / vllm / transformers are pinned hard;
+# everything else is a floor (>=) so pip can resolve freely.
+# ----------------------------------------------------------------------------
+
+# CUDA 12.4 PyTorch wheels live on a separate index.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# --- Core serving stack (model backend) -------------------------------------
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
+vllm==0.8.5
+transformers==4.57.6
+tokenizers==0.22.2
+xformers==0.0.29.post2
+triton==3.2.0
+sentencepiece==0.2.0
+protobuf>=4.25,<5
+
+# vLLM tracing packages must stay version-coherent or protobuf conflicts.
+opentelemetry-api==1.26.0
+opentelemetry-sdk==1.26.0
+opentelemetry-exporter-otlp==1.26.0
+opentelemetry-proto==1.26.0
+
+# --- ASR (Parakeet via NeMo) ------------------------------------------------
+nemo-toolkit[asr]>=2.7.2
+# NeMo pulls `datasets`, which on newer releases wants pyarrow>=21. Pin together.
+datasets==3.6.0
+pyarrow==20.0.0
+
+# --- TTS --------------------------------------------------------------------
+piper-tts>=1.4.2
+
+# --- Duplex websocket server + clients (server.py / duplex_client.py) -------
+fastapi>=0.115.0
+uvicorn>=0.35.0
+websockets>=15.0.1
+requests>=2.31.0          # used by cpm_generate() / local_generate()
+
+# --- Audio + utilities ------------------------------------------------------
+numpy>=1.26
+soundfile>=0.12.1
+librosa>=0.10.0
+python-dotenv>=1.0.1
+
+# --- Optional LLM API clients (only if you swap the local backend) ----------
+openai>=2.26.0
+groq>=1.2.0
+
+# --- Browser demo client (simple_web.py) needs NO extra packages ------------
+#     It uses only the Python standard library + the running server.py.
+
+# --- Optional: RL training extras (NOT needed to run the demo) --------------
+# accelerate>=0.29.0
+# peft>=0.10.0
+# wandb>=0.16.0
+
+# --- Optional: the Gradio debug UI (demo.py) and tests ----------------------
+# gradio>=6.9.0
+# pytest>=8.4.0

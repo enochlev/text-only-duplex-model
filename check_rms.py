@@ -24,8 +24,8 @@ from full_duplex import (
     TTS_MODEL,
     TTS_SAMPLE_RATE,
     DuplexAudioBlock,
-    preload_piper_voice,
-    piper_synthesize,
+    preload_kokoro_voice,
+    kokoro_synthesize,
 )
 from trainer.rewards import (
     backchannel_loop_penalty,
@@ -188,11 +188,11 @@ _check(
 )
 
 # Real TTS audio — generate two utterances and use them as mic + bot channels
-print("  Generating TTS audio via Piper (this may take a moment on first run)…")
+print("  Generating TTS audio via Kokoro (this may take a moment on first run)…")
 try:
-    voice = preload_piper_voice(TTS_MODEL, device="cpu")
-    sr_bot, tts_int16 = piper_synthesize(voice, "Hello there, how can I help you today?")
-    sr_usr, mic_int16 = piper_synthesize(voice, "Yeah I think we should talk about this.")
+    voice = preload_kokoro_voice(TTS_MODEL, device="cpu")
+    sr_bot, tts_int16 = kokoro_synthesize(voice, "Hello there, how can I help you today?")
+    sr_usr, mic_int16 = kokoro_synthesize(voice, "Yeah I think we should talk about this.")
 
     # Resample both to 16 kHz for the VAD server
     from full_duplex import _resample

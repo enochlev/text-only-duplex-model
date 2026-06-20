@@ -26,7 +26,7 @@ from typing import Any, Iterator, List, Optional, Tuple
 
 import numpy as np
 
-from full_duplex import ASR_SAMPLE_RATE, TTS_MODEL, preload_piper_voice, piper_synthesize, _resample
+from full_duplex import ASR_SAMPLE_RATE, TTS_MODEL, preload_kokoro_voice, kokoro_synthesize, _resample
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ class ScriptTTSSource:
         self.device = device
 
     def load(self) -> EpisodeData:
-        voice = preload_piper_voice(tts_model=self.tts_model, device=self.device)
+        voice = preload_kokoro_voice(tts_model=self.tts_model, device=self.device)
         segments: List[np.ndarray] = []
         word_timestamps: List[Tuple[float, float, str]] = []
         # 0.5 s leading silence ensures the first word's midpoint clears the
@@ -197,7 +197,7 @@ class ScriptTTSSource:
         segments.append(np.zeros(int(_LEAD_S * ASR_SAMPLE_RATE), dtype=np.float32))
         t = _LEAD_S
         for line in self.script_lines:
-            sr, audio_int16 = piper_synthesize(voice, line)
+            sr, audio_int16 = kokoro_synthesize(voice, line)
             audio_f32 = audio_int16.astype(np.float32) / 32767.0
             if sr != ASR_SAMPLE_RATE:
                 audio_f32 = _resample(audio_f32, sr, ASR_SAMPLE_RATE)

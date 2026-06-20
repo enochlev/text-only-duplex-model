@@ -349,7 +349,7 @@ def main() -> None:
     # Point the generate functions at the chosen model backend.
     full_duplex.VLLM_PORT = args.vllm_port
 
-    print("[boot] preloading Piper TTS and Parakeet ASR...")
+    print("[boot] preloading Kokoro TTS and Parakeet ASR...")
     preload_duplex_models()
     print(f"[boot] models ready, starting websocket server on ws://{args.host}:{args.port}/ws")
 

@@ -7,7 +7,7 @@ Run
     python demo.py
 
 The Gradio process only captures microphone audio, plays returned audio, and
-renders server-authored debug state. Piper TTS and Parakeet ASR are loaded in
+renders server-authored debug state. Kokoro TTS and Parakeet ASR are loaded in
 the standalone server process, not in this UI process.
 """
 

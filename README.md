@@ -2,6 +2,74 @@
 
 Real-time full-duplex audio conversation agent. The agent speaks and listens simultaneously — words are committed to audio blocks on a rolling schedule while Parakeet ASR transcribes microphone input and corrects historical blocks.
 
+---
+
+## Quickstart (interns) — talk to the model in 3 commands
+
+The stack is **three layers**, started in order:
+
+```
+  ┌─────────────────────┐   ┌──────────────────────────────┐   ┌─────────────────────┐
+  │   vLLM backend       │ → │   server.py                  │ → │   simple_web.py     │
+  │   hosts the model    │   │   Piper TTS + Parakeet ASR   │   │   browser mic page  │
+  │   :8555 (HTTP API)   │   │   :8998 (websocket /ws)      │   │   :9000 (your page) │
+  └─────────────────────┘   └──────────────────────────────┘   └─────────────────────┘
+```
+
+You start **one** vLLM service and connect **one** client to it — no survey
+(`survey_demo.py`) and no Gradio (`demo.py`) needed for this path.
+
+### Prerequisites
+- Linux box with an **NVIDIA GPU** and **CUDA 12.4** (the `requirements.txt` pins `+cu124` wheels).
+- **Python 3.12** (see `.python-version`).
+- No API keys are needed for this path — the model, TTS, and ASR all run locally.
+
+### 0. Install
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+> Different CUDA version? Edit the `--extra-index-url` tag and the `+cu124` suffixes at the top of `requirements.txt`.
+
+### 1. Start the vLLM model backend (terminal 1)
+Serves the public MiniCPM-duplex model over an OpenAI-compatible API — **no checkpoint download required**:
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve xinrongzhang2022/MiniCPM-duplex \
+    --served-model-name cpm-text-duplex \
+    --max-model-len 3000 \
+    --gpu_memory_utilization 0.30 \
+    --port 8555 \
+    --trust-remote-code
+```
+> **Using the locally trained checkpoint instead?** Point `vllm serve` at it but keep the same served name:
+> `vllm serve ./checkpoints/final --served-model-name cpm-text-duplex --max-model-len 3000 --gpu_memory_utilization 0.30 --port 8555 --trust-remote-code`
+
+### 2. Start the duplex audio server (terminal 2)
+Loads Piper TTS + Parakeet ASR and exposes the websocket. `--cpm` selects the MiniCPM backend; the default ports already match step 1 (`--vllm-port 8555`, `--port 8998`):
+```bash
+CUDA_VISIBLE_DEVICES=0 python server.py --cpm
+```
+Wait for `models ready, starting websocket server on ws://127.0.0.1:8998/ws`.
+
+### 3. Start the browser mic client (terminal 3)
+```bash
+python simple_web.py
+```
+Open **http://localhost:9000**, press **Start talking**, and speak. The bot replies
+over your speakers in real time and the live transcript renders on the page.
+
+### Hooking it up to your own thing
+`simple_web.py` is intentionally minimal — one Python file (standard library only)
+that serves one HTML page. The JavaScript in that page **is the full integration
+contract**: open a websocket to `ws://<host>:8998/ws`, send a `hello`, stream
+`mic_audio` frames up (base64 float32 PCM), and play the `audio_chunk` frames that
+come back. Copy that JS into any web app, or speak the same JSON protocol from any
+language, to give it a live full-duplex voice agent. (`duplex_client.py` is the
+equivalent reference for a pure-Python client.)
+
+---
+
 ## Module overview
 
 **`full_duplex.py`** — single module, exports:

@@ -1,15 +1,15 @@
 """
-Integration tests — real Piper TTS + real Parakeet ASR (+ optional LLM).
+Integration tests — real Kokoro TTS + real Parakeet ASR (+ optional LLM).
 
 Sections:
   1. Parakeet ASR       — lazy model load, mic pipeline
-  2. Piper TTS          — PCM output, duration, latency
+  2. Kokoro TTS         — PCM output, duration, latency
   3. Real LLM           — requires OPENAI_API_KEY env var
   4. TTS → ASR roundtrip
   5. Full poll() loop   — requires OPENAI_API_KEY
   6. Speech then silence — block alignment end-to-end
 
-The entire module is skipped when piper-tts or NeMo is not installed.
+The entire module is skipped when kokoro or NeMo is not installed.
 
 Run:
     pytest tests/test_integration_real.py -v
@@ -26,8 +26,8 @@ import pytest
 # Dependency guards
 # ---------------------------------------------------------------------------
 
-piper_voice_mod = pytest.importorskip("piper.voice", reason="piper-tts not installed")
-nemo_asr_mod    = pytest.importorskip("nemo.collections.asr", reason="NeMo not installed")
+kokoro_mod   = pytest.importorskip("kokoro", reason="kokoro not installed")
+nemo_asr_mod = pytest.importorskip("nemo.collections.asr", reason="NeMo not installed")
 
 from full_duplex import (
     DEFAULT_BLOCK_S,
@@ -53,7 +53,7 @@ def require_openai_key():
 
 @pytest.fixture(scope="session")
 def tts_agent():
-    """A single DuplexAudioAgent with real Piper TTS, shared across TTS tests."""
+    """A single DuplexAudioAgent with real Kokoro TTS, shared across TTS tests."""
     agent = DuplexAudioAgent(
         llm_generate_fn=lambda *_: "",
         asr_fn=lambda *_: None,
@@ -136,11 +136,11 @@ class TestParakeetASR:
 
 
 # ---------------------------------------------------------------------------
-# Section 2 — Piper TTS
+# Section 2 — Kokoro TTS
 # ---------------------------------------------------------------------------
 
-class TestPiperTTS:
-    def test_piper_tts_returns_nonzero_pcm(self, tts_agent):
+class TestKokoroTTS:
+    def test_kokoro_tts_returns_nonzero_pcm(self, tts_agent):
         """_generate_tts returns int16 PCM with at least some non-zero samples."""
         sr, arr, _ = tts_agent._generate_tts("hello")
         assert isinstance(sr, int)
@@ -148,14 +148,14 @@ class TestPiperTTS:
         assert isinstance(arr, np.ndarray)
         assert arr.dtype == np.int16
         assert len(arr) > 0
-        assert np.any(arr != 0), "TTS returned all-zero audio — Piper produced silence"
+        assert np.any(arr != 0), "TTS returned all-zero audio — Kokoro produced silence"
 
-    def test_piper_tts_sample_rate_matches_voice_config(self, tts_agent):
-        """Returned sample rate equals voice.config.sample_rate."""
+    def test_kokoro_tts_sample_rate_is_tts_sample_rate(self, tts_agent):
+        """Returned sample rate equals the module TTS_SAMPLE_RATE (Kokoro = 24 kHz)."""
         sr, _, _ = tts_agent._generate_tts("test")
-        assert sr == tts_agent._get_piper_voice().config.sample_rate
+        assert sr == TTS_SAMPLE_RATE
 
-    def test_piper_tts_duration_is_realistic(self, tts_agent):
+    def test_kokoro_tts_duration_is_realistic(self, tts_agent):
         """A five-word phrase produces between 1 and 6 seconds of audio."""
         sr, arr, _ = tts_agent._generate_tts("hello world how are you")
         duration_s = len(arr) / sr
@@ -163,7 +163,7 @@ class TestPiperTTS:
             f"TTS duration {duration_s:.2f}s is outside expected range [1, 6]s"
         )
 
-    def test_piper_tts_latency_under_2s(self, tts_agent):
+    def test_kokoro_tts_latency_under_2s(self, tts_agent):
         """Synthesizing a short phrase completes in under 2 seconds."""
         start = time.perf_counter()
         tts_agent._generate_tts("hello there")
@@ -207,7 +207,7 @@ class TestRealLLM:
 
 class TestTTSASRRoundtrip:
     def _synthesize_as_mic_audio(self, agent: DuplexAudioAgent, text: str) -> np.ndarray:
-        """Synthesize text with Piper, convert to float32 at ASR_SAMPLE_RATE."""
+        """Synthesize text with Kokoro, convert to float32 at ASR_SAMPLE_RATE."""
         sr, int16_arr, _ = agent._generate_tts(text)
         float32_arr = int16_arr.astype(np.float32) / 32768.0
         return _resample(float32_arr, sr, ASR_SAMPLE_RATE)
@@ -220,7 +220,7 @@ class TestTTSASRRoundtrip:
         # No assertion needed beyond no exception
 
     def test_tts_asr_roundtrip_sentence_recognized(self, tts_agent):
-        """Parakeet transcribes Piper-synthesized speech and recovers some words."""
+        """Parakeet transcribes Kokoro-synthesized speech and recovers some words."""
         phrase = "the weather is nice today"
         original_words = set(phrase.lower().split())
 
@@ -325,7 +325,7 @@ class TestFullPollLoop:
 
 class TestSpeechThenSilenceAlignment:
     """
-    Synthesize 'hey how are you' with real Piper TTS, feed it through the mic
+    Synthesize 'hey how are you' with real Kokoro TTS, feed it through the mic
     pipeline to real Parakeet ASR, then run 5 seconds of silence blocks.
 
     Checks:
@@ -337,7 +337,7 @@ class TestSpeechThenSilenceAlignment:
 
     @staticmethod
     def _make_agent() -> DuplexAudioAgent:
-        """Real Piper TTS + real Parakeet ASR; deterministic mock LLM."""
+        """Real Kokoro TTS + real Parakeet ASR; deterministic mock LLM."""
         call_log = []
 
         def llm_fn(_, user_msg):
@@ -350,7 +350,7 @@ class TestSpeechThenSilenceAlignment:
 
     @staticmethod
     def _to_mic(agent: DuplexAudioAgent, text: str) -> np.ndarray:
-        """Synthesize text with real Piper; return float32 at ASR_SAMPLE_RATE."""
+        """Synthesize text with real Kokoro; return float32 at ASR_SAMPLE_RATE."""
         sr, pcm, _ = agent._generate_tts(text)
         return _resample(pcm.astype(np.float32) / 32768.0, sr, ASR_SAMPLE_RATE)
 

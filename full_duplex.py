@@ -2,7 +2,7 @@
 full_duplex.py — Real-time duplex audio agent.
 
 Exports:
-- DuplexAudioAgent : audio-in / audio-out duplex agent (Piper TTS + Parakeet ASR)
+- DuplexAudioAgent : audio-in / audio-out duplex agent (Kokoro TTS + Parakeet ASR)
 - DuplexAudioBlock : finalized conversation block dataclass
 - llm_generate     : thin OpenAI wrapper used by DuplexAudioAgent
 """
@@ -242,7 +242,7 @@ VLLM_PORT = int(os.getenv("VLLM_PORT", "8555"))
 
 DEFAULT_WPM       = 150
 DEFAULT_BLOCK_S   = 2.0
-TTS_SAMPLE_RATE   = 16000    # Piper PCM output rate (fallback for silence blocks)
+TTS_SAMPLE_RATE   = 24000    # Kokoro PCM output rate (also fallback for silence blocks)
 ASR_SAMPLE_RATE   = 16000    # Parakeet expects 16 kHz; incoming mic is resampled to this
 MAX_MIC_BLOCKS    = 8       # rolling mic audio window (last N agent blocks)
 MAX_AUDIO_QUEUE_S = MAX_MIC_BLOCKS * DEFAULT_BLOCK_S   # ≈ 20s safety cap
@@ -261,8 +261,17 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(__file__)) or "."
 _template_env = Environment(loader=FileSystemLoader(_MODULE_DIR))
 _prompt_template = _template_env.get_template("full-duplex.jinja2")
 
-#TTS_MODEL = os.path.join(_MODULE_DIR, "en_US-lessac-medium.onnx") # 22kHz model
-TTS_MODEL = os.path.join(_MODULE_DIR, "voices","en_US-danny-low.onnx") # 16kHz model with faster inference but lower quality
+# ---------------------------------------------------------------------------
+# Kokoro TTS config (replaces Piper)
+# ---------------------------------------------------------------------------
+# Kokoro-82M runs on the existing torch install (GPU via device='cuda'); there is
+# no per-file model path like Piper's .onnx. The default voice id is kept under the
+# historical name TTS_MODEL so trainer/data-ingestion code that threads
+# `tts_model=...` keeps working unchanged — the value is now a Kokoro voice id
+# (e.g. "af_heart"), not a filesystem path.
+KOKORO_REPO = os.getenv("KOKORO_REPO", "hexgrad/Kokoro-82M")
+KOKORO_LANG = os.getenv("KOKORO_LANG", "a")          # 'a' = American English, 'b' = British
+TTS_MODEL   = os.getenv("KOKORO_VOICE", "af_heart")  # default Kokoro voice id
 
 # ---------------------------------------------------------------------------
 # ASR model (lazy-loaded on first use)
@@ -276,11 +285,11 @@ for _noisy in ("nemo", "nemo_logging", "lightning", "pytorch_lightning", "omegac
 _os.environ.setdefault("TQDM_DISABLE", "1")  # suppress NeMo progress bars
 
 _asr_model = None
-_piper_voice_cache = {}
+_kokoro_cache = {}   # (lang_code, device) -> KPipeline (heavy model, loaded once)
 # NeMo's transcribe() is not thread-safe (freeze/unfreeze race).
 # All background ASR threads must hold this lock before calling transcribe().
 _asr_lock = _threading.Lock()
-_piper_lock = _threading.Lock()
+_kokoro_lock = _threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -355,27 +364,52 @@ def resolve_device(device: Optional[str] = None) -> str:
     return "cpu"
 
 
-def preload_piper_voice(
+class _KokoroVoice:
+    """Opaque voice handle: a loaded Kokoro KPipeline plus the voice id to use.
+
+    Mirrors the role the old Piper `voice` object played, so callers
+    (kokoro_synthesize, DuplexAudioAgent) treat it identically.
+    """
+    __slots__ = ("pipeline", "voice", "lang_code")
+
+    def __init__(self, pipeline: Any, voice: str, lang_code: str) -> None:
+        self.pipeline = pipeline
+        self.voice = voice
+        self.lang_code = lang_code
+
+
+def preload_kokoro_voice(
     tts_model: str = TTS_MODEL,
     device: Optional[str] = None,
-):
+    lang_code: str = KOKORO_LANG,
+) -> "_KokoroVoice":
+    """Load (and cache) a Kokoro pipeline and return a voice handle.
+
+    `tts_model` is the Kokoro voice id (e.g. "af_heart"); the parameter name is
+    retained for drop-in compatibility with the old Piper signature. The heavy
+    KPipeline is cached per (lang_code, device); the lightweight voice id is just
+    attached to the returned handle.
+    """
     resolved_device = resolve_device(device)
-    cache_key = (tts_model, resolved_device)
-    with _piper_lock:
-        cached = _piper_voice_cache.get(cache_key)
-        if cached is not None:
-            return cached
+    voice = tts_model or TTS_MODEL
+    cache_key = (lang_code, resolved_device)
+    with _kokoro_lock:
+        pipeline = _kokoro_cache.get(cache_key)
+        if pipeline is None:
+            from kokoro import KPipeline
 
-        from pathlib import Path
-        from piper.download_voices import download_voice
-
-        download_voice("en_US-danny-low", Path(tts_model).parent, force_redownload=False)
-
-        from piper.voice import PiperVoice
-
-        voice = PiperVoice.load(tts_model, use_cuda=(resolved_device == "cuda"))
-        _piper_voice_cache[cache_key] = voice
-        return voice
+            try:
+                pipeline = KPipeline(
+                    lang_code=lang_code, repo_id=KOKORO_REPO, device=resolved_device
+                )
+            except TypeError:
+                # Older kokoro builds lack the repo_id and/or device kwarg.
+                try:
+                    pipeline = KPipeline(lang_code=lang_code, device=resolved_device)
+                except TypeError:
+                    pipeline = KPipeline(lang_code=lang_code)
+            _kokoro_cache[cache_key] = pipeline
+    return _KokoroVoice(pipeline, voice, lang_code)
 
 
 def preload_asr_model():
@@ -404,50 +438,42 @@ def preload_duplex_models(
     device: Optional[str] = None,
 ) -> None:
     resolved_device = resolve_device(device)
-    preload_piper_voice(tts_model=tts_model, device=resolved_device)
+    preload_kokoro_voice(tts_model=tts_model, device=resolved_device)
     preload_asr_model()
 
 
-def piper_synthesize(voice: Any, text: str) -> tuple:
-    """Synthesize text with a loaded PiperVoice. Returns (sample_rate, int16_array).
+def kokoro_synthesize(voice: Any, text: str) -> tuple:
+    """Synthesize text with a loaded Kokoro voice handle.
 
-    Handles all known Piper Python API variants (synthesize / synthesize_stream_raw
-    / synthesize_wav) so callers outside DuplexAudioAgent can reuse this logic.
+    Returns (sample_rate, int16_array) — the same contract the old piper_synthesize
+    exposed, so DuplexAudioAgent's whole-response cache + per-block slicing is
+    unchanged. Kokoro yields one float32 waveform per sentence at 24 kHz; we
+    concatenate them and convert to int16.
     """
-    if hasattr(voice, "synthesize"):
-        sample_rate = getattr(getattr(voice, "config", None), "sample_rate", TTS_SAMPLE_RATE)
-        audio_chunks: List[bytes] = []
-        for chunk in voice.synthesize(text):
-            chunk_rate = getattr(chunk, "sample_rate", None)
-            if chunk_rate:
-                sample_rate = chunk_rate
-            audio_bytes = getattr(chunk, "audio_int16_bytes", b"")
-            if audio_bytes:
-                audio_chunks.append(audio_bytes)
-        return sample_rate, np.frombuffer(b"".join(audio_chunks), dtype=np.int16)
-
-    if hasattr(voice, "synthesize_stream_raw"):
-        audio_bytes = b"".join(voice.synthesize_stream_raw(text))
-        sample_rate = getattr(getattr(voice, "config", None), "sample_rate", TTS_SAMPLE_RATE)
-        return sample_rate, np.frombuffer(audio_bytes, dtype=np.int16)
-
-    if hasattr(voice, "synthesize_wav"):
-        import io
-        import wave as _wave
-        wav_buffer = io.BytesIO()
-        with _wave.open(wav_buffer, "wb") as wav_file:
-            voice.synthesize_wav(text, wav_file)
-        wav_buffer.seek(0)
-        with _wave.open(wav_buffer, "rb") as wav_file:
-            sample_rate = wav_file.getframerate()
-            audio_bytes = wav_file.readframes(wav_file.getnframes())
-        return sample_rate, np.frombuffer(audio_bytes, dtype=np.int16)
-
-    raise RuntimeError("Unsupported PiperVoice API: no synthesize method available")
+    pipeline = voice.pipeline
+    voice_id = voice.voice
+    chunks: List[np.ndarray] = []
+    for result in pipeline(text, voice=voice_id, speed=1.0):
+        # KPipeline yields a Result with .audio (recent) or a (gs, ps, audio) tuple.
+        audio = getattr(result, "audio", None)
+        if audio is None and isinstance(result, (tuple, list)):
+            audio = result[-1]
+        if audio is None:
+            continue
+        if hasattr(audio, "detach"):          # torch.Tensor → numpy
+            audio = audio.detach().cpu().numpy()
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size:
+            chunks.append(audio)
+    if not chunks:
+        return TTS_SAMPLE_RATE, np.zeros(0, dtype=np.int16)
+    audio = np.concatenate(chunks)
+    pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+    return TTS_SAMPLE_RATE, pcm16
 
 
 # ---------------------------------------------------------------------------
-# DuplexAudioAgent  (audio-in / audio-out — Piper TTS + Parakeet ASR)
+# DuplexAudioAgent  (audio-in / audio-out — Kokoro TTS + Parakeet ASR)
 # ---------------------------------------------------------------------------
 
 class DuplexAudioAgent:
@@ -505,11 +531,11 @@ class DuplexAudioAgent:
 
         # Audio
         self._tts_fn = tts_fn
-        self._piper_voice = None
+        self._kokoro_voice = None
         self._audio_queue: queue.Queue[tuple] = queue.Queue()
 
         # Whole-response TTS cache: the entire LLM response is synthesized in ONE
-        # Piper call, then sliced into block-sized pieces (see _slice_response_audio)
+        # Kokoro call, then sliced into block-sized pieces (see _slice_response_audio)
         # so playback is one continuous waveform instead of stuttering per-fragment
         # utterances. Cleared on barge-in / ASR flush and after the response is fully
         # spoken (_reset_full_tts_cache).
@@ -536,13 +562,13 @@ class DuplexAudioAgent:
         # Block timestamp tracking — carries previous block's end_ts as next start_ts
         self._block_start_ts: float = 0.0
 
-        # Eagerly load Piper TTS + Parakeet ASR so first-use latency is zero.
+        # Eagerly load Kokoro TTS + Parakeet ASR so first-use latency is zero.
         # Only runs when both implementations are real (neither tts_fn nor asr_fn
         # is injected). Test doubles bypass this block entirely.
         if self._tts_fn is None and self._asr_fn is None:
-            print("[init] loading Piper TTS voice…")
-            self._get_piper_voice()
-            print("[init] Piper TTS ready")
+            print("[init] loading Kokoro TTS voice…")
+            self._get_kokoro_voice()
+            print("[init] Kokoro TTS ready")
             print("[init] loading Parakeet ASR model…")
             self._get_asr_model()
             print("[init] Parakeet ASR ready")
@@ -661,13 +687,13 @@ class DuplexAudioAgent:
                 parts.append(f"[u={user_text!r} ai={assistant_text!r}]")
         return " | ".join(parts)
 
-    def _get_piper_voice(self):
-        if self._piper_voice is None:
-            self._piper_voice = preload_piper_voice(
+    def _get_kokoro_voice(self):
+        if self._kokoro_voice is None:
+            self._kokoro_voice = preload_kokoro_voice(
                 tts_model=self._tts_model,
                 device=self._device,
             )
-        return self._piper_voice
+        return self._kokoro_voice
 
     def _get_asr_model(self):
         return preload_asr_model()
@@ -718,8 +744,8 @@ class DuplexAudioAgent:
         if not self.quiet:
             print(msg)
 
-    def _synthesize_piper_audio(self, voice, text: str) -> tuple[int, np.ndarray]:
-        return piper_synthesize(voice, text)
+    def _synthesize_kokoro_audio(self, voice, text: str) -> tuple[int, np.ndarray]:
+        return kokoro_synthesize(voice, text)
 
     def _generate_tts(self, text: str) -> tuple:
         """Returns (sample_rate, audio_int16, latency_s)."""
@@ -727,8 +753,8 @@ class DuplexAudioAgent:
             sr, arr = self._tts_fn(text)
             return sr, arr, 0.0
         t0 = time.perf_counter()
-        voice = self._get_piper_voice()
-        sr, arr = self._synthesize_piper_audio(voice, text)
+        voice = self._get_kokoro_voice()
+        sr, arr = self._synthesize_kokoro_audio(voice, text)
         elapsed = time.perf_counter() - t0
         self._vlog(f"[tts] {repr(text)} → {len(arr)/sr:.2f}s audio  (synthesized in {elapsed:.3f}s)")
         return sr, arr, elapsed
@@ -745,7 +771,7 @@ class DuplexAudioAgent:
         self._full_tts_cursor_samples = 0
 
     def _ensure_full_tts_cache(self) -> None:
-        """Synthesize the entire pending response in ONE Piper call, once.
+        """Synthesize the entire pending response in ONE Kokoro call, once.
 
         Building a single continuous waveform for the whole response is what lets
         the per-block slices taken from it (see _slice_response_audio) play back
