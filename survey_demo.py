@@ -48,13 +48,6 @@ RESULTS  = Path("survey_results")
 # Theme pulled from the Gradio gallery: gradio.app/themes/gallery?id=harsh8001/minimal-orange
 THEME = gr.Theme.from_hub("harsh8001/minimal-orange")
 
-def _warn(msg: str) -> str:
-    """High-contrast inline validation banner (dark red on warm cream)."""
-    return (
-        "<div style='color:#b91c1c;background:#fff7ed;border:1px solid #fdba74;"
-        "border-radius:6px;padding:8px 12px;margin:6px 0;font-weight:600'>"
-        f"⚠ {msg}</div>"
-    )
 
 # ── Per-model concurrency (one active call each) ──────────────────────────────
 _locks     = {"A": threading.Lock(), "B": threading.Lock()}
@@ -775,12 +768,25 @@ if __name__ == "__main__":
         default=MODEL_B_PORT,
         help=f"Websocket port of the Model B server.py instance (default {MODEL_B_PORT}).",
     )
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        default=False,
+        help="Expose the survey app publicly via a Gradio FRP tunnel (*.gradio.live, expires ~1 week).",
+    )
+
+    # Full URL/host overrides for remote (e.g. --share tunnel) servers; a bare host
+    # or https://host is normalised to wss://host/ws by server_url_from_address.
+    parser.add_argument("--model-a-url", default=None,
+                        help="Model A server URL/host (e.g. https://xxx.gradio.live); overrides --model-a-port.")
+    parser.add_argument("--model-b-url", default=None,
+                        help="Model B server URL/host; overrides --model-b-port.")
     args = parser.parse_args()
     MODEL_A_PORT = args.model_a_port
     MODEL_B_PORT = args.model_b_port
     _URLS = {
-        "A": server_url_from_address(f"127.0.0.1:{MODEL_A_PORT}"),
-        "B": server_url_from_address(f"127.0.0.1:{MODEL_B_PORT}"),
+        "A": server_url_from_address(args.model_a_url or f"127.0.0.1:{MODEL_A_PORT}"),
+        "B": server_url_from_address(args.model_b_url or f"127.0.0.1:{MODEL_B_PORT}"),
     }
 
-    build_app().launch(share=True)
+    build_app().launch(share=args.share)
