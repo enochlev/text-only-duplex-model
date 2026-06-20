@@ -79,16 +79,20 @@ GROQ_MODEL_CONFIGS = [
 _next_model_index = 0
 _last_used_model: str = ""
 
-# Serving generation cap. Kept small so the bot speaks in short chunks (lower
-# time-to-first-word + clean barge-in points between chunks); when the model is
-# cut off here (finish_reason == "length") the chunked-continuation logic re-fires
-# for the next chunk, and when it emits EOS first (finish_reason == "stop") the bot
-# is done and waits for the user. See _maybe_run_llm / _commit_block_words.
-# TODO(training-mismatch): training used max_tokens=60 (trainer/rl_trainer.py); this
-# 30 is below that window. Revisit raising it / retraining with self-continuation.
-_SERVE_MAX_TOKENS = 30
-# Max chunks the bot will chain within one turn before forcing a stop, so a model
-# that never emits EOS can't monologue forever (~_MAX_CONTINUATION_CHUNKS × _SERVE_MAX_TOKENS tokens).
+# Serving generation cap (single-shot). 80 was the original known-good value that
+# produced complete, coherent answers. Lower caps (e.g. 30) only make sense WITH
+# working chunked continuation — see _ENABLE_CONTINUATION below.
+_SERVE_MAX_TOKENS = 80
+# Chunked self-continuation (re-fire when cut off by the token cap). DISABLED:
+# empirically the MiniCPM base cannot continue its own partial answer — at each
+# chunk seam it restarts the topic or flips into the user's role (logs2.txt, the
+# Pythagorean monologue). Approach A's prompt shape is in-distribution but the
+# *task* of continuing is OOD for this base. Re-enable only after retraining with
+# self-continuation examples (TODO(training-mismatch)); when off, max_tokens must
+# stay high enough (≈60–80) for EOS to terminate answers naturally.
+_ENABLE_CONTINUATION = False
+# Max chunks chained within one turn before a forced stop (only relevant when
+# _ENABLE_CONTINUATION is True) so a non-EOS model can't monologue forever.
 _MAX_CONTINUATION_CHUNKS = 5
 # finish_reason of the most recent generation ("length" | "stop" | None). Mirrors
 # the _last_used_model global pattern; read by _maybe_run_llm to arm continuation.
@@ -331,6 +335,56 @@ for _noisy in ("nemo", "nemo_logger", "nemo_logging", "lightning", "pytorch_ligh
     _logging.getLogger(_noisy).setLevel(_logging.ERROR)
 _os.environ.setdefault("TQDM_DISABLE", "1")  # suppress NeMo progress bars
 
+
+# setLevel(ERROR) alone does NOT silence these — NeMo's transcribe() re-raises its
+# logging verbosity mid-call, so the recurring Lhotse-dataloader warnings print on
+# every transcribe. A record filter runs on the handler regardless of the active
+# level, so it survives the re-raise. Attached in _silence_nemo_logging() once the
+# nemo logger exists (after the ASR model loads).
+_NEMO_SPAM_NEEDLES = (
+    "ignored by Lhotse dataloader",
+    "non-tarred dataset",
+    "pretokenize=True",
+    "setup_training_data",
+    "setup_validation_data",
+)
+
+
+class _NemoSpamFilter(_logging.Filter):
+    def filter(self, record: "_logging.LogRecord") -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(n in msg for n in _NEMO_SPAM_NEEDLES)
+
+
+def _silence_nemo_logging() -> None:
+    """Drop NeMo's recurring Lhotse-dataloader warnings (see _NEMO_SPAM_NEEDLES).
+
+    Attaches the filter to every candidate logger AND its handlers so the spam is
+    dropped even when transcribe() bumps the level back up mid-call. Best-effort:
+    NeMo's logging-object layout varies by version, so each attach is guarded.
+    """
+    _filt = _NemoSpamFilter()
+    candidates = []
+    try:
+        from nemo.utils import logging as _nl
+        _nl.setLevel(_logging.ERROR)
+        candidates.append(getattr(_nl, "_logger", None))
+    except Exception:
+        pass
+    candidates += [_logging.getLogger("nemo_logger"), _logging.getLogger("nemo")]
+    for _lg in candidates:
+        if _lg is None:
+            continue
+        try:
+            _lg.addFilter(_filt)
+            for _h in list(getattr(_lg, "handlers", [])):
+                _h.addFilter(_filt)
+        except Exception:
+            pass
+
 _asr_model = None
 _kokoro_cache = {}   # (lang_code, device) -> KPipeline (heavy model, loaded once)
 # NeMo's transcribe() is not thread-safe (freeze/unfreeze race).
@@ -470,13 +524,7 @@ def preload_asr_model():
             map_location=device,
         )
         _asr_model.to(device)
-        try:
-            from nemo.utils import logging as _nemo_logging
-            import logging as _py_logging
-
-            _nemo_logging.setLevel(_py_logging.ERROR)
-        except Exception:
-            pass
+        _silence_nemo_logging()
     return _asr_model
 
 
@@ -1644,16 +1692,15 @@ class DuplexAudioAgent:
             )
             self._update_pending_queue(proposal_words)
             self._last_accepted_response_context_version = generation_context_version
-            # Arm chunked continuation only when the model was cut off by the token
-            # cap (finish_reason == "length") and we're under the per-turn chunk cap.
-            # An EOS / <用户> ("stop") response disarms — the bot's turn is complete,
-            # so it stays silent until the user speaks again.
-            # TODO(naturalness): watch whether the in-distribution re-fire continues
-            # coherently vs. restarts/repeats/wraps-up-early, and whether chunk seams
-            # produce audible gaps. Tune _SERVE_MAX_TOKENS / _MAX_CONTINUATION_CHUNKS.
+            # Arm chunked continuation only when enabled AND the model was cut off by
+            # the token cap (finish_reason == "length") AND under the per-turn chunk
+            # cap. DISABLED by default (_ENABLE_CONTINUATION) — the base model restarts
+            # / role-flips at chunk seams (see logs2.txt). When off this stays False,
+            # so an EOS or length response alike ends the turn (bot waits for the user).
             self._continuation_count += 1
             self._continue_pending = (
-                _last_finish_reason == "length"
+                _ENABLE_CONTINUATION
+                and _last_finish_reason == "length"
                 and self._continuation_count < _MAX_CONTINUATION_CHUNKS
             )
         except Exception as exc:
