@@ -28,6 +28,7 @@ from full_duplex import (
     VLLM_PORT,
     cpm_generate,
     preload_duplex_models,
+    warmup_duplex_models,
 )
 
 POLL_INTERVAL_S = 0.08
@@ -361,6 +362,8 @@ def main() -> None:
 
     print("[boot] preloading Kokoro TTS and Parakeet ASR...")
     preload_duplex_models()
+    print("[boot] warming up TTS + ASR kernels...")
+    warmup_duplex_models()
     print(f"[boot] models ready, starting websocket server on ws://{args.host}:{args.port}/ws")
 
     public_url = None

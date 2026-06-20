@@ -79,6 +79,21 @@ GROQ_MODEL_CONFIGS = [
 _next_model_index = 0
 _last_used_model: str = ""
 
+# Serving generation cap. Kept small so the bot speaks in short chunks (lower
+# time-to-first-word + clean barge-in points between chunks); when the model is
+# cut off here (finish_reason == "length") the chunked-continuation logic re-fires
+# for the next chunk, and when it emits EOS first (finish_reason == "stop") the bot
+# is done and waits for the user. See _maybe_run_llm / _commit_block_words.
+# TODO(training-mismatch): training used max_tokens=60 (trainer/rl_trainer.py); this
+# 30 is below that window. Revisit raising it / retraining with self-continuation.
+_SERVE_MAX_TOKENS = 30
+# Max chunks the bot will chain within one turn before forcing a stop, so a model
+# that never emits EOS can't monologue forever (~_MAX_CONTINUATION_CHUNKS × _SERVE_MAX_TOKENS tokens).
+_MAX_CONTINUATION_CHUNKS = 5
+# finish_reason of the most recent generation ("length" | "stop" | None). Mirrors
+# the _last_used_model global pattern; read by _maybe_run_llm to arm continuation.
+_last_finish_reason: Optional[str] = None
+
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
     global _next_model_index, _last_used_model
     client = _get_groq_client()
@@ -102,7 +117,8 @@ def llm_generate_groq(system_prompt: str, user_message: str) -> str:
 
 def llm_stream_groq(system_prompt: str, user_message: str) -> Generator[str, None, None]:
     """Streaming Groq call — yields token strings one at a time."""
-    global _next_model_index, _last_used_model
+    global _next_model_index, _last_used_model, _last_finish_reason
+    _last_finish_reason = None  # non-CPM path: never arm chunked continuation
     client = _get_groq_client()
     config = GROQ_MODEL_CONFIGS[_next_model_index]
     model = config["model"]
@@ -137,6 +153,8 @@ def local_generate(system_prompt: str, user_message: str) -> str:
     This talks to the OpenAI-compatible model backend on VLLM_PORT, not to the
     duplex websocket server on SERVER_PORT.
     """
+    global _last_finish_reason
+    _last_finish_reason = None  # chunked continuation is wired only for cpm_generate
     import requests
     url = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
     payload = {
@@ -231,19 +249,26 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
     This talks to the OpenAI-compatible MiniCPM backend on VLLM_PORT, not to the
     duplex websocket server on SERVER_PORT.
     """
+    global _last_finish_reason
     import requests
     prompt = _build_cpm_prompt(user_message)
     url = f"http://localhost:{VLLM_PORT}/v1/completions"
     payload = {
         "model": "cpm-text-duplex",
         "prompt": prompt,
-        "max_tokens": 80,
+        "max_tokens": _SERVE_MAX_TOKENS,
         "temperature": 0.0,
         "stop": ["<用户>"],
     }
     resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
     resp.raise_for_status()
-    return resp.json()["choices"][0]["text"].strip()
+    choice = resp.json()["choices"][0]
+    # finish_reason drives chunked continuation: "length" → cut off, re-fire next
+    # chunk; "stop" (EOS / <用户>) → turn complete, wait for the user.
+    _last_finish_reason = choice.get("finish_reason")
+    text = choice["text"].strip()
+    print(f"[llm] finish_reason={_last_finish_reason} words={len(text.split())}")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +324,10 @@ TTS_MODEL   = os.getenv("KOKORO_VOICE", "af_heart")  # default Kokoro voice id
 import logging as _logging
 import os as _os
 import threading as _threading
-for _noisy in ("nemo", "nemo_logging", "lightning", "pytorch_lightning", "omegaconf"):
+# NeMo's own logger is named "nemo_logger" (not "nemo"/"nemo_logging"), so the
+# original two names never matched it — "nemo_logger" is the one that silences the
+# recurring Lhotse-dataloader warnings emitted on every transcribe().
+for _noisy in ("nemo", "nemo_logger", "nemo_logging", "lightning", "pytorch_lightning", "omegaconf"):
     _logging.getLogger(_noisy).setLevel(_logging.ERROR)
 _os.environ.setdefault("TQDM_DISABLE", "1")  # suppress NeMo progress bars
 
@@ -461,6 +489,54 @@ def preload_duplex_models(
     preload_asr_model()
 
 
+def warmup_duplex_models(
+    tts_model: str = TTS_MODEL,
+    device: Optional[str] = None,
+    min_seconds: float = 6.0,
+) -> None:
+    """Run dummy TTS + ASR inferences so the first real turn doesn't pay one-time
+    kernel-compilation cost. Observed cold starts: Kokoro first synth ~3.2s,
+    Parakeet first transcribe ~1.4s; warm calls are ~0.1s. Loops for ~min_seconds
+    so every kernel path (varied audio length) is compiled before serving.
+    """
+    import tempfile
+    import soundfile as sf
+
+    resolved_device = resolve_device(device)
+    voice = preload_kokoro_voice(tts_model=tts_model, device=resolved_device)
+    model = preload_asr_model()
+
+    phrase = "How are you doing today?"
+    t0 = time.time()
+    iters = 0
+    while True:
+        sr, pcm16 = kokoro_synthesize(voice, phrase)            # warms Kokoro kernels
+        if pcm16.size:
+            audio = pcm16.astype(np.float32) / 32767.0
+            if sr != ASR_SAMPLE_RATE:
+                audio = _resample(audio, sr, ASR_SAMPLE_RATE)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    tmp_path = f.name
+                    sf.write(f.name, audio, ASR_SAMPLE_RATE)
+                with _asr_lock:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        model.transcribe([tmp_path], timestamps=True, verbose=False)  # warms Parakeet
+            except Exception as exc:
+                print(f"[boot] warmup transcribe skipped: {exc!r}")
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+        iters += 1
+        if time.time() - t0 >= min_seconds:
+            break
+    print(f"[boot] warmup complete ({iters} iters, {time.time() - t0:.1f}s)")
+
+
 def kokoro_synthesize(voice: Any, text: str) -> tuple:
     """Synthesize text with a loaded Kokoro voice handle.
 
@@ -535,6 +611,13 @@ class DuplexAudioAgent:
         # Prevents duplicate LLM calls within the same block period when the model
         # chose silence but _last_accepted_response_context_version is not set.
         self._last_idle_call_n_blocks: int = -1
+        # Chunked continuation: armed when the last generation was cut off by the
+        # token cap (finish_reason == "length"). While armed, the bot re-fires for
+        # the next chunk when pending drains and bypasses the generation window;
+        # an EOS ("stop") response disarms it so the bot waits for the user.
+        # _continuation_count caps a single turn's chunks to avoid a runaway monologue.
+        self._continue_pending: bool = False
+        self._continuation_count: int = 0
         self._last_ctx_flush_user_fingerprint: str = ""
         self.last_llm_error: Optional[str] = None
         self.last_llm_error_seq: int = 0
@@ -625,6 +708,9 @@ class DuplexAudioAgent:
     def _invalidate_future_assistant_continuation(self) -> None:
         self._pending_words = []
         self._committed_words = []
+        # New/changed user input supersedes any in-flight chunked answer — abandon it.
+        self._continue_pending = False
+        self._continuation_count = 0
         self._clear_pending_response_timing()
         # Flushed words → flushed audio: drop the whole-response synthesis and any
         # already-queued bot audio so a barge-in stops playback immediately instead
@@ -993,7 +1079,7 @@ class DuplexAudioAgent:
                 sf.write(f.name, full_audio, ASR_SAMPLE_RATE)
             with _asr_lock:
                 with contextlib.redirect_stderr(io.StringIO()):
-                    output = model.transcribe([tmp_path], timestamps=True)
+                    output = model.transcribe([tmp_path], timestamps=True, verbose=False)
         except Exception as exc:
             print(f"[asr] transcribe error: {exc!r}")
             import traceback; traceback.print_exc()
@@ -1188,10 +1274,13 @@ class DuplexAudioAgent:
             self._clear_pending_response_timing()
             pending_preview = " ".join(self._pending_words[:6]) + ("…" if len(self._pending_words) > 6 else "")
             self._vlog(f"[commit ✓] {text!r}  pending={len(self._pending_words)} words  [{pending_preview}]")
-            # Words were consumed — allow LLM to continue generating the next chunk
-            # regardless of whether context_version changed. Without this, the AI
-            # goes silent after the first response until the user speaks again.
-            if not self._pending_words:
+            # Chunk fully spoken — re-fire for the next chunk ONLY if the last
+            # generation was cut off by the token cap (continuation armed). An EOS
+            # ("stop") response leaves the version guard set, so the bot stays silent
+            # until the user speaks again. Resetting to None bypasses the version
+            # guard in _maybe_run_llm; the next adaptive tick's audio masks the
+            # ~0.5s gen+TTS so the next chunk begins seamlessly.
+            if not self._pending_words and self._continue_pending:
                 self._last_accepted_response_context_version = None
 
     def _update_pending_queue(self, proposal_words: List[str]) -> None:
@@ -1479,11 +1568,13 @@ class DuplexAudioAgent:
             self._current_block is None or not self._current_block.user_text
         ):
             return
-        # Also bypass the window guard when there's unanswered user speech.
-        # The window check prevents chatty bot behavior after long silence, but
-        # when the user asked something the bot never answered (words assigned to
-        # a block >3 deep by ASR churn), we must still generate.
-        if not unanswered and not self._within_generation_window():
+        # Also bypass the window guard when there's unanswered user speech OR a
+        # chunked continuation is armed. The window check prevents chatty bot
+        # behavior after long silence, but (a) when the user asked something the bot
+        # never answered (words assigned to a block >3 deep by ASR churn) and (b)
+        # when the bot was mid-answer and cut off by the token cap, a long answer
+        # spans past the 3-block window — in both cases we must still generate.
+        if not unanswered and not self._continue_pending and not self._within_generation_window():
             return
 
         generation_context_version = self.context_version
@@ -1534,6 +1625,7 @@ class DuplexAudioAgent:
             if not proposal_words:
                 self._clear_pending_response_timing()
                 self._pending_words = []
+                self._continue_pending = False  # nothing more to say — disarm continuation
                 # Do NOT set _last_accepted_response_context_version here.
                 # For idle (empty) responses the model chose silence; subsequent
                 # blocks within _within_generation_window() should still be
@@ -1552,6 +1644,18 @@ class DuplexAudioAgent:
             )
             self._update_pending_queue(proposal_words)
             self._last_accepted_response_context_version = generation_context_version
+            # Arm chunked continuation only when the model was cut off by the token
+            # cap (finish_reason == "length") and we're under the per-turn chunk cap.
+            # An EOS / <用户> ("stop") response disarms — the bot's turn is complete,
+            # so it stays silent until the user speaks again.
+            # TODO(naturalness): watch whether the in-distribution re-fire continues
+            # coherently vs. restarts/repeats/wraps-up-early, and whether chunk seams
+            # produce audible gaps. Tune _SERVE_MAX_TOKENS / _MAX_CONTINUATION_CHUNKS.
+            self._continuation_count += 1
+            self._continue_pending = (
+                _last_finish_reason == "length"
+                and self._continuation_count < _MAX_CONTINUATION_CHUNKS
+            )
         except Exception as exc:
             self.last_llm_error = f"{type(exc).__name__}: {exc}"
             self.last_llm_error_seq += 1
