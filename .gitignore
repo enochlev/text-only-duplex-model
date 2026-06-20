@@ -19,3 +19,9 @@ debug/*
 checkpoints/*
 wandb/*
 logs/*
+sft_checkpoints/*
+*/_*
+*._*
+survey_*
+*.log
+*.pem
