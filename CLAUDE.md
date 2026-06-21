@@ -168,6 +168,8 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
+| 2026-06-20 | `gamma` (`trainer.py`) | 1.0 | 0.90 | Sum-to-go returns smeared a late interruption across every prior correct decision → flat-plateau/no-learning (avg_KL≈0); 0.90 localizes credit to adjacent steps (§7/§10 intent), cuts advantage variance |
+| 2026-06-20 | `episodes_per_step` default (`trainer.py`) | 8 (run used 14) | 24 | Per-batch z-scored advantage over ~14 noisy episodes gave inconsistent gradient; larger batch stabilizes the update |
 | 2026-06-06 | RM3 weight (`trainer.py`) | 1.5 | 2.0 | RM4≈−RM2 cancelled to a flat 50-step plateau; tilt the balance toward "wait" |
 | 2026-06-06 | RM4 weight (`trainer.py`) | 2.5 | 2.25 | Same plateau fix — slightly reduce speak incentive so net gradient favours caution |
 | 2026-06-06 | RM4 source-block guard (`rewards.py`) | +1.0 whenever src had user_text | +1.0 only if src had no bot speech | Barge-in (interrupt) collected the timely +2.5 the moment user stopped, halving RM2's deterrent; now interrupts are strictly unprofitable |

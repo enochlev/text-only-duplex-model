@@ -71,7 +71,7 @@ def main() -> None:
                         help="Use LoRA for SFT (safest option; weights merged before RL)")
     # RL options
     parser.add_argument("--steps", type=int, default=10, help="Number of RL training steps")
-    parser.add_argument("--episodes-per-step", type=int, default=8)
+    parser.add_argument("--episodes-per-step", type=int, default=24)
     parser.add_argument("--lr", type=float, default=2.5e-6)
     parser.add_argument("--kl-coeff", type=float, default=0.01)
     parser.add_argument("--kl-ref-coeff", type=float, default=0.04,
@@ -176,6 +176,10 @@ def main() -> None:
         kl_ref_coeff=args.kl_ref_coeff,
         kl_ref_clip=args.kl_ref_clip,
         episodes_per_train_step=args.episodes_per_step,
+        # gamma<1 localizes credit to adjacent steps (see CLAUDE.md §7/§10 intent).
+        # 1.0 smeared a late interruption's penalty across every prior correct
+        # decision → flat-plateau / no-learning. 0.90 cuts advantage variance.
+        gamma=0.90,
         max_seq_len=660,
         device=args.device,
         output_dir=args.output_dir,
