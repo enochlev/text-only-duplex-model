@@ -392,11 +392,10 @@ def main() -> None:
 
     if args.is_cpm:
         print(f"[boot] CPM mode: using MiniCPM-duplex backend on port {args.vllm_port}")
-        # SERVING block size only (training keeps DEFAULT_BLOCK_S=2.0). 1.5s idle ticks
-        # seal the user's speech + submit ASR ~0.5s sooner (input-side latency); _n
-        # becomes ceil(150*1.5/60)=4 words/slice. Revert by removing default_block_s if
-        # the 4-word vs trained-5-word history segmentation degrades turn-taking.
-        agent_factory = lambda: DuplexAudioAgent(llm_generate_fn=cpm_generate, default_block_s=1.5)
+        # SERVING block size only (training keeps DEFAULT_BLOCK_S=2.0). 1.7s matches
+        # Kokoro's real ~175 WPM rate, so _n = ceil(150*1.7/60) = 5 words/slice maps
+        # cleanly to ~1.7s of audio per block. Revert by removing default_block_s.
+        agent_factory = lambda: DuplexAudioAgent(llm_generate_fn=cpm_generate, default_block_s=1.7)
         app = create_app(agent_factory=agent_factory, public_url=public_url)
     else:
         print(f"[boot] local mode: using trained model backend on port {args.vllm_port}")
