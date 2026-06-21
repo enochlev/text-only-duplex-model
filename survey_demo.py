@@ -163,6 +163,14 @@ def _save(s: dict) -> None:
 # ── AudioContext JS (same scheduling logic as demo.py) ────────────────────────
 _JS = """
 var _aC = null, _aN = 0;
+// Jitter-buffer head-start before a fresh response's first chunk so the play
+// cursor (_aN) never falls behind currentTime mid-response — that slippage caused
+// ~0.1-0.2s underrun gaps between blocks. This path stacks several jitter sources
+// (Gradio Timer poll + queue + WAV-URI textbox round-trip + async decodeAudioData +
+// the gradio.live tunnel's network latency), so it needs a larger cushion than a
+// direct websocket client. Costs this much latency only at a response's first chunk,
+// not per block. Tune down toward 0.18 on localhost; up if gaps persist over a tunnel.
+var _JITTER_S = 0.20;
 window._audioEnqueue = function(u) {
     if (!u) return;
     if (u === '__reset__') { _aN = 0; return; }
@@ -175,7 +183,7 @@ window._audioEnqueue = function(u) {
         .then(function(b) { return c.decodeAudioData(b); })
         .then(function(d) {
             var s = c.createBufferSource(); s.buffer = d; s.connect(c.destination);
-            var w = Math.max(c.currentTime + 0.05, _aN);
+            var w = Math.max(c.currentTime + _JITTER_S, _aN);
             s.start(w); _aN = w + d.duration;
         }).catch(function(e) { console.error('[audio]', e); });
 };

@@ -110,6 +110,13 @@ let audioCtx = null;    // single AudioContext (capture + playback)
 let micStream = null;   // MediaStream from getUserMedia
 let micNode = null;     // ScriptProcessorNode pulling mic samples
 let playCursor = 0;     // next scheduled playback time (AudioContext clock)
+// Jitter buffer head-start. The server meters audio just-in-time (one slice per
+// ~1.5s tick, no look-ahead), so poll granularity (~80ms) + network jitter let
+// playCursor fall behind currentTime → ~0.1-0.2s underrun gaps between blocks.
+// A bigger cushion keeps playCursor ahead so consecutive slices stay glued. Costs
+// this much latency only at a response's first chunk (or after an underrun), not
+// per block. Tune down toward 0.12 if start latency bugs you, up if gaps persist.
+const JITTER_BUFFER_S = 0.20;
 
 const $ = (id) => document.getElementById(id);
 
@@ -147,8 +154,10 @@ function playChunk(sampleRate, b64) {{
   src.buffer = buf;
   src.connect(audioCtx.destination);
 
-  // max(): if the queue drained, restart from "now" instead of the stale cursor.
-  const when = Math.max(audioCtx.currentTime + 0.05, playCursor);
+  // max(): if playCursor fell behind (fresh response or underrun), restart with a
+  // jitter-buffer head-start instead of the stale cursor; otherwise stay glued to
+  // playCursor so consecutive slices play back-to-back with no gap.
+  const when = Math.max(audioCtx.currentTime + JITTER_BUFFER_S, playCursor);
   src.start(when);
   playCursor = when + buf.duration;
 }}
