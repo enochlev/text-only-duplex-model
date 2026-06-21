@@ -16,6 +16,7 @@ import queue
 import re
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, List, Optional
@@ -1267,12 +1268,24 @@ class DuplexAudioAgent:
         # consecutive pairs in the actual historical block list.
         self._strip_boundary_duplicates(n_rolling)
 
-        # Fix B: suppress flush when user content is unchanged across rolling blocks.
-        # Same words in different block slots (NeMo timestamp drift) must not restart the LLM.
+        # Fix B: suppress flush unless GENUINELY NEW user words arrived since the last
+        # flush. Full-sequence equality was too strict — a rolling-window slide (old
+        # words dropping off the front), pure re-segmentation, or re-capitalization
+        # changes the fingerprint with NO new speech, which spuriously restarted the
+        # bot's in-progress answer (logs2.txt ctx=5: "A squared.." → "a squared.." after
+        # the window slid). Compare token MULTISETS instead: slide/re-seg/case never add
+        # words, so (current − previous) is empty and we skip; only a real new word makes
+        # the difference non-empty. Reference is kept (not updated) on a skip so a slide
+        # alone never advances it.
+        # Limitation: a word flushed earlier, dropped off the window, then re-spoken can
+        # be missed — acceptable stopgap; cache-aware streaming ASR will retire this.
         if any_changed:
             _current_fp = self._user_content_fingerprint(rolling)
-            if _current_fp == self._last_ctx_flush_user_fingerprint:
-                any_changed = False   # same words, different slots — skip flush
+            _new_words = Counter(_current_fp.split()) - Counter(
+                self._last_ctx_flush_user_fingerprint.split()
+            )
+            if not _new_words:
+                any_changed = False   # only slide / re-seg / case — skip flush
             else:
                 self._last_ctx_flush_user_fingerprint = _current_fp
 
