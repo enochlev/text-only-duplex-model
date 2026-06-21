@@ -1051,7 +1051,15 @@ class DuplexAudioAgent:
                     if block.user_text:
                         tokens.extend(self._change_tokens(block.user_text))
                     break
-        return " ".join(tokens)
+        # Collapse consecutive duplicate tokens. ASR boundary overlap puts the same
+        # word at the tail of one block and the head of the next ("…with a" |
+        # "a squared…" → "a a"), which the multiset diff in Fix B would otherwise read
+        # as a new word and flush on. Non-adjacent repeats ("squared … squared") survive.
+        collapsed: List[str] = []
+        for _t in tokens:
+            if not collapsed or collapsed[-1] != _t:
+                collapsed.append(_t)
+        return " ".join(collapsed)
 
     def _strip_boundary_duplicates(self, n_rolling: int) -> None:
         """Remove leading words from a block that duplicate the trailing word of the prior block.
