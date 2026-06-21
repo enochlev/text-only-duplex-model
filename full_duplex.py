@@ -1792,6 +1792,15 @@ class DuplexAudioAgent:
             if chunk is not None:
                 return chunk
             self._maybe_run_llm()
+            # Pull the commit/emit tick forward when a fresh response is queued but
+            # no audio has started yet (the whole-response TTS cache isn't built).
+            # Otherwise the first slice waits up to one idle block before playing.
+            # This fires once per response: the next tick builds _full_tts_audio,
+            # which stays non-None until the response is fully spoken or flushed, so
+            # subsequent slices keep their normal audio-paced (adaptive) cadence and
+            # barge-in safety (the queue stays ~one slice deep).
+            if self._pending_words and self._full_tts_audio is None and not self._llm_in_flight:
+                self._next_block_ts = now
             return None
 
         # Use previous block's end time as this block's start (0.0 → use now on first poll)
