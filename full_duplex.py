@@ -80,10 +80,14 @@ GROQ_MODEL_CONFIGS = [
 _next_model_index = 0
 _last_used_model: str = ""
 
-# Serving generation cap (single-shot). 80 was the original known-good value that
-# produced complete, coherent answers. Lower caps (e.g. 30) only make sense WITH
-# working chunked continuation — see _ENABLE_CONTINUATION below.
-_SERVE_MAX_TOKENS = 80
+# Serving generation cap (single-shot). Raised 80→200 on 2026-06-23: with a large
+# enough window the model emits its ENTIRE turn (ending in eos </s>) in one call,
+# so there is no truncation seam and the chunked-continuation workaround is moot.
+# At ~300 tok/s a 200-token cap is ~0.7s of gen — masked by block quantization.
+# This is a CEILING, not a target: short answers should still end early on eos.
+# If you see "[llm] WARNING: hit max_tokens" a lot, eos isn't firing (the model is
+# rambling to the cap) — dial this back and investigate the eos/turn-end behavior.
+_SERVE_MAX_TOKENS = 200
 # Chunked self-continuation (re-fire when cut off by the token cap). DISABLED:
 # empirically the MiniCPM base cannot continue its own partial answer — at each
 # chunk seam it restarts the topic or flips into the user's role (logs2.txt, the
@@ -107,7 +111,11 @@ _last_finish_reason: Optional[str] = None
 # latency. NOTE: this is the "speak sooner" lever previously removed (P2-A) — with
 # an untrained base it can amplify false-starts (the base re-answers on every
 # partial ASR revision). Flip to False to restore strict tick-paced emission.
-_ENABLE_EARLY_EMIT = True
+# DISABLED 2026-06-22: re-trial showed it wedges the bot's reply block into the
+# middle of a still-settling utterance (ASR re-timestamps trailing words across
+# block boundaries), splitting the user's sentence. Same class of issue as the
+# original P2-A removal. Emission stays strictly tick-paced.
+_ENABLE_EARLY_EMIT = False
 
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
     global _next_model_index, _last_used_model
@@ -174,11 +182,14 @@ def local_generate(system_prompt: str, user_message: str) -> str:
     url = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
     payload = {
         "model": "text-duplex",
+        # Match cpm_generate's larger window so a full turn lands in one call (the
+        # chat template's eos terminates it; <用户> isn't used in this format, so no
+        # ban needed here).
+        "max_tokens": _SERVE_MAX_TOKENS,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_message},
         ],
-        "max_tokens": 60,
         "temperature": 0.0,
     }
     response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
@@ -259,7 +270,13 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
 
     system_prompt is ignored — MiniCPM uses raw <用户>/<AI> format with no system turn.
     user_message is in the standard block format; reformatted internally to CPM format.
-    Stops at <用户> (the model's natural turn boundary).
+
+    The model's own turn ends on eos (</s>), which fires reliably. We additionally
+    BAN the <用户> SEQUENCE via vLLM bad_words so the base can't role-flip into a
+    hallucinated user turn when unsure — it must keep generating until eos instead.
+    bad_words bans the sequence (not the pieces): <用户> tokenizes to <,用户,> so it
+    only blocks the closing > when preceded by <用户 — standalone < / > (math
+    operators!) are untouched. stop=["<用户>"] is kept as a harmless fallback.
 
     This talks to the OpenAI-compatible MiniCPM backend on VLLM_PORT, not to the
     duplex websocket server on SERVER_PORT.
@@ -273,7 +290,8 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
         "prompt": prompt,
         "max_tokens": _SERVE_MAX_TOKENS,
         "temperature": 0.0,
-        "stop": ["<用户>"],
+        "stop": ["<用户>"],          # fallback; bad_words below prevents it being generated
+        "bad_words": ["<用户>"],     # sequence ban → model continues to eos instead of bailing
     }
     resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
     resp.raise_for_status()
@@ -282,6 +300,11 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
     # chunk; "stop" (EOS / <用户>) → turn complete, wait for the user.
     _last_finish_reason = choice.get("finish_reason")
     text = choice["text"].strip()
+    if _last_finish_reason == "length":
+        # eos did not fire within the (now large) window — the model rambled to the
+        # cap instead of ending its turn. With <用户> banned this is the signal to
+        # watch: it means turn-end relies on eos and eos isn't being produced.
+        print(f"[llm] WARNING: hit max_tokens={_SERVE_MAX_TOKENS} without eos — turn not self-terminating")
     print(f"[llm] finish_reason={_last_finish_reason} words={len(text.split())}")
     return text
 
