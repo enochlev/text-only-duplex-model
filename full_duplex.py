@@ -99,6 +99,16 @@ _MAX_CONTINUATION_CHUNKS = 5
 # the _last_used_model global pattern; read by _maybe_run_llm to arm continuation.
 _last_finish_reason: Optional[str] = None
 
+# --- ADHOC LATENCY HACK (2026-06-22) — early-emit / pull-tick-forward ---------
+# Normally a response that finishes mid-block isn't committed/played until the
+# next fixed block tick, so first-audio latency is up to ~2 blocks (≤3.4s @1.7s).
+# When enabled, poll() fires the tick the instant a fresh response is fully
+# buffered (during a silence/user gap, never mid-response), cutting ~1 block of
+# latency. NOTE: this is the "speak sooner" lever previously removed (P2-A) — with
+# an untrained base it can amplify false-starts (the base re-answers on every
+# partial ASR revision). Flip to False to restore strict tick-paced emission.
+_ENABLE_EARLY_EMIT = True
+
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
     global _next_model_index, _last_used_model
     client = _get_groq_client()
@@ -1813,7 +1823,26 @@ class DuplexAudioAgent:
             if chunk is not None:
                 return chunk
             self._maybe_run_llm()
-            return None
+            # ADHOC early-emit (P2-A): a fresh response is now fully buffered but
+            # the fixed block boundary hasn't arrived. Pull the tick forward to
+            # now so the first speech chunk plays immediately instead of waiting
+            # out the rest of the block (~1.7s). Guards:
+            #   _pending_words      → there is a response to speak
+            #   not _llm_in_flight  → stream/gen complete (full_tts_cache needs this)
+            #   last block silent   → we're in a gap starting a NEW response, not
+            #                          mid-utterance; continuous multi-block speech
+            #                          must keep using _next_block_ts as its clock.
+            # When all hold we fall through to the tick path below to emit now.
+            early_emit = (
+                _ENABLE_EARLY_EMIT
+                and self._pending_words
+                and not self._llm_in_flight
+                and not (self.blocks and self.blocks[-1].assistant_text)
+            )
+            if not early_emit:
+                return None
+            self._vlog(f"[early-emit] pulling tick forward ({self._next_block_ts - now:.2f}s early)")
+            self._next_block_ts = now
 
         # Use previous block's end time as this block's start (0.0 → use now on first poll)
         block_start = self._block_start_ts if self._block_start_ts else now

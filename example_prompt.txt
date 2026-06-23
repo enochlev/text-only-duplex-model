@@ -1,4 +1,0 @@
-<用户>cool let's do that<AI>Great! I'd be happy to help you create a weather forecast.</s><用户><idle><AI> Please provide me with the following information:
-
-</s><用户><idle><AI>1. Your location or the city/town you</s><用户><idle><AI>'d like the weather forecast for.
-2</s><用户><idle><AI>

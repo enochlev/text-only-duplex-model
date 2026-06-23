@@ -168,6 +168,7 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
+| 2026-06-20 | `learning_rate` (`--lr`) | 2e-6 | 5e-6 | After gamma+batch cleaned the advantage signal, policy still wouldn't move (KL≈0, flat reward) → step size too small. 5e-6 broke the plateau: reward trend Δ=+0.53 over 30 steps, RM2 interruptions roughly halved, content-KL stayed ~0 |
 | 2026-06-20 | `gamma` (`trainer.py`) | 1.0 | 0.90 | Sum-to-go returns smeared a late interruption across every prior correct decision → flat-plateau/no-learning (avg_KL≈0); 0.90 localizes credit to adjacent steps (§7/§10 intent), cuts advantage variance |
 | 2026-06-20 | `episodes_per_step` default (`trainer.py`) | 8 (run used 14) | 24 | Per-batch z-scored advantage over ~14 noisy episodes gave inconsistent gradient; larger batch stabilizes the update |
 | 2026-06-06 | RM3 weight (`trainer.py`) | 1.5 | 2.0 | RM4≈−RM2 cancelled to a flat 50-step plateau; tilt the balance toward "wait" |
