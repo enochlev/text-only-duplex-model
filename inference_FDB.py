@@ -77,7 +77,12 @@ def _setup_log() -> None:
 
 
 CHUNK_MS = 80       # audio chunk duration sent per frame
-SETTLE_S = 1.5      # wait for TTS to finish after all input is sent
+# After all input is sent the bot may still be mid-reply. Replies can now run much
+# longer (serving max_tokens=200 → up to ~15-20s of TTS), so a fixed settle would
+# clip the tail. Instead drain until the bot has been quiet for QUIET_TAIL_S (the
+# server only emits non-silent chunks), capped at MAX_TAIL_S as a safety stop.
+QUIET_TAIL_S = 4.0
+MAX_TAIL_S = 45.0
 
 
 def _mono(x: np.ndarray) -> np.ndarray:
@@ -117,6 +122,7 @@ class FDBFileClient:
         self.audio = _mono(audio)
         self.sr = sr
         self.duration_s = len(self.audio) / sr
+        self._last_audio_at = 0.0   # wall-clock of the last received TTS chunk
 
     async def _send(self, ws, stop_event: asyncio.Event) -> None:
         chunk_size = max(1, int(self.sr * CHUNK_MS / 1000.0))
@@ -124,7 +130,14 @@ class FDBFileClient:
             chunk = self.audio[offset : offset + chunk_size]
             await ws.send(json.dumps(_encode_audio(self.sr, chunk)))
             await asyncio.sleep(len(chunk) / self.sr)
-        await asyncio.sleep(SETTLE_S)
+        # Input fully sent — wait out any in-progress / delayed reply. Stop once the
+        # bot has emitted no audio for QUIET_TAIL_S, or after MAX_TAIL_S regardless.
+        self._last_audio_at = time.time()
+        deadline = time.time() + MAX_TAIL_S
+        while time.time() < deadline:
+            await asyncio.sleep(0.2)
+            if time.time() - self._last_audio_at >= QUIET_TAIL_S:
+                break
         stop_event.set()
 
     async def _recv(
@@ -145,6 +158,7 @@ class FDBFileClient:
             msg = json.loads(raw)
             if msg.get("type") == "audio_chunk":
                 arrival_s = time.time() - t0
+                self._last_audio_at = time.time()
                 sr, audio = _decode_audio(msg)
                 segments.append((arrival_s, sr, audio))
             elif msg.get("type") == "warning":

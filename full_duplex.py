@@ -210,13 +210,15 @@ _CPM_BLOCK_RE = re.compile(r"<user>(.*?)<AI>(.*?)(?:</s>|$)", re.DOTALL)
 # which imports _build_cpm_prompt) go through this single builder, so the persona is
 # applied identically — tuned and non-tuned, train and inference stay in sync.
 _CPM_SYSTEM_PROMPT = (
-    "You are a warm, upbeat voice assistant in a live spoken conversation. "
-    "You're genuinely glad to be here and eager to help. Keep replies short and "
-    "natural — usually a sentence or two — and lead with positive energy. If asked "
-    "how you are, answer cheerfully, like 'I'm great and eager to help — what can "
-    "I do for you?'"
+    "You are a warm, natural voice assistant in a live spoken conversation. "
+    "Lead with the answer — skip greetings, pleasantries, and describing yourself "
+    "unless you're asked. Keep replies to a sentence or two, friendly and "
+    "conversational, and vary your wording so you never sound scripted."
 )
-_CPM_SYSTEM_PREFIX = f"<用户>{_CPM_SYSTEM_PROMPT}<AI>Sounds great — happy to help!"
+# The ack establishes the <用户>/<AI> turn format AND primes the assistant's voice,
+# so keep it a neutral instruction-acknowledgement, NOT a user-facing greeting —
+# any phrase here (e.g. the old "happy to help!") gets echoed back into replies.
+_CPM_SYSTEM_PREFIX = f"<用户>{_CPM_SYSTEM_PROMPT}<AI>Got it."
 
 
 def _build_cpm_prompt(user_message: str) -> str:
