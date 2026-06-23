@@ -83,6 +83,7 @@ CHUNK_MS = 80       # audio chunk duration sent per frame
 # server only emits non-silent chunks), capped at MAX_TAIL_S as a safety stop.
 QUIET_TAIL_S = 4.0
 MAX_TAIL_S = 45.0
+MAX_WORKERS = 4     # hard cap on concurrent sessions (each = its own server session)
 
 
 def _mono(x: np.ndarray) -> np.ndarray:
@@ -123,6 +124,7 @@ class FDBFileClient:
         self.sr = sr
         self.duration_s = len(self.audio) / sr
         self._last_audio_at = 0.0   # wall-clock of the last received TTS chunk
+        self.tag = inp.parent.name  # short id for readable logs when running concurrently
 
     async def _send(self, ws, stop_event: asyncio.Event) -> None:
         chunk_size = max(1, int(self.sr * CHUNK_MS / 1000.0))
@@ -162,7 +164,7 @@ class FDBFileClient:
                 sr, audio = _decode_audio(msg)
                 segments.append((arrival_s, sr, audio))
             elif msg.get("type") == "warning":
-                print(f"[WARN] {msg.get('source')}: {msg.get('message')}")
+                print(f"[WARN][{self.tag}] {msg.get('source')}: {msg.get('message')}")
         return segments
 
     async def _run(self) -> None:
@@ -210,13 +212,19 @@ class FDBFileClient:
         sf.write(str(self.out), buf, out_sr)
         print(f"[DONE] {self.inp} → {self.out} ({len(buf) / out_sr:.2f}s @ {out_sr} Hz)")
 
-    def run(self) -> None:
+    async def run_async(self) -> None:
+        # Errors are swallowed here (not re-raised) so one failed file never
+        # cancels its siblings when run under asyncio.gather.
         try:
-            asyncio.run(self._run())
+            await self._run()
         except wsex.ConnectionClosedError as e:
-            print("[WARN] closed:", e)
+            print(f"[WARN][{self.tag}] closed:", e)
         except Exception as e:
-            print("[ERR]", e)
+            print(f"[ERR][{self.tag}]", e)
+
+    def run(self) -> None:
+        # Single-file convenience wrapper (kept for backward compat).
+        asyncio.run(self.run_async())
 
 
 def _ws_url(addr: str) -> str:
@@ -240,22 +248,52 @@ def _input_files() -> List[Path]:
     return files
 
 
+async def _run_all(url: str, jobs: List[tuple[Path, Path]], workers: int) -> None:
+    # Each worker opens its own websocket → its own server session (session_id is
+    # None, so the server mints a unique one per connection). The semaphore bounds
+    # how many run concurrently. Client audio is paced at 1x real-time, so the limit
+    # is wall-clock, not compute → N workers ≈ Nx throughput. Server-side ASR/TTS are
+    # lock-serialized (cheap) and vLLM batches concurrent requests.
+    sem = asyncio.Semaphore(workers)
+
+    async def _one(inp: Path, out: Path) -> None:
+        async with sem:
+            print("[RUN]", inp)
+            await FDBFileClient(url, inp, out).run_async()
+
+    await asyncio.gather(*(_one(inp, out) for inp, out in jobs))
+
+
 def main() -> None:
     _setup_log()
     ap = argparse.ArgumentParser("fdb_batch_client")
     ap.add_argument("--server_ip", required=True, help="host[:port] or http(s):// URL")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=MAX_WORKERS,
+        help=f"concurrent sessions, 1-{MAX_WORKERS} (default {MAX_WORKERS}); each is an independent server session",
+    )
     args = ap.parse_args()
 
+    workers = max(1, min(args.workers, MAX_WORKERS))
+    if workers != args.workers:
+        print(f"[INFO] clamping --workers {args.workers} → {workers} (max {MAX_WORKERS})")
+
     url = _ws_url(args.server_ip)
-    print(f"[INFO] connecting to {url}")
+    print(f"[INFO] connecting to {url}  (workers={workers})")
+
+    jobs: List[tuple[Path, Path]] = []
     for inp in _input_files():
         out = inp.with_name(inp.name.replace("input.wav", "output.wav"))
         if not overwrite and out.exists():
             print("[SKIP]", out)
             continue
         out.parent.mkdir(parents=True, exist_ok=True)
-        print("[RUN]", inp)
-        FDBFileClient(url, inp, out).run()
+        jobs.append((inp, out))
+
+    print(f"[INFO] {len(jobs)} file(s) to process")
+    asyncio.run(_run_all(url, jobs, workers))
 
 
 if __name__ == "__main__":

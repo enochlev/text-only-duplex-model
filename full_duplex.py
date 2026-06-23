@@ -115,7 +115,7 @@ _last_finish_reason: Optional[str] = None
 # middle of a still-settling utterance (ASR re-timestamps trailing words across
 # block boundaries), splitting the user's sentence. Same class of issue as the
 # original P2-A removal. Emission stays strictly tick-paced.
-_ENABLE_EARLY_EMIT = False
+_ENABLE_EARLY_EMIT = True
 
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
     global _next_model_index, _last_used_model
@@ -426,7 +426,11 @@ _kokoro_cache = {}   # (lang_code, device) -> KPipeline (heavy model, loaded onc
 # NeMo's transcribe() is not thread-safe (freeze/unfreeze race).
 # All background ASR threads must hold this lock before calling transcribe().
 _asr_lock = _threading.Lock()
-_kokoro_lock = _threading.Lock()
+_kokoro_lock = _threading.Lock()   # guards one-time KPipeline cache load
+# All sessions share ONE KPipeline instance (per lang/device), so concurrent
+# sessions (e.g. parallel inference_FDB workers) must serialize the synthesis
+# forward pass — a torch module is not safe under concurrent forward calls.
+_tts_lock = _threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -632,18 +636,21 @@ def kokoro_synthesize(voice: Any, text: str) -> tuple:
     pipeline = voice.pipeline
     voice_id = voice.voice
     chunks: List[np.ndarray] = []
-    for result in pipeline(text, voice=voice_id, speed=1.0):
-        # KPipeline yields a Result with .audio (recent) or a (gs, ps, audio) tuple.
-        audio = getattr(result, "audio", None)
-        if audio is None and isinstance(result, (tuple, list)):
-            audio = result[-1]
-        if audio is None:
-            continue
-        if hasattr(audio, "detach"):          # torch.Tensor → numpy
-            audio = audio.detach().cpu().numpy()
-        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-        if audio.size:
-            chunks.append(audio)
+    # Serialize the GPU forward pass across sessions (shared pipeline). Numpy
+    # post-processing below is on local data, so it stays outside the lock.
+    with _tts_lock:
+        for result in pipeline(text, voice=voice_id, speed=1.0):
+            # KPipeline yields a Result with .audio (recent) or a (gs, ps, audio) tuple.
+            audio = getattr(result, "audio", None)
+            if audio is None and isinstance(result, (tuple, list)):
+                audio = result[-1]
+            if audio is None:
+                continue
+            if hasattr(audio, "detach"):          # torch.Tensor → numpy
+                audio = audio.detach().cpu().numpy()
+            audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+            if audio.size:
+                chunks.append(audio)
     if not chunks:
         return TTS_SAMPLE_RATE, np.zeros(0, dtype=np.int16)
     audio = np.concatenate(chunks)
