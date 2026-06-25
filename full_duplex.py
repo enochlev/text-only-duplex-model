@@ -211,9 +211,11 @@ _CPM_BLOCK_RE = re.compile(r"<user>(.*?)<AI>(.*?)(?:</s>|$)", re.DOTALL)
 # applied identically — tuned and non-tuned, train and inference stay in sync.
 _CPM_SYSTEM_PROMPT = (
     "You are a warm, natural voice assistant in a live spoken conversation. "
-    "Lead with the answer — skip greetings, pleasantries, and describing yourself "
-    "unless you're asked. Keep replies to a sentence or two, friendly and "
-    "conversational, and vary your wording so you never sound scripted."
+    "Everything you say is spoken aloud, so reply in one or two short sentences — "
+    "no lists, bullet points, step-by-step breakdowns, or markdown. Lead with the "
+    "answer (don't restate the question), skip greetings and self-description unless "
+    "asked, and don't over-explain — give the direct answer and stop. Vary your "
+    "wording so you never sound scripted."
 )
 # The ack establishes the <用户>/<AI> turn format AND primes the assistant's voice,
 # so keep it a neutral instruction-acknowledgement, NOT a user-facing greeting —
@@ -273,12 +275,12 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
     system_prompt is ignored — MiniCPM uses raw <用户>/<AI> format with no system turn.
     user_message is in the standard block format; reformatted internally to CPM format.
 
-    The model's own turn ends on eos (</s>), which fires reliably. We additionally
-    BAN the <用户> SEQUENCE via vLLM bad_words so the base can't role-flip into a
-    hallucinated user turn when unsure — it must keep generating until eos instead.
-    bad_words bans the sequence (not the pieces): <用户> tokenizes to <,用户,> so it
-    only blocks the closing > when preceded by <用户 — standalone < / > (math
-    operators!) are untouched. stop=["<用户>"] is kept as a harmless fallback.
+    The model's own turn ends on eos (</s>), which fires reliably. stop=["<用户>"]
+    catches the rare case where the base role-flips into a hallucinated user turn
+    WITHOUT first emitting eos — a string match on the decoded output, so it's robust
+    to however <用户> tokenizes. (logit_bias bans on < / > were tried and dropped: a
+    char's token id is context-dependent, so banning the standalone ids did not
+    suppress the in-context symbols. Removing symbols for TTS is a post-processing job.)
 
     This talks to the OpenAI-compatible MiniCPM backend on VLLM_PORT, not to the
     duplex websocket server on SERVER_PORT.
@@ -292,8 +294,7 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
         "prompt": prompt,
         "max_tokens": _SERVE_MAX_TOKENS,
         "temperature": 0.0,
-        "stop": ["<用户>"],          # fallback; bad_words below prevents it being generated
-        "bad_words": ["<用户>"],     # sequence ban → model continues to eos instead of bailing
+        "stop": ["<用户>"],          # robust string-match guard against role-flips
     }
     resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
     resp.raise_for_status()
