@@ -109,10 +109,27 @@ def main() -> None:
         "--embed-device", default="cpu",
         help="Device for the MiniLM embedding pass used to build the data pool index",
     )
+    parser.add_argument(
+        "--asr-noisy-fraction", type=float, default=0.5,
+        help="Share of script/UltraChat data drawn from cached TTS->ASR-noised variants "
+             "(0 disables; requires `python -m scripts.warm_asr_cache`). Default 0.5",
+    )
+    parser.add_argument(
+        "--monologue-weight", type=float, default=0.1,
+        help="Sampling share for the long-monologue (no-interrupt) dataset. 0 disables. Default 0.1",
+    )
+    parser.add_argument(
+        "--ultrachat-asr-cap", type=int, default=2000,
+        help="Warmed-prefix size for ASR-noised UltraChat prompts. Default 2000",
+    )
     args = parser.parse_args()
 
     set_embed_device(args.embed_device)
-    data_pool = make_default_data_pool()
+    data_pool = make_default_data_pool(
+        asr_noisy_fraction=args.asr_noisy_fraction,
+        monologue_weight_frac=args.monologue_weight,
+        ultrachat_asr_cap=args.ultrachat_asr_cap,
+    )
 
     # -----------------------------------------------------------------------
     # Stage 1 — SFT warm-up
