@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -76,6 +77,152 @@ def _estimate_word_timestamps(
         (t_start + i * per_word, t_start + (i + 1) * per_word, w)
         for i, w in enumerate(words)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Shared TTS->ASR augmentation cache
+# ---------------------------------------------------------------------------
+# Real Kokoro TTS + Parakeet ASR is expensive, so each (text, voice) round-trip
+# is computed ONCE and cached as JSON under ~/.cache/full_duplex_trainer/asr_aug/.
+# Training sources read the cached ASR transcript + word timestamps so the
+# training loop never triggers a live TTS/ASR call. Pre-fill with
+# scripts/warm_asr_cache.py. Motivation: training previously fed the model clean
+# ground-truth text (estimated WPM timestamps); this injects the realistic ASR
+# noise (wrong words, timing) the model actually sees at inference.
+
+_ASR_CACHE_VERSION = 1
+_ASR_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v2"
+# Kokoro-82M voices for augmentation diversity. Verify against the installed
+# Kokoro build; an unknown id falls back to Kokoro's default at synthesis time.
+_ASR_AUG_VOICES = ["af_heart", "af_bella", "am_michael", "am_adam", "bf_emma", "bm_george"]
+
+
+def _asr_aug_cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    path = os.path.join(base, "full_duplex_trainer", "asr_aug")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _asr_cache_key(
+    text: str,
+    voice_id: str,
+    asr_model_id: str = _ASR_MODEL_ID,
+    sample_rate: int = ASR_SAMPLE_RATE,
+    version: int = _ASR_CACHE_VERSION,
+) -> str:
+    payload = f"{version}|{asr_model_id}|{sample_rate}|{voice_id}|{text}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def voices_for_text(
+    text: str, n_variants: int = 3, voices: Optional[List[str]] = None
+) -> List[str]:
+    """Deterministic subset of `voices` for a text (hash-seeded shuffle).
+
+    The same text always maps to the same N voices across runs/processes, so the
+    (text, voice) cache entries are stable and never thrash. random.Random(str)
+    seeds from a sha512 of the string (not the per-process builtin hash), so this
+    is reproducible.
+    """
+    pool = list(voices or _ASR_AUG_VOICES)
+    n = max(1, min(n_variants, len(pool)))
+    rng = random.Random(_asr_cache_key(text, "__voicepick__"))
+    rng.shuffle(pool)
+    return pool[:n]
+
+
+def asr_cache_entry(text: str, voice_id: str) -> Optional[dict]:
+    """Cached ASR record for (text, voice_id), or None if not warmed. Read-only."""
+    path = os.path.join(_asr_aug_cache_dir(), _asr_cache_key(text, voice_id) + ".json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def synthesize_and_asr(
+    text: str, voice_id: str, device: Optional[str] = None, store_audio: bool = False
+) -> dict:
+    """text -> Kokoro TTS -> Parakeet ASR, cached as JSON. EXPENSIVE on a miss.
+
+    Returns a record::
+
+        {schema, text, voice_id, asr_model_id, sample_rate, asr_text,
+         duration_s, words}
+
+    where ``words`` are (start_s, end_s, word) absolute within the synthesized
+    clip (re-based onto the episode timeline by the caller). On a cache hit no
+    TTS/ASR runs. ``store_audio=True`` also persists the 16 kHz waveform as
+    ``<key>.npy`` (hook for a future live-ASR mode; the text-only training path
+    needs only ``duration_s`` + ``words``).
+
+    Called only by the warmer (and, defensively, by sources on a miss); the
+    training loop reads via ``asr_cache_entry`` and never calls this.
+    """
+    cached = asr_cache_entry(text, voice_id)
+    if cached is not None:
+        return cached
+
+    import tempfile
+
+    import soundfile as sf  # type: ignore
+
+    from full_duplex import preload_asr_model, _asr_lock  # heavy — import on demand
+
+    voice = preload_kokoro_voice(tts_model=voice_id, device=device)
+    sr, audio_int16 = kokoro_synthesize(voice, text)
+    audio_f32 = audio_int16.astype(np.float32) / 32767.0
+    if sr != ASR_SAMPLE_RATE:
+        audio_f32 = _resample(audio_f32, sr, ASR_SAMPLE_RATE)
+    duration_s = len(audio_f32) / ASR_SAMPLE_RATE
+
+    model = preload_asr_model()
+    tmp_path = None
+    words: List[Tuple[float, float, str]] = []
+    asr_text = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+            sf.write(f.name, audio_f32, ASR_SAMPLE_RATE)
+        with _asr_lock:
+            out = model.transcribe([tmp_path], timestamps=True, verbose=False)
+        if out:
+            asr_text = (out[0].text or "").strip()
+            for seg in out[0].timestamp.get("word", []):
+                w = (seg.get("word") or "").strip()
+                if w:
+                    words.append((float(seg.get("start", 0.0)), float(seg.get("end", 0.0)), w))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    record = {
+        "schema": _ASR_CACHE_VERSION,
+        "text": text,
+        "voice_id": voice_id,
+        "asr_model_id": _ASR_MODEL_ID,
+        "sample_rate": ASR_SAMPLE_RATE,
+        "asr_text": asr_text,
+        "duration_s": duration_s,
+        "words": words,
+    }
+    cache_dir = _asr_aug_cache_dir()
+    key = _asr_cache_key(text, voice_id)
+    json_path = os.path.join(cache_dir, key + ".json")
+    tmp_json = json_path + ".tmp"
+    with open(tmp_json, "w") as f:
+        json.dump(record, f)
+    os.replace(tmp_json, json_path)  # atomic
+    if store_audio:
+        np.save(os.path.join(cache_dir, key + ".npy"), audio_f32)
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +367,78 @@ class ScriptTTSSource:
             block_s=self.block_s,
             wpm=self.wpm,
             source_id=self.source_id or "",
+        )
+
+    def make_simulator(self) -> "PlaybackSimulator":
+        return PlaybackSimulator(self.load())
+
+
+class AsrAugmentedScriptSource:
+    """Like ScriptTTSSource, but each line's transcript + word timestamps come
+    from a cached TTS->ASR round-trip (realistic ASR noise) instead of clean
+    estimated text. Audio is silence of the cached duration — the text-only
+    training path uses only timing + the transcript override (see
+    rl_trainer.sim_seal_mic_block), never the waveform.
+
+    Read-only on the cache: a line/voice that isn't warmed falls back to clean
+    estimated timestamps so training NEVER blocks on a live TTS/ASR call. Warm
+    with scripts/warm_asr_cache.py.
+    """
+
+    def __init__(
+        self,
+        script_lines: List[str],
+        inter_turn_pause_s: float = 12.0,  # kept for signature parity (unused: pause is jittered)
+        silence_after_s: float = 8.0,
+        max_episode_s: float = 72.0,
+        block_s: float = 2.0,
+        wpm: int = 150,
+        source_id: Optional[str] = None,
+        voices: Optional[List[str]] = None,
+        n_variants: int = 3,
+        device: Optional[str] = None,
+    ) -> None:
+        self.script_lines = script_lines
+        self.inter_turn_pause_s = inter_turn_pause_s
+        self.silence_after_s = silence_after_s
+        self.max_episode_s = max_episode_s
+        self.block_s = block_s
+        self.wpm = wpm
+        self.source_id = source_id
+        self.voices = list(voices or _ASR_AUG_VOICES)
+        self.n_variants = n_variants
+        self.device = device
+
+    def load(self) -> EpisodeData:
+        _LEAD_S = 0.5
+        segments: List[np.ndarray] = [np.zeros(int(_LEAD_S * ASR_SAMPLE_RATE), dtype=np.float32)]
+        word_timestamps: List[Tuple[float, float, str]] = []
+        t = _LEAD_S
+        for line in self.script_lines:
+            voice = random.choice(voices_for_text(line, self.n_variants, self.voices))
+            rec = asr_cache_entry(line, voice)
+            if rec is not None and rec.get("words"):
+                dur = float(rec["duration_s"])
+                word_timestamps.extend((t + ws, t + we, w) for ws, we, w in rec["words"])
+            else:
+                # Not warmed → clean fallback (same timing model as ScriptTTSSource).
+                dur = _wpm_duration_s(line, self.wpm)
+                jittered_wpm = max(60, int(self.wpm * random.uniform(0.85, 1.15)))
+                word_timestamps.extend(_estimate_word_timestamps(line, t, t + dur, jittered_wpm))
+            segments.append(np.zeros(int(dur * ASR_SAMPLE_RATE), dtype=np.float32))
+            t += dur
+            pause_s = random.uniform(8.0, 16.0)  # 4–8 block gap between user turns
+            segments.append(np.zeros(int(pause_s * ASR_SAMPLE_RATE), dtype=np.float32))
+            t += pause_s
+        audio = np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
+        return EpisodeData(
+            audio=audio,
+            word_timestamps=word_timestamps,
+            silence_after_s=self.silence_after_s,
+            max_episode_s=self.max_episode_s,
+            block_s=self.block_s,
+            wpm=self.wpm,
+            source_id=self.source_id or "asr_script",
         )
 
     def make_simulator(self) -> "PlaybackSimulator":
@@ -474,6 +693,199 @@ class UltraChatTTSSource:
             tts_model=self.tts_model,
             device=self.device,
         ).load()
+
+    def make_simulator(self) -> "PlaybackSimulator":
+        return PlaybackSimulator(self.load())
+
+
+class AsrAugmentedUltraChatSource:
+    """Single-prompt UltraChat episode with an ASR-noised transcript (cached).
+
+    Draws one conversational prompt from the warmed prefix (first ``prompt_cap``
+    indices, which scripts/warm_asr_cache.py fills) and runs it through
+    AsrAugmentedScriptSource. Read-only on the cache (clean fallback if cold).
+    """
+
+    def __init__(
+        self,
+        silence_after_s: float = 24.0,
+        max_episode_s: float = 72.0,
+        block_s: float = 2.0,
+        wpm: int = 150,
+        source_id: Optional[str] = None,
+        voices: Optional[List[str]] = None,
+        n_variants: int = 3,
+        device: Optional[str] = None,
+        prompt_cap: int = 2000,
+    ) -> None:
+        self.silence_after_s = silence_after_s
+        self.max_episode_s = max_episode_s
+        self.block_s = block_s
+        self.wpm = wpm
+        self.source_id = source_id
+        self.voices = list(voices or _ASR_AUG_VOICES)
+        self.n_variants = n_variants
+        self.device = device
+        self.prompt_cap = prompt_cap
+
+    def load(self) -> EpisodeData:
+        prompts = _load_ultrachat_prompts()
+        conv = _get_conversational_indices()
+        capped = [i for i in conv if i < self.prompt_cap] or conv[: self.prompt_cap]
+        idx = random.choice(capped)
+        return AsrAugmentedScriptSource(
+            script_lines=[prompts[idx]],
+            silence_after_s=self.silence_after_s,
+            max_episode_s=self.max_episode_s,
+            block_s=self.block_s,
+            wpm=self.wpm,
+            source_id=self.source_id or "asr_ultrachat",
+            voices=self.voices,
+            n_variants=self.n_variants,
+            device=self.device,
+        ).load()
+
+    def make_simulator(self) -> "PlaybackSimulator":
+        return PlaybackSimulator(self.load())
+
+
+# ---------------------------------------------------------------------------
+# LongMonologueSource — one long user turn (teach "don't interrupt")
+# ---------------------------------------------------------------------------
+
+_ULTRACHAT_LONG: Optional[List[str]] = None
+
+
+def _load_ultrachat_long_messages(
+    min_words: int = 40, max_words: int = 90, max_msgs: int = 20000
+) -> List[str]:
+    """Long first-user messages from UltraChat 200k, with disk cache.
+
+    Unlike _load_ultrachat_prompts (which keeps <20-word prompts), this keeps
+    messages in [min_words, max_words] — long enough to span ~8–15 blocks when
+    synthesized. Generation tasks ("Write a blog post…") are dropped. Cached to
+    ~/.cache/full_duplex_trainer/ultrachat_long_{min}_{max}_{max_msgs}.json.
+    """
+    global _ULTRACHAT_LONG
+    if _ULTRACHAT_LONG is not None:
+        return _ULTRACHAT_LONG
+    cache_path = os.path.join(
+        _ultrachat_cache_dir(), f"ultrachat_long_{min_words}_{max_words}_{max_msgs}.json"
+    )
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            _ULTRACHAT_LONG = json.load(f)
+        print(f"[LongMonologueSource] loaded {len(_ULTRACHAT_LONG)} long messages from disk cache")
+        return _ULTRACHAT_LONG
+    try:
+        from datasets import load_dataset  # type: ignore
+    except ImportError:
+        raise RuntimeError("LongMonologueSource requires 'datasets'. pip install datasets")
+    print("[LongMonologueSource] streaming ultrachat_200k for long messages (first run only — will cache)…")
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
+    msgs: List[str] = []
+    for example in ds:
+        messages = example.get("messages") or []
+        if not messages:
+            continue
+        first = messages[0]
+        if first.get("role") != "user":
+            continue
+        text = (first.get("content") or "").strip()
+        n = len(text.split())
+        if min_words <= n <= max_words and not _is_generation_task(text):
+            msgs.append(text)
+            if len(msgs) >= max_msgs:
+                break
+    _ULTRACHAT_LONG = msgs
+    with open(cache_path, "w") as f:
+        json.dump(msgs, f)
+    print(f"[LongMonologueSource] cached {len(msgs)} long messages → {cache_path}")
+    return _ULTRACHAT_LONG
+
+
+class LongMonologueSource:
+    """One continuous long user turn (no multi-turn, no similarity) to teach the
+    model NOT to interrupt while the user keeps talking.
+
+    Picks a long UltraChat message, uses its cached TTS->ASR transcript +
+    timestamps (realistic ASR noise), and keeps it only if the synthesized
+    duration lands in the target block span (8–15 blocks by default). The
+    message is one unbroken turn; PlaybackSimulator's trailing ``silence_after_s``
+    is the window where the bot should finally respond (kept >= a few blocks so
+    the episode has a post-monologue speech step to carry the RM3 idle-reward
+    gradient back — see CLAUDE.md §10).
+
+    Read-only on the cache: only messages in the warmed prefix
+    (first ``warm_cap``) are considered; if none are cached/in-range after
+    ``max_tries`` it falls back to clean estimated timestamps so training never
+    blocks on live TTS/ASR. Warm with scripts/warm_asr_cache.py.
+    """
+
+    def __init__(
+        self,
+        min_words: int = 40,
+        max_words: int = 90,
+        target_blocks: Tuple[int, int] = (8, 15),
+        silence_after_s: float = 12.0,
+        block_s: float = 2.0,
+        wpm: int = 150,
+        source_id: str = "long_monologue",
+        voices: Optional[List[str]] = None,
+        n_variants: int = 3,
+        device: Optional[str] = None,
+        warm_cap: int = 500,
+        max_tries: int = 16,
+    ) -> None:
+        self.min_words = min_words
+        self.max_words = max_words
+        self.target_blocks = target_blocks
+        self.silence_after_s = silence_after_s
+        self.block_s = block_s
+        self.wpm = wpm
+        self.source_id = source_id
+        self.voices = list(voices or _ASR_AUG_VOICES)
+        self.n_variants = n_variants
+        self.device = device
+        self.warm_cap = warm_cap
+        self.max_tries = max_tries
+
+    def _episode(self, words_rebased, dur: float) -> EpisodeData:
+        _LEAD_S = 0.5
+        audio = np.zeros(int((_LEAD_S + dur) * ASR_SAMPLE_RATE), dtype=np.float32)
+        # +block_s margin so the last word's block fully closes before silence.
+        max_episode_s = _LEAD_S + dur + self.silence_after_s + self.block_s + 5.0
+        return EpisodeData(
+            audio=audio,
+            word_timestamps=words_rebased,
+            silence_after_s=self.silence_after_s,
+            max_episode_s=max_episode_s,
+            block_s=self.block_s,
+            wpm=self.wpm,
+            source_id=self.source_id,
+        )
+
+    def load(self) -> EpisodeData:
+        _LEAD_S = 0.5
+        msgs = _load_ultrachat_long_messages(self.min_words, self.max_words)
+        candidates = msgs[: self.warm_cap] if self.warm_cap else msgs
+        lo = self.target_blocks[0] * self.block_s
+        hi = self.target_blocks[1] * self.block_s
+        for _ in range(self.max_tries):
+            msg = random.choice(candidates)
+            voice = random.choice(voices_for_text(msg, self.n_variants, self.voices))
+            rec = asr_cache_entry(msg, voice)
+            if rec is not None and rec.get("words") and lo <= float(rec["duration_s"]) <= hi:
+                dur = float(rec["duration_s"])
+                words = [(_LEAD_S + ws, _LEAD_S + we, w) for ws, we, w in rec["words"]]
+                return self._episode(words, dur)
+        # Cold/out-of-range fallback: clean estimated timestamps for one message.
+        msg = random.choice(candidates)
+        dur = _wpm_duration_s(msg, self.wpm)
+        words = _estimate_word_timestamps(msg, _LEAD_S, _LEAD_S + dur, self.wpm)
+        print("[LongMonologueSource] WARNING: no warmed in-range message found; "
+              "using clean fallback. Run scripts/warm_asr_cache.py to enable ASR noise.")
+        return self._episode(words, dur)
 
     def make_simulator(self) -> "PlaybackSimulator":
         return PlaybackSimulator(self.load())
@@ -937,57 +1349,103 @@ def make_default_data_pool(
     wpm: int = 150,
     tts_model: str = "",
     device: Optional[str] = None,
+    *,
+    asr_noisy_fraction: float = 0.5,
+    asr_voices: Optional[List[str]] = None,
+    asr_n_variants: int = 3,
+    ultrachat_asr_cap: int = 2000,
+    monologue_weight_frac: float = 0.1,
+    long_word_range: Tuple[int, int] = (40, 90),
 ) -> DataPool:
-    """Build a DataPool from the built-in TRAINING_SCRIPTS and BOOSTED_TRAINING_SCRIPTS.
+    """Build a DataPool from the built-in scripts + UltraChat, with optional
+    TTS->ASR noise augmentation and a long-monologue dataset.
 
     BOOSTED_TRAINING_SCRIPTS (training_scripts_boosted.json) are sampled at 2x
-    the weight of standard scripts — they are pure conversational Q&A that produce
-    richer epsilon/RM3 gradient signal than UltraChat (which suffers from
-    vad_blocked killing epsilon due to grammatically-complete sub-clauses).
-    """
-    sources = []
-    weights = []
+    the weight of standard scripts — pure conversational Q&A that produce richer
+    epsilon/RM3 gradient signal.
 
-    for i, lines in enumerate(TRAINING_SCRIPTS):
+    ASR noise (asr_noisy_fraction in (0,1)): for each script, AND for UltraChat,
+    a clean source and a cache-backed ASR-noised source are registered so the
+    noisy share ≈ asr_noisy_fraction. Noisy script variants are only added if the
+    script is ASR-cache-warmed (else skipped with a warning) so training never
+    blocks on a live TTS/ASR call — warm with `python -m scripts.warm_asr_cache`.
+
+    monologue_weight_frac: minority share given to LongMonologueSource (one long
+    user turn, to teach "don't interrupt"). 0 disables it.
+    """
+    sources: List[Any] = []
+    weights: List[float] = []
+    f = asr_noisy_fraction
+    noisy_mult = (f / (1.0 - f)) if 0.0 < f < 1.0 else 0.0
+    skipped_cold = [0]
+
+    def _warmed(lines: List[str]) -> bool:
+        return all(
+            any(asr_cache_entry(line, v) is not None
+                for v in voices_for_text(line, asr_n_variants, asr_voices))
+            for line in lines
+        )
+
+    def _add_script(lines: List[str], sid_prefix: str, i: int, clean_w: float) -> None:
         sources.append(ScriptTTSSource(
-            script_lines=lines,
-            inter_turn_pause_s=inter_turn_pause_s,
-            silence_after_s=silence_after_s,
-            max_episode_s=max_episode_s,
-            block_s=block_s,
-            wpm=wpm,
-            source_id=f"script_{i:02d}",
-            tts_model=tts_model,
-            device=device,
+            script_lines=lines, inter_turn_pause_s=inter_turn_pause_s,
+            silence_after_s=silence_after_s, max_episode_s=max_episode_s,
+            block_s=block_s, wpm=wpm, source_id=f"{sid_prefix}_{i:02d}",
+            tts_model=tts_model, device=device,
         ))
-        is_backchannel = max(len(l.split()) for l in lines) <= 3
-        weights.append(0.2 if is_backchannel else 1.0)
+        weights.append(clean_w)
+        if noisy_mult > 0:
+            if _warmed(lines):
+                sources.append(AsrAugmentedScriptSource(
+                    script_lines=lines, inter_turn_pause_s=inter_turn_pause_s,
+                    silence_after_s=silence_after_s, max_episode_s=max_episode_s,
+                    block_s=block_s, wpm=wpm, source_id=f"asr_{sid_prefix}_{i:02d}",
+                    voices=asr_voices, n_variants=asr_n_variants, device=device,
+                ))
+                weights.append(clean_w * noisy_mult)
+            else:
+                skipped_cold[0] += 1
+
+    clean_weight_sum = 0.0
+    for i, lines in enumerate(TRAINING_SCRIPTS):
+        w = 0.2 if max(len(l.split()) for l in lines) <= 3 else 1.0
+        clean_weight_sum += w
+        _add_script(lines, "script", i, w)
 
     for i, lines in enumerate(BOOSTED_TRAINING_SCRIPTS):
-        sources.append(ScriptTTSSource(
-            script_lines=lines,
-            inter_turn_pause_s=inter_turn_pause_s,
-            silence_after_s=silence_after_s,
-            max_episode_s=max_episode_s,
-            block_s=block_s,
-            wpm=wpm,
-            source_id=f"boosted_{i:02d}",
-            tts_model=tts_model,
-            device=device,
-        ))
-        weights.append(2.0)
+        clean_weight_sum += 2.0
+        _add_script(lines, "boosted", i, 2.0)
 
-    # Give UltraChat the same total weight as all scripts combined → ~50% sampling.
+    if skipped_cold[0]:
+        print(f"[make_default_data_pool] {skipped_cold[0]} script(s) not ASR-warmed → "
+              f"noisy variant skipped. Run: python -m scripts.warm_asr_cache")
+
+    # UltraChat: total weight ≈ all clean scripts combined × 1.5 (~50% sampling),
+    # split clean/noisy by asr_noisy_fraction.
+    uc_total = clean_weight_sum * 1.5
     sources.append(UltraChatTTSSource(
-        silence_after_s=silence_after_s,
-        inter_turn_pause_s=inter_turn_pause_s,
-        max_episode_s=max_episode_s,
-        block_s=block_s,
-        wpm=wpm,
-        source_id="ultrachat",
-        tts_model=tts_model,
-        device=device,
+        silence_after_s=silence_after_s, inter_turn_pause_s=inter_turn_pause_s,
+        max_episode_s=max_episode_s, block_s=block_s, wpm=wpm,
+        source_id="ultrachat", tts_model=tts_model, device=device,
     ))
-    weights.append(sum(weights) * 1.5)
+    weights.append(uc_total * (1.0 - f) if noisy_mult > 0 else uc_total)
+    if noisy_mult > 0:
+        sources.append(AsrAugmentedUltraChatSource(
+            silence_after_s=silence_after_s, max_episode_s=max_episode_s,
+            block_s=block_s, wpm=wpm, source_id="asr_ultrachat",
+            voices=asr_voices, n_variants=asr_n_variants, device=device,
+            prompt_cap=ultrachat_asr_cap,
+        ))
+        weights.append(uc_total * f)
+
+    # Long-monologue dataset (minority weight) — teach no-interrupt on long turns.
+    if monologue_weight_frac and monologue_weight_frac > 0:
+        sources.append(LongMonologueSource(
+            min_words=long_word_range[0], max_words=long_word_range[1],
+            block_s=block_s, wpm=wpm, source_id="long_monologue",
+            voices=asr_voices, n_variants=asr_n_variants, device=device,
+        ))
+        denom = max(1e-9, 1.0 - monologue_weight_frac)
+        weights.append(sum(weights) * monologue_weight_frac / denom)
 
     return DataPool(sources, weights=weights)
