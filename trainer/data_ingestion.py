@@ -84,11 +84,12 @@ def _estimate_word_timestamps(
 # ---------------------------------------------------------------------------
 # Real Kokoro TTS + Parakeet ASR is expensive, so each (text, voice) round-trip
 # is computed ONCE and cached as JSON under ~/.cache/full_duplex_trainer/asr_aug/.
-# Training sources read the cached ASR transcript + word timestamps so the
-# training loop never triggers a live TTS/ASR call. Pre-fill with
-# scripts/warm_asr_cache.py. Motivation: training previously fed the model clean
-# ground-truth text (estimated WPM timestamps); this injects the realistic ASR
-# noise (wrong words, timing) the model actually sees at inference.
+# Sources synthesize lazily on first use (cache miss → synthesize_and_asr, which
+# caches the result) — no separate warm step. The first epoch pays the synthesis
+# cost (~0.15s per text on GPU); afterwards every draw is an instant cache read.
+# Motivation: training previously fed the model clean ground-truth text (estimated
+# WPM timestamps); this injects the realistic ASR noise (wrong words, timing) the
+# model actually sees at inference.
 
 _ASR_CACHE_VERSION = 1
 _ASR_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v2"
@@ -160,8 +161,10 @@ def synthesize_and_asr(
     ``<key>.npy`` (hook for a future live-ASR mode; the text-only training path
     needs only ``duration_s`` + ``words``).
 
-    Called only by the warmer (and, defensively, by sources on a miss); the
-    training loop reads via ``asr_cache_entry`` and never calls this.
+    The ASR-augmented sources call this lazily during data loading: a cache hit
+    is an instant JSON read; a miss synthesizes once (first epoch) and caches it,
+    keyed by a hash of (version, model, sample_rate, voice, text), so changing any
+    of those recomputes and anything unchanged is reused across runs.
     """
     cached = asr_cache_entry(text, voice_id)
     if cached is not None:
@@ -380,9 +383,9 @@ class AsrAugmentedScriptSource:
     training path uses only timing + the transcript override (see
     rl_trainer.sim_seal_mic_block), never the waveform.
 
-    Read-only on the cache: a line/voice that isn't warmed falls back to clean
-    estimated timestamps so training NEVER blocks on a live TTS/ASR call. Warm
-    with scripts/warm_asr_cache.py.
+    Each line is synthesized + transcribed on first use and cached
+    (synthesize_and_asr); subsequent draws are instant cache reads. If ASR
+    returns nothing, falls back to clean estimated timestamps.
     """
 
     def __init__(
@@ -416,12 +419,12 @@ class AsrAugmentedScriptSource:
         t = _LEAD_S
         for line in self.script_lines:
             voice = random.choice(voices_for_text(line, self.n_variants, self.voices))
-            rec = asr_cache_entry(line, voice)
-            if rec is not None and rec.get("words"):
+            rec = synthesize_and_asr(line, voice, device=self.device)  # cached after first call
+            if rec.get("words"):
                 dur = float(rec["duration_s"])
                 word_timestamps.extend((t + ws, t + we, w) for ws, we, w in rec["words"])
             else:
-                # Not warmed → clean fallback (same timing model as ScriptTTSSource).
+                # ASR produced nothing → clean fallback (ScriptTTSSource timing model).
                 dur = _wpm_duration_s(line, self.wpm)
                 jittered_wpm = max(60, int(self.wpm * random.uniform(0.85, 1.15)))
                 word_timestamps.extend(_estimate_word_timestamps(line, t, t + dur, jittered_wpm))
@@ -701,9 +704,9 @@ class UltraChatTTSSource:
 class AsrAugmentedUltraChatSource:
     """Single-prompt UltraChat episode with an ASR-noised transcript (cached).
 
-    Draws one conversational prompt from the warmed prefix (first ``prompt_cap``
-    indices, which scripts/warm_asr_cache.py fills) and runs it through
-    AsrAugmentedScriptSource. Read-only on the cache (clean fallback if cold).
+    Draws one conversational prompt from the first ``prompt_cap`` indices (a cap
+    that bounds how many distinct prompts get synthesized/cached) and runs it
+    through AsrAugmentedScriptSource, which synthesizes + transcribes on first use.
     """
 
     def __init__(
@@ -816,10 +819,11 @@ class LongMonologueSource:
     the episode has a post-monologue speech step to carry the RM3 idle-reward
     gradient back — see CLAUDE.md §10).
 
-    Read-only on the cache: only messages in the warmed prefix
-    (first ``warm_cap``) are considered; if none are cached/in-range after
-    ``max_tries`` it falls back to clean estimated timestamps so training never
-    blocks on live TTS/ASR. Warm with scripts/warm_asr_cache.py.
+    Draws from the first ``warm_cap`` long messages. Each candidate is
+    synthesized + transcribed on first use and cached (synthesize_and_asr);
+    after that, the duration filter is an instant cache read. If no in-range
+    message is found within ``max_tries``, falls back to clean estimated
+    timestamps for one message.
     """
 
     def __init__(
@@ -835,7 +839,7 @@ class LongMonologueSource:
         n_variants: int = 3,
         device: Optional[str] = None,
         warm_cap: int = 500,
-        max_tries: int = 16,
+        max_tries: int = 6,
     ) -> None:
         self.min_words = min_words
         self.max_words = max_words
@@ -874,17 +878,15 @@ class LongMonologueSource:
         for _ in range(self.max_tries):
             msg = random.choice(candidates)
             voice = random.choice(voices_for_text(msg, self.n_variants, self.voices))
-            rec = asr_cache_entry(msg, voice)
-            if rec is not None and rec.get("words") and lo <= float(rec["duration_s"]) <= hi:
+            rec = synthesize_and_asr(msg, voice, device=self.device)  # cached after first call
+            if rec.get("words") and lo <= float(rec["duration_s"]) <= hi:
                 dur = float(rec["duration_s"])
                 words = [(_LEAD_S + ws, _LEAD_S + we, w) for ws, we, w in rec["words"]]
                 return self._episode(words, dur)
-        # Cold/out-of-range fallback: clean estimated timestamps for one message.
+        # No in-range message within max_tries → clean fallback for one message.
         msg = random.choice(candidates)
         dur = _wpm_duration_s(msg, self.wpm)
         words = _estimate_word_timestamps(msg, _LEAD_S, _LEAD_S + dur, self.wpm)
-        print("[LongMonologueSource] WARNING: no warmed in-range message found; "
-              "using clean fallback. Run scripts/warm_asr_cache.py to enable ASR noise.")
         return self._episode(words, dur)
 
     def make_simulator(self) -> "PlaybackSimulator":
@@ -1364,11 +1366,11 @@ def make_default_data_pool(
     the weight of standard scripts — pure conversational Q&A that produce richer
     epsilon/RM3 gradient signal.
 
-    ASR noise (asr_noisy_fraction in (0,1)): for each script, AND for UltraChat,
-    a clean source and a cache-backed ASR-noised source are registered so the
-    noisy share ≈ asr_noisy_fraction. Noisy script variants are only added if the
-    script is ASR-cache-warmed (else skipped with a warning) so training never
-    blocks on a live TTS/ASR call — warm with `python -m scripts.warm_asr_cache`.
+    ASR noise (asr_noisy_fraction in (0,1)): for each script AND for UltraChat, a
+    clean source and an ASR-noised source are registered so the noisy share ≈
+    asr_noisy_fraction. The noised sources synthesize + transcribe each text on
+    first use and cache it (keyed by a param hash), so the first epoch is a bit
+    slower and every run afterward reuses the cache. 0 disables noise.
 
     monologue_weight_frac: minority share given to LongMonologueSource (one long
     user turn, to teach "don't interrupt"). 0 disables it.
@@ -1377,14 +1379,6 @@ def make_default_data_pool(
     weights: List[float] = []
     f = asr_noisy_fraction
     noisy_mult = (f / (1.0 - f)) if 0.0 < f < 1.0 else 0.0
-    skipped_cold = [0]
-
-    def _warmed(lines: List[str]) -> bool:
-        return all(
-            any(asr_cache_entry(line, v) is not None
-                for v in voices_for_text(line, asr_n_variants, asr_voices))
-            for line in lines
-        )
 
     def _add_script(lines: List[str], sid_prefix: str, i: int, clean_w: float) -> None:
         sources.append(ScriptTTSSource(
@@ -1395,16 +1389,13 @@ def make_default_data_pool(
         ))
         weights.append(clean_w)
         if noisy_mult > 0:
-            if _warmed(lines):
-                sources.append(AsrAugmentedScriptSource(
-                    script_lines=lines, inter_turn_pause_s=inter_turn_pause_s,
-                    silence_after_s=silence_after_s, max_episode_s=max_episode_s,
-                    block_s=block_s, wpm=wpm, source_id=f"asr_{sid_prefix}_{i:02d}",
-                    voices=asr_voices, n_variants=asr_n_variants, device=device,
-                ))
-                weights.append(clean_w * noisy_mult)
-            else:
-                skipped_cold[0] += 1
+            sources.append(AsrAugmentedScriptSource(
+                script_lines=lines, inter_turn_pause_s=inter_turn_pause_s,
+                silence_after_s=silence_after_s, max_episode_s=max_episode_s,
+                block_s=block_s, wpm=wpm, source_id=f"asr_{sid_prefix}_{i:02d}",
+                voices=asr_voices, n_variants=asr_n_variants, device=device,
+            ))
+            weights.append(clean_w * noisy_mult)
 
     clean_weight_sum = 0.0
     for i, lines in enumerate(TRAINING_SCRIPTS):
@@ -1415,10 +1406,6 @@ def make_default_data_pool(
     for i, lines in enumerate(BOOSTED_TRAINING_SCRIPTS):
         clean_weight_sum += 2.0
         _add_script(lines, "boosted", i, 2.0)
-
-    if skipped_cold[0]:
-        print(f"[make_default_data_pool] {skipped_cold[0]} script(s) not ASR-warmed → "
-              f"noisy variant skipped. Run: python -m scripts.warm_asr_cache")
 
     # UltraChat: total weight ≈ all clean scripts combined × 1.5 (~50% sampling),
     # split clean/noisy by asr_noisy_fraction.
