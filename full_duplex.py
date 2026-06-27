@@ -82,39 +82,25 @@ _last_used_model: str = ""
 
 # Serving generation cap (single-shot). Raised 80→200 on 2026-06-23: with a large
 # enough window the model emits its ENTIRE turn (ending in eos </s>) in one call,
-# so there is no truncation seam and the chunked-continuation workaround is moot.
+# so there is no truncation seam.
 # At ~300 tok/s a 200-token cap is ~0.7s of gen — masked by block quantization.
 # This is a CEILING, not a target: short answers should still end early on eos.
 # If you see "[llm] WARNING: hit max_tokens" a lot, eos isn't firing (the model is
 # rambling to the cap) — dial this back and investigate the eos/turn-end behavior.
 _SERVE_MAX_TOKENS = 200
-# Chunked self-continuation (re-fire when cut off by the token cap). DISABLED:
-# empirically the MiniCPM base cannot continue its own partial answer — at each
-# chunk seam it restarts the topic or flips into the user's role (logs2.txt, the
-# Pythagorean monologue). Approach A's prompt shape is in-distribution but the
-# *task* of continuing is OOD for this base. Re-enable only after retraining with
-# self-continuation examples (TODO(training-mismatch)); when off, max_tokens must
-# stay high enough (≈60–80) for EOS to terminate answers naturally.
-_ENABLE_CONTINUATION = False
-# Max chunks chained within one turn before a forced stop (only relevant when
-# _ENABLE_CONTINUATION is True) so a non-EOS model can't monologue forever.
-_MAX_CONTINUATION_CHUNKS = 5
-# finish_reason of the most recent generation ("length" | "stop" | None). Mirrors
-# the _last_used_model global pattern; read by _maybe_run_llm to arm continuation.
-_last_finish_reason: Optional[str] = None
 
 # --- ADHOC LATENCY HACK (2026-06-22) — early-emit / pull-tick-forward ---------
 # Normally a response that finishes mid-block isn't committed/played until the
 # next fixed block tick, so first-audio latency is up to ~2 blocks (≤3.4s @1.7s).
 # When enabled, poll() fires the tick the instant a fresh response is fully
 # buffered (during a silence/user gap, never mid-response), cutting ~1 block of
-# latency. NOTE: this is the "speak sooner" lever previously removed (P2-A) — with
-# an untrained base it can amplify false-starts (the base re-answers on every
-# partial ASR revision). Flip to False to restore strict tick-paced emission.
-# DISABLED 2026-06-22: re-trial showed it wedges the bot's reply block into the
-# middle of a still-settling utterance (ASR re-timestamps trailing words across
-# block boundaries), splitting the user's sentence. Same class of issue as the
-# original P2-A removal. Emission stays strictly tick-paced.
+# latency. NOTE: this is the "speak sooner" lever (P2-A). Known trade-off: with an
+# untrained base it can amplify false-starts (the base re-answers on every partial
+# ASR revision), and it can wedge the reply block into a still-settling utterance
+# (ASR re-timestamps trailing words across blocks), occasionally splitting the user's
+# sentence in the transcript.
+# ENABLED 2026-06-24: user prefers the ~1-block-lower first-audio latency and accepts
+# that occasional block-wedge artifact. Flip to False for strict tick-paced emission.
 _ENABLE_EARLY_EMIT = True
 
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
@@ -140,8 +126,7 @@ def llm_generate_groq(system_prompt: str, user_message: str) -> str:
 
 def llm_stream_groq(system_prompt: str, user_message: str) -> Generator[str, None, None]:
     """Streaming Groq call — yields token strings one at a time."""
-    global _next_model_index, _last_used_model, _last_finish_reason
-    _last_finish_reason = None  # non-CPM path: never arm chunked continuation
+    global _next_model_index, _last_used_model
     client = _get_groq_client()
     config = GROQ_MODEL_CONFIGS[_next_model_index]
     model = config["model"]
@@ -176,8 +161,6 @@ def local_generate(system_prompt: str, user_message: str) -> str:
     This talks to the OpenAI-compatible model backend on VLLM_PORT, not to the
     duplex websocket server on SERVER_PORT.
     """
-    global _last_finish_reason
-    _last_finish_reason = None  # chunked continuation is wired only for cpm_generate
     import requests
     url = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
     payload = {
@@ -285,7 +268,6 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
     This talks to the OpenAI-compatible MiniCPM backend on VLLM_PORT, not to the
     duplex websocket server on SERVER_PORT.
     """
-    global _last_finish_reason
     import requests
     prompt = _build_cpm_prompt(user_message)
     url = f"http://localhost:{VLLM_PORT}/v1/completions"
@@ -299,16 +281,20 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
     resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
     resp.raise_for_status()
     choice = resp.json()["choices"][0]
-    # finish_reason drives chunked continuation: "length" → cut off, re-fire next
-    # chunk; "stop" (EOS / <用户>) → turn complete, wait for the user.
-    _last_finish_reason = choice.get("finish_reason")
+    # finish_reason: "length" → cut off by the token cap; "stop" → turn complete.
+    finish_reason = choice.get("finish_reason")
+    # stop_reason disambiguates a "stop": None → eos (</s>, model's turn-complete
+    # signal); a value → it hit the "<用户>" stop string (role-flip caught).
+    stop_reason = choice.get("stop_reason")
     text = choice["text"].strip()
-    if _last_finish_reason == "length":
-        # eos did not fire within the (now large) window — the model rambled to the
-        # cap instead of ending its turn. With <用户> banned this is the signal to
-        # watch: it means turn-end relies on eos and eos isn't being produced.
+    if finish_reason == "stop":
+        ended_on = "eos" if stop_reason is None else f"stop:{stop_reason!r}"
+    elif finish_reason == "length":
+        ended_on = "length(hit max_tokens, no eos)"
         print(f"[llm] WARNING: hit max_tokens={_SERVE_MAX_TOKENS} without eos — turn not self-terminating")
-    print(f"[llm] finish_reason={_last_finish_reason} words={len(text.split())}")
+    else:
+        ended_on = str(finish_reason)
+    print(f"[llm] ended_on={ended_on} words={len(text.split())}")
     return text
 
 
@@ -703,13 +689,6 @@ class DuplexAudioAgent:
         # Prevents duplicate LLM calls within the same block period when the model
         # chose silence but _last_accepted_response_context_version is not set.
         self._last_idle_call_n_blocks: int = -1
-        # Chunked continuation: armed when the last generation was cut off by the
-        # token cap (finish_reason == "length"). While armed, the bot re-fires for
-        # the next chunk when pending drains and bypasses the generation window;
-        # an EOS ("stop") response disarms it so the bot waits for the user.
-        # _continuation_count caps a single turn's chunks to avoid a runaway monologue.
-        self._continue_pending: bool = False
-        self._continuation_count: int = 0
         self._last_ctx_flush_user_fingerprint: str = ""
         self.last_llm_error: Optional[str] = None
         self.last_llm_error_seq: int = 0
@@ -800,9 +779,6 @@ class DuplexAudioAgent:
     def _invalidate_future_assistant_continuation(self) -> None:
         self._pending_words = []
         self._committed_words = []
-        # New/changed user input supersedes any in-flight chunked answer — abandon it.
-        self._continue_pending = False
-        self._continuation_count = 0
         self._clear_pending_response_timing()
         # Flushed words → flushed audio: drop the whole-response synthesis and any
         # already-queued bot audio so a barge-in stops playback immediately instead
@@ -1386,14 +1362,6 @@ class DuplexAudioAgent:
             self._clear_pending_response_timing()
             pending_preview = " ".join(self._pending_words[:6]) + ("…" if len(self._pending_words) > 6 else "")
             self._vlog(f"[commit ✓] {text!r}  pending={len(self._pending_words)} words  [{pending_preview}]")
-            # Chunk fully spoken — re-fire for the next chunk ONLY if the last
-            # generation was cut off by the token cap (continuation armed). An EOS
-            # ("stop") response leaves the version guard set, so the bot stays silent
-            # until the user speaks again. Resetting to None bypasses the version
-            # guard in _maybe_run_llm; the next adaptive tick's audio masks the
-            # ~0.5s gen+TTS so the next chunk begins seamlessly.
-            if not self._pending_words and self._continue_pending:
-                self._last_accepted_response_context_version = None
 
     def _update_pending_queue(self, proposal_words: List[str]) -> None:
         committed = self._committed_words
@@ -1680,13 +1648,12 @@ class DuplexAudioAgent:
             self._current_block is None or not self._current_block.user_text
         ):
             return
-        # Also bypass the window guard when there's unanswered user speech OR a
-        # chunked continuation is armed. The window check prevents chatty bot
-        # behavior after long silence, but (a) when the user asked something the bot
-        # never answered (words assigned to a block >3 deep by ASR churn) and (b)
-        # when the bot was mid-answer and cut off by the token cap, a long answer
-        # spans past the 3-block window — in both cases we must still generate.
-        if not unanswered and not self._continue_pending and not self._within_generation_window():
+        # Also bypass the window guard when there's unanswered user speech. The
+        # window check prevents chatty bot behavior after long silence, but when the
+        # user asked something the bot never answered (words assigned to a block >3
+        # deep by ASR churn) the answer spans past the 3-block window — we must still
+        # generate.
+        if not unanswered and not self._within_generation_window():
             return
 
         generation_context_version = self.context_version
@@ -1737,7 +1704,6 @@ class DuplexAudioAgent:
             if not proposal_words:
                 self._clear_pending_response_timing()
                 self._pending_words = []
-                self._continue_pending = False  # nothing more to say — disarm continuation
                 # Do NOT set _last_accepted_response_context_version here.
                 # For idle (empty) responses the model chose silence; subsequent
                 # blocks within _within_generation_window() should still be
@@ -1756,17 +1722,6 @@ class DuplexAudioAgent:
             )
             self._update_pending_queue(proposal_words)
             self._last_accepted_response_context_version = generation_context_version
-            # Arm chunked continuation only when enabled AND the model was cut off by
-            # the token cap (finish_reason == "length") AND under the per-turn chunk
-            # cap. DISABLED by default (_ENABLE_CONTINUATION) — the base model restarts
-            # / role-flips at chunk seams (see logs2.txt). When off this stays False,
-            # so an EOS or length response alike ends the turn (bot waits for the user).
-            self._continuation_count += 1
-            self._continue_pending = (
-                _ENABLE_CONTINUATION
-                and _last_finish_reason == "length"
-                and self._continuation_count < _MAX_CONTINUATION_CHUNKS
-            )
         except Exception as exc:
             self.last_llm_error = f"{type(exc).__name__}: {exc}"
             self.last_llm_error_seq += 1
