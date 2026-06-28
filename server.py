@@ -25,6 +25,7 @@ import full_duplex
 from full_duplex import (
     DuplexAudioAgent,
     SERVER_PORT,
+    TTS_MODEL,
     VLLM_PORT,
     cpm_generate,
     preload_duplex_models,
@@ -355,15 +356,23 @@ def main() -> None:
         default=False,
         help="Expose the server publicly via a Gradio FRP tunnel (*.gradio.live, expires ~1 week).",
     )
+    parser.add_argument(
+        "--voice",
+        default=TTS_MODEL,
+        help=(
+            f"Kokoro TTS voice id for the bot (default {TTS_MODEL!r}). Any Kokoro-82M "
+            "voice works, e.g. af_heart, af_bella, am_michael, am_adam, bf_emma, bm_george."
+        ),
+    )
     args = parser.parse_args()
 
     # Point the generate functions at the chosen model backend.
     full_duplex.VLLM_PORT = args.vllm_port
 
-    print("[boot] preloading Kokoro TTS and Parakeet ASR...")
-    preload_duplex_models()
+    print(f"[boot] preloading Kokoro TTS (voice={args.voice!r}) and Parakeet ASR...")
+    preload_duplex_models(tts_model=args.voice)
     print("[boot] warming up TTS + ASR kernels...")
-    warmup_duplex_models()
+    warmup_duplex_models(tts_model=args.voice)
     print(f"[boot] models ready, starting websocket server on ws://{args.host}:{args.port}/ws")
 
     public_url = None
@@ -395,11 +404,13 @@ def main() -> None:
         # SERVING block size only (training keeps DEFAULT_BLOCK_S=2.0). 1.7s matches
         # Kokoro's real ~175 WPM rate, so _n = ceil(150*1.7/60) = 5 words/slice maps
         # cleanly to ~1.7s of audio per block. Revert by removing default_block_s.
-        agent_factory = lambda: DuplexAudioAgent(llm_generate_fn=cpm_generate, default_block_s=1.7)
-        app = create_app(agent_factory=agent_factory, public_url=public_url)
+        agent_factory = lambda: DuplexAudioAgent(
+            llm_generate_fn=cpm_generate, default_block_s=1.7, tts_model=args.voice,
+        )
     else:
         print(f"[boot] local mode: using trained model backend on port {args.vllm_port}")
-        app = create_app(public_url=public_url)
+        agent_factory = lambda: DuplexAudioAgent(tts_model=args.voice)
+    app = create_app(agent_factory=agent_factory, public_url=public_url)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

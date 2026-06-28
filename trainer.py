@@ -111,8 +111,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--asr-noisy-fraction", type=float, default=0.5,
-        help="Share of script/UltraChat data drawn from cached TTS->ASR-noised variants "
-             "(0 disables; requires `python -m scripts.warm_asr_cache`). Default 0.5",
+        help="Share of script/UltraChat data drawn from TTS->ASR-noised variants. Each text is "
+             "synthesized + transcribed on first use and cached (reused every later run). "
+             "0 disables. Default 0.5",
     )
     parser.add_argument(
         "--monologue-weight", type=float, default=0.1,
@@ -120,7 +121,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--ultrachat-asr-cap", type=int, default=2000,
-        help="Warmed-prefix size for ASR-noised UltraChat prompts. Default 2000",
+        help="Max distinct UltraChat prompts to ASR-noise (cached on first use). Default 2000",
     )
     args = parser.parse_args()
 
