@@ -101,7 +101,7 @@ _SERVE_MAX_TOKENS = 200
 # sentence in the transcript.
 # ENABLED 2026-06-24: user prefers the ~1-block-lower first-audio latency and accepts
 # that occasional block-wedge artifact. Flip to False for strict tick-paced emission.
-_ENABLE_EARLY_EMIT = True
+_ENABLE_EARLY_EMIT = False
 
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
     global _next_model_index, _last_used_model
