@@ -411,7 +411,7 @@ def main() -> None:
         print(f"[boot] local mode: using trained model backend on port {args.vllm_port}")
         agent_factory = lambda: DuplexAudioAgent(tts_model=args.voice)
     app = create_app(agent_factory=agent_factory, public_url=public_url)
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host="0.0.0.0", port=8998)
 
 
 if __name__ == "__main__":
