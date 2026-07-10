@@ -20,8 +20,10 @@ checkpoints/*
 wandb/*
 logs/*
 sft_checkpoints/*
-*/_*
+*/_[!_]*
 *._*
 survey_*
 *.log
 *.pem
+# Hush repo clone (shared lib + ONNX bundle for the retico client filter)
+Hush/

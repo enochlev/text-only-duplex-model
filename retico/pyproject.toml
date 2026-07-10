@@ -1,0 +1,27 @@
+[project]
+name = "retico-duplex-client"
+version = "0.1.0"
+description = "Retico client pipeline: mic -> (hush) -> remote full-duplex server -> Misty robot"
+requires-python = ">=3.10"
+dependencies = [
+    "retico-core>=0.2.10",
+    "numpy",
+    "pyaudio>=0.2.13",
+    "requests",
+    "soundfile",
+    "websockets>=12",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+# Hush runs via the prebuilt libweya_nc shared library (ONNX Runtime inside,
+# ctypes from Python) — no torch needed. The lib comes from the Hush repo
+# clone next to the training repo; the ONNX model bundle can be fetched from
+# the HF hub (HUSH_CHECKPOINT=weya-ai/hush) which needs huggingface-hub.
+hush = [
+    "huggingface-hub",
+]
+
+[tool.uv]
+# This is a runnable environment, not an installable package.
+package = false
