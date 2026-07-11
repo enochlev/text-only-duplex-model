@@ -103,6 +103,42 @@ _SERVE_MAX_TOKENS = 200
 # that occasional block-wedge artifact. Flip to False for strict tick-paced emission.
 _ENABLE_EARLY_EMIT = False
 
+# --- EXPERIMENT (2026-07-11) — strip punctuation from user turns in the prompt ---
+# Hypothesis: the model overfits to punctuation as an end-of-turn signal — ASR only
+# emits terminal punctuation ("."/"?"/"!") once it has decided the user finished
+# speaking, so "punctuation present → safe to talk" is an easy shortcut that does NOT
+# transfer (real ASR punctuation is late/unreliable). We want the model to infer
+# turn completion from the WORDS/context, not from a punctuation token.
+#
+# We strip punctuation from the user text ONLY at prompt-render time (_format_timeblocks),
+# not from the stored block.user_text. This means:
+#   • the model never sees punctuation in user turns — in BOTH training and prod, since
+#     both build the prompt through _format_timeblocks (symmetric by construction);
+#   • the training harness keeps its punctuated ground truth intact, so _user_finished_in
+#     (epsilon-greedy gate) and _classify_text_change ("punctuation"-only churn suppression)
+#     still work — those are legitimate harness supervision, not model-visible leakage.
+# Apostrophes inside contractions (don't, it's) are kept — they are part of the word,
+# not a turn/clause boundary. Flip to False to restore punctuated prompts.
+_STRIP_USER_PUNCTUATION = True
+
+# Drops every punctuation mark (. , ? ! ; : " ( ) - — … etc.) but preserves apostrophes
+# that sit between word characters so contractions survive (don't → don't, not do nt).
+_USER_PUNCT_RE = re.compile(r"[^\w\s']")
+_EDGE_APOSTROPHE_RE = re.compile(r"(?<!\w)'|'(?!\w)")
+
+
+def strip_user_punctuation(text: str) -> str:
+    """Remove punctuation from a user-turn string for prompt rendering.
+
+    Keeps letters/digits/whitespace and word-internal apostrophes; collapses the
+    whitespace left behind. Returns text unchanged when the experiment toggle is off.
+    """
+    if not _STRIP_USER_PUNCTUATION or not text:
+        return text
+    text = _USER_PUNCT_RE.sub(" ", text)
+    text = _EDGE_APOSTROPHE_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 def llm_generate_groq(system_prompt: str, user_message: str) -> str:
     global _next_model_index, _last_used_model
     client = _get_groq_client()
@@ -1392,11 +1428,11 @@ class DuplexAudioAgent:
     def _format_timeblocks(self) -> str:
         parts = []
         for block in self.blocks[-self._max_prompt_blocks:]:
-            user_seg = block.user_text if block.user_text else "<idle>"
+            user_seg = strip_user_punctuation(block.user_text) or "<idle>"
             ai_seg = self._assistant_text_for_prompt(block)
             parts.append(f"<user>{user_seg}<AI>{ai_seg}</s>")
         current_user = self._current_block.user_text if self._current_block else ""
-        user_seg = current_user if current_user else "<idle>"
+        user_seg = strip_user_punctuation(current_user) or "<idle>"
         parts.append(f"<user>{user_seg}<AI>")
         return "".join(parts)
 
