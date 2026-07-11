@@ -116,7 +116,7 @@ def main() -> None:
              "0 disables. Default 0.5",
     )
     parser.add_argument(
-        "--monologue-weight", type=float, default=0.1,
+        "--monologue-weight", type=float, default=0.2,
         help="Sampling share for the long-monologue (no-interrupt) dataset. 0 disables. Default 0.1",
     )
     parser.add_argument(
