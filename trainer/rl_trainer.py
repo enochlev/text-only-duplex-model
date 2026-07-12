@@ -85,7 +85,12 @@ _EPS_FORCE_IDLE_OVERLAP = 0.15  # user mid-sentence, bot also speaking (clearer 
 # Added 2026-07-11. Caveat: _user_finished_in() can also fire on a sentence boundary WITHIN a
 # long monologue; a forced response there is an interruption and RM2 will (correctly) penalise
 # it, so the signal self-corrects rather than teaching a bad habit.
-_EPS_FORCE_SPEAK = 0.20
+# 2026-07-12 (overnight Run 3): 0.20 → 0.10. Runs 1+2 (rebalanced weights) showed the
+# over-silence collapse is solved (non_idle held ~45% through 150 steps), so forced-speech
+# may now be over-injecting mid-monologue interruptions that inflate RM2. Halving it tests
+# whether the natural policy has internalised responsiveness (→ simplify) or forced-speech is
+# still load-bearing (→ non_idle drifts down, revert). Run 2 archived as the floor.
+_EPS_FORCE_SPEAK = 0.10
 _EPS_FORCE_SPEAK_MIN_TOKENS = 5  # floor so a forced response is a real utterance, not one filler token
 
 
