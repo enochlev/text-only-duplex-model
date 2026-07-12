@@ -123,16 +123,16 @@ Idle steps produce no tokens, so REINFORCE can't compute a gradient directly. Th
 
 ## 8. Reward Function Reference
 
-Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 2.0, 2.25, 0.75, 2.0]`:
+Active reward functions (`trainer.py`) in order, with weights `[2.5, 3.5, 1.5, 2.75, 0.75, 2.5]` (conservative rebalance 2026-07-11; was `[2.0, 4.0, 2.0, 2.25, 0.75, 2.0]` — see §11):
 
 | # | Function | Weight | Step type | Fires when | Raw values | Weighted values |
 |---|---|---|---|---|---|---|
-| RM1 | `block_silence_penalty` | 2.0 | **Idle** | Bot stays silent after user finishes speaking (capped at 2 blocks; model is force-idled beyond that) | lag=0: −1.0 / lag=1: −2.0 / lag≥2: 0.0 | −2.0 / −4.0 / 0.0 |
-| RM2 | `block_interruption_penalty` | 4.0 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | committed(run=1,silent src): 0.0 / true-interrupt(run=1): −0.75 / run=2: −1.0 / run=3: −1.5 / run≥4: −2.0 | 0.0 / −3.0 / −4.0 / −6.0 / −8.0 |
-| RM3 | `block_idle_reward` | 2.0 | **Idle** | Bot stays silent while user is mid-sentence AND user continues in the next block (post-episode lookahead) | +0.5 | +1.0 |
-| RM4 | `timely_response_reward` | 2.25 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn. **No bonus if the source block already had bot speech** (that's an interruption, not a polite wait — RM2 handles it). | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +2.25 / +1.69 / +1.125 |
+| RM1 | `block_silence_penalty` | 2.5 | **Idle** | Bot stays silent after user finishes speaking (capped at 2 blocks; model is force-idled beyond that) | lag=0: −1.0 / lag=1: −2.0 / lag≥2: 0.0 | −2.5 / −5.0 / 0.0 |
+| RM2 | `block_interruption_penalty` | 3.5 | **Speech** | Bot speaks while user is also speaking. First overlap free only if source block T had no user speech. | committed(run=1,silent src): 0.0 / true-interrupt(run=1): −0.75 / run=2: −1.0 / run=3: −1.5 / run≥4: −2.0 | 0.0 / −2.625 / −3.5 / −5.25 / −7.0 |
+| RM3 | `block_idle_reward` | 1.5 | **Idle** | Bot stays silent while user is mid-sentence AND user continues in the next block (post-episode lookahead) | +0.5 | +0.75 |
+| RM4 | `timely_response_reward` | 2.75 | **Speech** | Bot speaks (non-overlap) promptly after user finishes their turn. **No bonus if the source block already had bot speech** (that's an interruption, not a polite wait — RM2 handles it). | lag=0: +1.0 / lag=1: +0.75 / lag=2: +0.5 | +2.75 / +2.06 / +1.375 |
 | RM5 | `backchannel_loop_penalty` | 0.75 | **Speech** | Bot outputs a backchannel-only response. Single backchannel during user's mid-sentence is free. | mid-sentence run=1: 0.0 / post-turn run=1: −0.5 / run N: −0.5N | 0.0 / −0.375 / −0.375N |
-| RM6 | `missed_turn_penalty` | 2.0 | **Speech** | Bot speech step follows N unanswered prior user turns. Each skipped turn costs −1.0. Current turn being answered does not count. Uses base history. | N skipped: −N | −2.0 per skipped turn |
+| RM6 | `missed_turn_penalty` | 2.5 | **Speech** | Bot speech step follows N unanswered prior user turns. Each skipped turn costs −1.0. Current turn being answered does not count. Uses base history. | N skipped: −N | −2.5 per skipped turn |
 
 `vad_overlap_penalty` (audio overlap via pyannote OSD) is defined but commented out — no-op in text-only simulation; re-enable for real audio.
 
@@ -150,7 +150,9 @@ Active reward functions (`trainer.py`) in order, with weights `[2.0, 4.0, 2.0, 2
 
 ## 9. Epsilon-Greedy Exploration (`rl_trainer.py:390`)
 
-When the user is mid-sentence, the bot is sometimes **forced silent** even if it would normally generate. This lets REINFORCE observe RM3's +0.5 reward and learn that silence during user speech is correct. The rate is **20%** for clean new-question starts (user has text, source block had no prior bot overlap) and **30%** for overlap moments (source block already had both user and bot text), where staying silent is more clearly correct. (Clean-start rate was raised 10%→20% on 2026-06-06: the verbose MiniCPM base jumps in after the first fragment of a multi-block question, so more forced-idle samples are needed to teach it to wait for the full question.)
+**Forced-idle** (`_EPS_FORCE_IDLE_CLEAN` / `_EPS_FORCE_IDLE_OVERLAP`, `rl_trainer.py`): when the user is mid-sentence, the bot is sometimes **forced silent** even if it would normally generate. This lets REINFORCE observe RM3's reward and learn that silence during user speech is correct. The rate is **10%** for clean new-question starts (user has text, source block had no prior bot overlap) and **15%** for overlap moments (source block already had both user and bot text). (These were **20%/30%** until 2026-07-11; lowered after the punctuation-strip run showed the policy now over-idles ~80% naturally, so heavy forced-idle just deepens the over-silence corner. Earlier history: clean-start was 10%→20% on 2026-06-06 for the verbose un-trained base.)
+
+**Forced-speech** (`_EPS_FORCE_SPEAK`, added 2026-07-11): the complement — when the user just **completed** a turn (`_user_finished_in` True on the last block), the bot is forced to emit a real response **20%** of the time (via `min_tokens=_EPS_FORCE_SPEAK_MIN_TOKENS`, so it can't idle). This gives RM1/RM4/RM6 a direct gradient on "you should have spoken here" even in idle-dominated episodes — the §10 fully-idle gradient hole. Caveat: `_user_finished_in` can fire on a sentence boundary *within* a long monologue; a forced response there is an interruption and RM2 penalises it, so the signal self-corrects.
 
 **Why `max_tokens=1` for forced-idle steps:** REINFORCE requires a log probability to compute a gradient. Even when the text output is discarded, vLLM generates one token so its log-prob is captured. Without this, `log_probs=[]` and the gradient is zero.
 
@@ -158,7 +160,7 @@ When the user is mid-sentence, the bot is sometimes **forced silent** even if it
 
 ## 10. Known Issue — Fully-Idle Episodes
 
-Idle-step rewards (RM1/RM3) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. Epsilon-greedy exploration and the current RM weights (`[2.0, 4.0, 2.0, 2.25, 0.75, 2.0]`) mitigate this, but if silent episodes dominate, consider forcing at least one speech step per episode (analogous to forced-idle epsilon).
+Idle-step rewards (RM1/RM3) propagate via `_compute_returns` onto adjacent speech steps' advantages. If an episode has **zero speech steps**, no gradient is computed at all — the RM1 penalty never reaches the optimizer. This was not hypothetical: the 150-step punctuation-strip run (2026-07-11) collapsed toward silence (non_idle 66%→~15%, near-fully-idle episodes appearing) precisely because RM2 (immediate, on speech steps) dominated while RM1 (indirect, via idle-step returns) couldn't push back. **Mitigations now in place:** (1) the forced-speech epsilon (§9) injects a real speech step after completed user turns, giving RM1/RM4/RM6 a direct gradient; (2) the 2026-07-11 weight rebalance eased RM2/RM3 and raised RM1/RM4/RM6. Watch `speak_fired` and `non_idle` in the step summary to confirm the corner stays closed.
 
 ---
 
@@ -168,6 +170,10 @@ Entries are newest-first. Format: `date | param | old → new | why (5–15 word
 
 | Date | Parameter / File | Old | New | Why |
 |---|---|---|---|---|
+| 2026-07-11 | User-turn punctuation in prompt (`full_duplex.py` `_format_timeblocks`) | shown | stripped via `strip_punctuation` | Model was using ASR punctuation as an EOS "safe-to-talk" tell rather than learning turn-completion from content. Strip only the model-visible prompt; stored `user_text` keeps punctuation so `_user_finished_in` / ASR logic still work |
+| 2026-07-11 | RM weights (`trainer.py`) | `[2.0, 4.0, 2.0, 2.25, 0.75, 2.0]` | `[2.5, 3.5, 1.5, 2.75, 0.75, 2.5]` | 150-step post-strip run overshot into over-silence (RM2 −1.7→−0.15 solved interruptions but non_idle 66%→~15%, RM1 5×'d, near-fully-idle episodes). Conservative rebalance: ease RM2/RM3, raise RM1/RM4/RM6 |
+| 2026-07-11 | Forced-idle epsilon (`rl_trainer.py`) | 0.20 / 0.30 | 0.10 / 0.15 | Policy now over-idles ~80% naturally; heavy forced-idle just deepens the over-silence corner |
+| 2026-07-11 | Forced-speech epsilon (`rl_trainer.py`) | — | `_EPS_FORCE_SPEAK=0.20`, `min_tokens=5` | §10 fix: force a real response after completed user turns so RM1/RM4/RM6 get a direct gradient in idle-dominated episodes. Added `min_tokens` to `llm_generate_train`; new `speak_fired` metric |
 | 2026-06-20 | `learning_rate` (`--lr`) | 2e-6 | 5e-6 | After gamma+batch cleaned the advantage signal, policy still wouldn't move (KL≈0, flat reward) → step size too small. 5e-6 broke the plateau: reward trend Δ=+0.53 over 30 steps, RM2 interruptions roughly halved, content-KL stayed ~0 |
 | 2026-06-20 | `gamma` (`trainer.py`) | 1.0 | 0.90 | Sum-to-go returns smeared a late interruption across every prior correct decision → flat-plateau/no-learning (avg_KL≈0); 0.90 localizes credit to adjacent steps (§7/§10 intent), cuts advantage variance |
 | 2026-06-20 | `episodes_per_step` default (`trainer.py`) | 8 (run used 14) | 24 | Per-batch z-scored advantage over ~14 noisy episodes gave inconsistent gradient; larger batch stabilizes the update |

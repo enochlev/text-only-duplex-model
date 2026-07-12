@@ -72,6 +72,22 @@ _GPT_SAMPLE_RATE = 24_000
 
 _SENT_END_RE = re.compile(r'[.!?]')
 
+# --- Epsilon-greedy exploration rates (see CLAUDE.md §9 / §10) --------------------
+# Forced-IDLE: when the user is mid-sentence, occasionally force silence so REINFORCE
+# gets a gradient on "wait" (RM3). Lowered 2026-07-11 (0.20/0.30 → 0.10/0.15): after the
+# punctuation-strip run the policy over-idles (~80% natural), so heavy forced-idle just
+# deepens the over-silence corner.
+_EPS_FORCE_IDLE_CLEAN = 0.10    # user mid-sentence, bot NOT already speaking
+_EPS_FORCE_IDLE_OVERLAP = 0.15  # user mid-sentence, bot also speaking (clearer "stop & listen")
+# Forced-SPEECH: when the user just COMPLETED a turn, occasionally force a real response so
+# the "should have spoken" gradient (RM1/RM4/RM6) reaches the optimizer even in idle-dominated
+# episodes — the §10 fully-idle gradient hole that let the 150-step run collapse to silence.
+# Added 2026-07-11. Caveat: _user_finished_in() can also fire on a sentence boundary WITHIN a
+# long monologue; a forced response there is an interruption and RM2 will (correctly) penalise
+# it, so the signal self-corrects rather than teaching a bad habit.
+_EPS_FORCE_SPEAK = 0.20
+_EPS_FORCE_SPEAK_MIN_TOKENS = 5  # floor so a forced response is a real utterance, not one filler token
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -135,6 +151,8 @@ class Episode:
     """Eligible calls where VAD said user finished → epsilon suppressed."""
     eps_greedy_fired: int = 0
     """Calls where epsilon-greedy actually forced idle."""
+    eps_greedy_speak_fired: int = 0
+    """Calls where epsilon-greedy forced a response after the user completed a turn (§10 fix)."""
     eps_natural_fired: int = 0
     """Calls where model chose idle on its own (no epsilon forcing)."""
 
@@ -239,6 +257,7 @@ def llm_generate_train(
     max_tokens: int = 16,
     temperature: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    min_tokens: int = 0,
     is_minicpm: bool = False,
 ) -> Tuple[str, List[int], List[int], List[float]]:
     """
@@ -282,6 +301,11 @@ def llm_generate_train(
     )
     if logit_bias:
         sp_kwargs["logit_bias"] = logit_bias
+    if min_tokens:
+        # Force at least this many real tokens before EOS/stop is allowed. Used by the
+        # forced-SPEECH epsilon path to make the model emit a genuine response instead of
+        # idling; max_tokens still caps length, so there is no runaway.
+        sp_kwargs["min_tokens"] = min_tokens
     if is_minicpm:
         sp_kwargs["stop"] = ["<用户>"]
     sampling_params = VLLMSamplingParams(**sp_kwargs)
@@ -394,6 +418,7 @@ class VirtualSimulationConnection:
         eps_eligible = [0]
         eps_vad_suppressed = [0]
         eps_fired = [0]
+        eps_speak_fired = [0]
         eps_natural_fired = [0]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
@@ -455,14 +480,21 @@ class VirtualSimulationConnection:
             # so the positive RM5 reward can propagate correctly via backprop.
             _last_blk = agent.blocks[-1] if agent.blocks else None
             _force_idle = False
+            _force_speak = False
             if _last_blk is not None and _last_blk.user_text:
                 eps_eligible[0] += 1
                 if _user_finished_in(_last_blk):
                     eps_vad_suppressed[0] += 1
+                    # Forced-SPEECH (§10): the user completed a turn → occasionally force a
+                    # real response so the "should have spoken" gradient (RM1/RM4/RM6) reaches
+                    # the optimizer even when the policy has drifted toward over-silence.
+                    if np.random.random() < _EPS_FORCE_SPEAK:
+                        eps_speak_fired[0] += 1
+                        _force_speak = True
                 else:
                     # Crossover: bot was also speaking → model should stop and listen.
                     # Higher epsilon at overlap moments; lower at clean new-question starts.
-                    _eps_rate = 0.30 if _last_blk.assistant_text else 0.20
+                    _eps_rate = _EPS_FORCE_IDLE_OVERLAP if _last_blk.assistant_text else _EPS_FORCE_IDLE_CLEAN
                     if np.random.random() < _eps_rate:
                         eps_fired[0] += 1
                         _force_idle = True
@@ -491,10 +523,13 @@ class VirtualSimulationConnection:
                     self.vllm_engine,
                     self.tokenizer,
                     max_tokens=self.vllm_max_tokens,
+                    min_tokens=(_EPS_FORCE_SPEAK_MIN_TOKENS if _force_speak else 0),
                     temperature=self.vllm_temperature,
                     is_minicpm=self.is_minicpm,
                 )
-                if not text:
+                if _force_speak:
+                    print(f"[eps-speak] forced response ({len(rtok)} tok): {text[:48]!r}")
+                elif not text:
                     eps_natural_fired[0] += 1
 
             # Trim at first .?! after the 40th token; fall back to full text if none.
@@ -597,6 +632,7 @@ class VirtualSimulationConnection:
             eps_greedy_eligible=eps_eligible[0],
             eps_greedy_vad_suppressed=eps_vad_suppressed[0],
             eps_greedy_fired=eps_fired[0],
+            eps_greedy_speak_fired=eps_speak_fired[0],
             eps_natural_fired=eps_natural_fired[0],
         )
 
@@ -650,6 +686,7 @@ class RealTimeGPTEpisodeRunner:
         eps_eligible = [0]
         eps_vad_suppressed = [0]
         eps_fired = [0]
+        eps_speak_fired = [0]
         eps_natural_fired = [0]
 
         def intercepted_llm_fn(system_prompt: str, user_message: str) -> str:
@@ -705,14 +742,21 @@ class RealTimeGPTEpisodeRunner:
             # so the positive RM5 reward can propagate correctly via backprop.
             _last_blk = agent.blocks[-1] if agent.blocks else None
             _force_idle = False
+            _force_speak = False
             if _last_blk is not None and _last_blk.user_text:
                 eps_eligible[0] += 1
                 if _user_finished_in(_last_blk):
                     eps_vad_suppressed[0] += 1
+                    # Forced-SPEECH (§10): the user completed a turn → occasionally force a
+                    # real response so the "should have spoken" gradient (RM1/RM4/RM6) reaches
+                    # the optimizer even when the policy has drifted toward over-silence.
+                    if np.random.random() < _EPS_FORCE_SPEAK:
+                        eps_speak_fired[0] += 1
+                        _force_speak = True
                 else:
                     # Crossover: bot was also speaking → model should stop and listen.
                     # Higher epsilon at overlap moments; lower at clean new-question starts.
-                    _eps_rate = 0.30 if _last_blk.assistant_text else 0.20
+                    _eps_rate = _EPS_FORCE_IDLE_OVERLAP if _last_blk.assistant_text else _EPS_FORCE_IDLE_CLEAN
                     if np.random.random() < _eps_rate:
                         eps_fired[0] += 1
                         _force_idle = True
@@ -741,10 +785,13 @@ class RealTimeGPTEpisodeRunner:
                     self.vllm_engine,
                     self.tokenizer,
                     max_tokens=self.vllm_max_tokens,
+                    min_tokens=(_EPS_FORCE_SPEAK_MIN_TOKENS if _force_speak else 0),
                     temperature=self.vllm_temperature,
                     is_minicpm=self.is_minicpm,
                 )
-                if not text:
+                if _force_speak:
+                    print(f"[eps-speak] forced response ({len(rtok)} tok): {text[:48]!r}")
+                elif not text:
                     eps_natural_fired[0] += 1
 
             # Trim at first .?! after the 40th token; fall back to full text if none.
@@ -849,6 +896,7 @@ class RealTimeGPTEpisodeRunner:
             eps_greedy_eligible=eps_eligible[0],
             eps_greedy_vad_suppressed=eps_vad_suppressed[0],
             eps_greedy_fired=eps_fired[0],
+            eps_greedy_speak_fired=eps_speak_fired[0],
             eps_natural_fired=eps_natural_fired[0],
         )
 
@@ -1348,6 +1396,7 @@ class FullDuplexRLTrainer:
               f"vad_blocked={episode.eps_greedy_vad_suppressed}  "
               f"natural_fired={episode.eps_natural_fired}  "
               f"fired={episode.eps_greedy_fired}  "
+              f"speak_fired={episode.eps_greedy_speak_fired}  "
               f"effective_rate={episode.eps_greedy_fired / _eps_denom:.0%}"
               )
         print(f"\n  {'#':>3}  {'user':<{UW}}  {'bot':<{BW}}")
@@ -1815,6 +1864,7 @@ class FullDuplexRLTrainer:
                 sum(sum(1 for s in e.steps if not s.is_idle) for e in episodes)
             ),
             "eps_fired_total": float(sum(e.eps_greedy_fired for e in episodes)),
+            "eps_speak_fired_total": float(sum(e.eps_greedy_speak_fired for e in episodes)),
             "eps_natural_fired_total": float(sum(e.eps_natural_fired for e in episodes)),
             "eps_eligible_total": float(sum(e.eps_greedy_eligible for e in episodes)),
         }
@@ -1832,6 +1882,7 @@ class FullDuplexRLTrainer:
         )
         print(
             f"  eps: fired={int(metrics['eps_fired_total'])}  "
+            f"speak_fired={int(metrics.get('eps_speak_fired_total', 0))}  "
             f"natural_fired={int(metrics['eps_natural_fired_total'])}  "
             f"natural_rate={natural_rate:.1%}"
         )
@@ -2013,6 +2064,7 @@ class FullDuplexRLTrainer:
         step_n = int(metrics["step"])
         _nat = int(metrics.get("eps_natural_fired_total", 0))
         _fired = int(metrics.get("eps_fired_total", 0))
+        _speak = int(metrics.get("eps_speak_fired_total", 0))
         _elig = max(metrics.get("eps_eligible_total", 1), 1)
         _nat_rate = _nat / _elig
         lines = [
@@ -2022,7 +2074,7 @@ class FullDuplexRLTrainer:
             f"avg_reward={metrics['avg_reward']:+.4f}  "
             f"baseline={metrics['baseline']:.3f}  "
             f"non_idle={int(metrics['n_non_idle'])}/{int(metrics['n_steps_total'])}  "
-            f"eps_fired={_fired}  natural_fired={_nat}({_nat_rate:.1%})",
+            f"eps_fired={_fired}  speak_fired={_speak}  natural_fired={_nat}({_nat_rate:.1%})",
         ]
 
         # Per-RM averages on one line

@@ -218,13 +218,13 @@ def main() -> None:
         # junk_output_penalty,  # disabled — MiniCPM base is clean; RM6 fought its natural markdown/list formatting
         missed_turn_penalty,
     ]
-    # RM1=block_silence_penalty       weight=2.0  lag=0→-2.0  lag=1→-4.0  lag≥2→0.0
-    # RM2=block_interruption_penalty  weight=4.0  run=1(true)→-3.0  run=2→-4.0  run=3→-6.0  run≥4→-8.0
-    # RM3=block_idle_reward           weight=2.0  mid-sentence silence → +1.0
-    # RM4=timely_response_reward      weight=2.25 lag=0→+2.25 lag=1→+1.69  lag=2→+1.125
+    # RM1=block_silence_penalty       weight=2.5  lag=0→-2.5  lag=1→-5.0  lag≥2→0.0
+    # RM2=block_interruption_penalty  weight=3.5  run=1(true)→-2.625  run=2→-3.5  run=3→-5.25  run≥4→-7.0
+    # RM3=block_idle_reward           weight=1.5  mid-sentence silence → +0.75
+    # RM4=timely_response_reward      weight=2.75 lag=0→+2.75 lag=1→+2.06  lag=2→+1.375
     #                                 (no bonus when source block already had bot speech → interruption)
     # RM5=backchannel_loop_penalty    weight=0.75 post-turn run=1→-0.375; run=N→-0.375N
-    # RM6=missed_turn_penalty         weight=2.0  1 skipped turn→-2.0  2→-4.0  N→-2.0N
+    # RM6=missed_turn_penalty         weight=2.5  1 skipped turn→-2.5  2→-5.0  N→-2.5N
     # (junk_output_penalty removed — MiniCPM base no longer emits HTML/junk; was penalising natural formatting)
     # Note: RM4 does NOT fire for backchannel or junk blocks (guards in timely_response_reward).
     # RM6(missed_turn) uses base history (like RM2) so prior covered blocks don't break the turn count.
@@ -232,7 +232,13 @@ def main() -> None:
     #             outweighs the fear of RM2 interrupt risk (+2.5 vs -2.0), breaking the equilibrium.
     # 2026-06-06: RM3 1.5→2.0, RM4 2.5→2.25 — RM4≈-RM2 had cancelled to a flat plateau over 50
     #             steps; tilt nets a small gradient favouring "wait" to break the equilibrium.
-    rl_cfg.reward_fn_weights = [2.0, 4.0, 2.0, 2.25, 0.75, 2.0]
+    # 2026-07-11: conservative rebalance after the punctuation-strip 150-step run OVERSHOT into
+    #             over-silence (RM2 −1.7→−0.15 solved interruptions, but non_idle 66%→15%, RM1
+    #             5×'d to −0.5, near-fully-idle episodes appeared). Ease the pressure toward
+    #             silence, boost responding — small moves so we don't swing back to interrupting:
+    #             RM1 2.0→2.5, RM2 4.0→3.5, RM3 2.0→1.5, RM4 2.25→2.75, RM6 2.0→2.5.
+    #             Paired with epsilon changes (rl_trainer.py): forced-idle ↓, forced-speech added.
+    rl_cfg.reward_fn_weights = [2.5, 3.5, 1.5, 2.75, 0.75, 2.5]
 
     print("\n" + "="*70)
     print(f"STAGE 2 — RL fine-tuning  (model={rl_model_path})")
