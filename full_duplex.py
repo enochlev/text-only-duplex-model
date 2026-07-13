@@ -130,6 +130,22 @@ _STRIP_USER_PUNCTUATION = False
 _USER_PUNCT_RE = re.compile(r"[^\w\s']")
 _EDGE_APOSTROPHE_RE = re.compile(r"(?<!\w)'|'(?!\w)")
 
+# --- ASR commit strategy -------------------------------------------------------
+# 2026-07-12: the legacy _run_parakeet re-transcribes the whole rolling mic window
+# every block tick, so word timestamps drift and already-emitted words get rewritten
+# as more right-context arrives. Offline measurement on real recordings: ~28 retroactive
+# word rewrites per 10s (asr_compare.py). Those retro-edits are what the Fix A/B/C/D
+# heuristics fight, and the ones they miss trip a context flush that cuts the bot off
+# mid-response. _run_parakeet_monotonic replaces the block-granular mutable-window with a
+# single TIME cursor: any block whose audio ends before (window_end - _ASR_RIGHT_CONTEXT_S)
+# is FROZEN and never rewritten (structural, not heuristic), so re-segmentation of settled
+# audio can no longer flush. Words within the right-context tail stay provisional (live).
+# Word timestamps are unchanged — we still use model.transcribe(timestamps=True) — so block
+# assignment and the source→covered reward attribution are untouched. Override at launch with
+# ASR_MONOTONIC_COMMIT=1 (and optionally ASR_RIGHT_CONTEXT_S=<sec>) to A/B live vs the legacy path.
+_ASR_MONOTONIC_COMMIT = os.environ.get("ASR_MONOTONIC_COMMIT", "0") == "1"
+_ASR_RIGHT_CONTEXT_S = float(os.environ.get("ASR_RIGHT_CONTEXT_S", "2.0"))  # revisable tail (s) before freeze
+
 
 def strip_user_punctuation(text: str) -> str:
     """Remove punctuation from a user-turn string for prompt rendering.
@@ -771,6 +787,9 @@ class DuplexAudioAgent:
         self.asr_windows: List[AsrTimestampWindow] = []
         self.max_asr_windows: int = 20
         self.mutable_asr_windows: int = 2
+        # Monotonic-commit cursor (used only when _ASR_MONOTONIC_COMMIT): absolute audio
+        # time up to which user words are frozen. Advances forward only; never rewinds.
+        self._asr_commit_cursor_ts: float = 0.0
 
         # Block timestamp tracking — carries previous block's end_ts as next start_ts
         self._block_start_ts: float = 0.0
@@ -1096,6 +1115,8 @@ class DuplexAudioAgent:
         rolling_copy = list(self._mic_rolling)
         if self._asr_fn is not None:
             self._executor.submit(self._asr_fn, rolling_copy, self)
+        elif _ASR_MONOTONIC_COMMIT:
+            self._executor.submit(self._run_parakeet_monotonic, rolling_copy)
         else:
             self._executor.submit(self._run_parakeet, rolling_copy)
 
@@ -1367,6 +1388,154 @@ class DuplexAudioAgent:
                 self._mark_assistant_history_stale_from(earliest_changed_index)
             print(
                 "[asr→ctx] action=flush_future_continuation+mark_stale_history "
+                f"earliest_block_index={earliest_changed_index} "
+                f"latest_source_block_id={self._latest_user_source_block_id}"
+            )
+            self._last_accepted_response_context_version = None
+            self.context_version += 1
+
+    def _run_parakeet_monotonic(self, rolling: List[tuple]) -> None:
+        """Monotonic-commit ASR (see _ASR_MONOTONIC_COMMIT). Re-transcribes the rolling mic
+        window each tick to obtain word timestamps (so block assignment / reward attribution
+        are unchanged), but FREEZES any block whose audio ends at/before the commit cursor
+        (= window_end - _ASR_RIGHT_CONTEXT_S). Frozen blocks are never rewritten or cleared,
+        so drift / re-segmentation of settled audio can no longer trip a context flush — the
+        structural replacement for the legacy Fix A/B/C/D churn heuristics. Only genuinely
+        new trailing words (Fix-B fingerprint gate) flush an in-flight response."""
+        import tempfile
+        import soundfile as sf
+
+        if not rolling:
+            return
+        full_audio = np.concatenate([audio for _, _, audio in rolling])
+        if len(full_audio) == 0:
+            return
+
+        buf_start_ts = rolling[0][0]
+        window_end_ts = rolling[-1][1]
+        model = self._get_asr_model()
+        asr_started_perf = time.perf_counter()
+
+        tmp_path = None
+        asr_t0 = time.perf_counter()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp_path = f.name
+                sf.write(f.name, full_audio, ASR_SAMPLE_RATE)
+            with _asr_lock:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    output = model.transcribe([tmp_path], timestamps=True, verbose=False)
+        except Exception as exc:
+            print(f"[asr] transcribe error: {exc!r}")
+            import traceback; traceback.print_exc()
+            return
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        asr_latency = time.perf_counter() - asr_t0
+
+        text = repr(output[0].text) if output else "(empty)"
+        print(f"[asr•mono] transcribed {len(full_audio)/ASR_SAMPLE_RATE:.1f}s -> {text}  ({asr_latency:.3f}s)")
+        word_segments = output[0].timestamp.get("word", []) if output else []
+
+        # Group words by rolling-block index via absolute end timestamp (same as _run_parakeet).
+        windows: dict = {}
+        for seg in word_segments:
+            word = seg.get("word", "").strip()
+            if not word:
+                continue
+            abs_end = buf_start_ts + seg["end"]
+            for idx, (start, end, _) in enumerate(rolling):
+                if start <= abs_end < end:
+                    windows.setdefault(idx, []).append((word, abs_end))
+                    break
+
+        # The commit cursor trails the window end by _ASR_RIGHT_CONTEXT_S. A block whose audio
+        # ends at/before the cursor is frozen; the fresher tail stays provisional (revisable).
+        cursor = self._asr_commit_cursor_ts
+        settle_boundary = window_end_ts - _ASR_RIGHT_CONTEXT_S
+
+        # Clear PROVISIONAL blocks that lost all their words this pass (a word drifted to a
+        # neighbouring block). Frozen blocks are never cleared. Mirrors the legacy Fix A but
+        # scoped to the revisable tail, so it cannot churn settled history.
+        for idx, (b_start, b_end, _) in enumerate(rolling):
+            if b_end <= cursor or idx in windows:
+                continue
+            for _blk in self.blocks:
+                if abs(_blk.start_ts - b_start) < 0.5:
+                    if _blk.user_text:
+                        print(f"[asr•mono→block] block@{b_start:.1f} provisional-clear old={_blk.user_text!r}")
+                        _blk.user_text = ""
+                    break
+
+        any_changed = False
+        earliest_changed_index = None
+        latest_changed_target = None
+        for idx in sorted(windows):
+            block_start_ts, block_end_ts, _ = rolling[idx]
+            if block_end_ts <= cursor:
+                continue  # fully frozen — never rewrite settled audio (this kills the churn)
+            word_text = " ".join(w for w, _ in windows[idx])
+
+            target = None
+            target_index = None
+            for block_index in range(len(self.blocks) - 1, -1, -1):
+                block = self.blocks[block_index]
+                if abs(block.start_ts - block_start_ts) < 0.5:
+                    target = block
+                    target_index = block_index
+                    break
+            if target is None:
+                print(f"[asr•mono] no matching block for start_ts={block_start_ts:.1f}")
+                continue
+
+            target.asr_latency_s = asr_latency
+            target.asr_started_perf_s = asr_started_perf
+            old = target.user_text
+            if old != word_text:
+                target.user_text = word_text
+                change_kind = self._classify_text_change(old, word_text)
+                print(
+                    f"[asr•mono→block] block@{block_start_ts:.1f} {change_kind} "
+                    f"old={old!r} new={word_text!r}"
+                )
+                if change_kind != "punctuation":
+                    any_changed = True
+                    if earliest_changed_index is None or target_index < earliest_changed_index:
+                        earliest_changed_index = target_index
+                    latest_changed_target = target
+
+        # Strip a word that drifted across the frozen/provisional boundary into a duplicate.
+        self._strip_boundary_duplicates(len(rolling))
+
+        # Advance the freeze cursor. Monotonic — only moves forward.
+        if settle_boundary > self._asr_commit_cursor_ts:
+            self._asr_commit_cursor_ts = settle_boundary
+
+        # Fix-B flush gate (identical policy to _run_parakeet): flush only when GENUINELY NEW
+        # user words arrived since the last flush. Frozen-block immutability above has already
+        # removed the re-segmentation/drift edits that used to reach here spuriously.
+        if any_changed:
+            _current_fp = self._user_content_fingerprint(rolling)
+            _new_words = Counter(_current_fp.split()) - Counter(
+                self._last_ctx_flush_user_fingerprint.split()
+            )
+            if not _new_words:
+                any_changed = False
+            else:
+                self._last_ctx_flush_user_fingerprint = _current_fp
+
+        if any_changed:
+            if latest_changed_target is not None:
+                self._latest_user_source_block_id = latest_changed_target.block_id
+            self._invalidate_future_assistant_continuation()
+            if earliest_changed_index is not None:
+                self._mark_assistant_history_stale_from(earliest_changed_index)
+            print(
+                "[asr•mono→ctx] action=flush_future_continuation+mark_stale_history "
                 f"earliest_block_index={earliest_changed_index} "
                 f"latest_source_block_id={self._latest_user_source_block_id}"
             )
