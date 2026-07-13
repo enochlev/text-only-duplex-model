@@ -502,7 +502,7 @@ def main() -> None:
     if args.record:
         print(f"[boot] recording sessions to {args.record}/ (mic+bot WAV + meta on disconnect)")
     app = create_app(agent_factory=agent_factory, public_url=public_url, record_dir=args.record)
-    uvicorn.run(app, host="0.0.0.0", port=8998)
+    uvicorn.run(app, host="0.0.0.0", port=args.port)
 
 
 if __name__ == "__main__":
