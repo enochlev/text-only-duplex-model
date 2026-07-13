@@ -231,7 +231,10 @@ def _ws_url(addr: str) -> str:
     if "://" in addr:
         proto, rest = addr.split("://", 1)
         proto = "ws" if proto in {"http", "ws"} else "wss"
-        return f"{proto}://{rest.rstrip('/')}/ws"
+        rest = rest.rstrip("/")
+        if not rest.endswith("/ws"):          # don't double it if the URL already ends in /ws
+            rest += "/ws"
+        return f"{proto}://{rest}"
     if ":" not in addr:
         addr += ":8998"
     return f"ws://{addr}/ws"
