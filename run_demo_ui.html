@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Conversation Study</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#181b22; --card2:#20242e; --line:#2b303b;
+    --txt:#e8eaf0; --mut:#9aa3b2; --accent:#f59e0b; --accent2:#3b82f6;
+    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f4f5f8; --card:#ffffff; --card2:#f0f2f6; --line:#e2e5ec;
+           --txt:#1a1d24; --mut:#5b6472; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:720px;margin:0 auto;padding:24px 18px 64px}
+  h1{font-size:24px;margin:.2em 0 .1em}
+  h2{font-size:19px;margin:1.1em 0 .4em}
+  p{color:var(--txt)} .mut{color:var(--mut)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:22px;margin:16px 0;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+  .hidden{display:none!important}
+  button{font:inherit;cursor:pointer;border:none;border-radius:10px;padding:12px 18px;
+    background:var(--card2);color:var(--txt);transition:.15s}
+  button:hover{filter:brightness(1.08)} button:disabled{opacity:.45;cursor:not-allowed}
+  .primary{background:var(--accent);color:#1a1d24;font-weight:600}
+  .big{font-size:18px;padding:16px 26px;width:100%;font-weight:600}
+  .tabs{display:flex;gap:8px;margin-bottom:8px}
+  .tabs button{flex:1;border-radius:10px 10px 0 0}
+  .tabs .active{background:var(--accent);color:#1a1d24;font-weight:600}
+  /* connection pill */
+  .pill{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border-radius:999px;
+    font-size:14px;font-weight:600;background:var(--card2)}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--mut)}
+  .pill.disconnected .dot{background:var(--mut)}
+  .pill.connecting .dot{background:var(--warn);animation:pulse 1s infinite}
+  .pill.connected .dot{background:var(--ok)}
+  .pill.error .dot{background:var(--bad)}
+  @keyframes pulse{50%{opacity:.3}}
+  /* volume meters */
+  .meter-row{display:flex;align-items:center;gap:12px;margin:10px 0}
+  .meter-row .lbl{width:44px;font-size:13px;color:var(--mut);text-align:right}
+  .meter{flex:1;height:14px;border-radius:8px;background:var(--card2);overflow:hidden;position:relative}
+  .meter .fill{position:absolute;left:0;top:0;bottom:0;width:0%;border-radius:8px;transition:width .06s linear}
+  .meter.you .fill{background:linear-gradient(90deg,#3b82f6,#60a5fa)}
+  .meter.bot .fill{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+  /* likert */
+  .likert{display:flex;gap:6px;margin:6px 0 2px;flex-wrap:wrap}
+  .likert label{flex:1;min-width:56px;text-align:center;padding:9px 4px;border:1px solid var(--line);
+    border-radius:9px;font-size:13px;cursor:pointer;background:var(--card2)}
+  .likert input{display:none}
+  .likert input:checked+span{font-weight:700}
+  .likert label:has(input:checked){border-color:var(--accent);background:rgba(245,158,11,.18)}
+  .q{margin:16px 0}
+  .q .qt{font-weight:600;margin-bottom:4px}
+  .scale-ends{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);margin-top:2px}
+  input[type=checkbox]{width:18px;height:18px;vertical-align:-3px;margin-right:8px}
+  textarea,select{width:100%;font:inherit;background:var(--card2);color:var(--txt);
+    border:1px solid var(--line);border-radius:9px;padding:10px}
+  .transcript{max-height:220px;overflow:auto;background:var(--card2);border-radius:10px;
+    padding:12px;font-size:14px;margin-top:12px}
+  .transcript .u{color:var(--accent2)} .transcript .b{color:var(--accent)}
+  .transcript .stale{opacity:.45;text-decoration:line-through}
+  .step{font-size:13px;color:var(--mut);letter-spacing:.05em;text-transform:uppercase}
+  .banner{padding:12px 16px;border-radius:10px;background:rgba(239,68,68,.12);
+    border:1px solid var(--bad);color:var(--txt);margin:12px 0}
+  a{color:var(--accent2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ============ CONSENT GATE ============ -->
+  <section id="consent" class="card">
+    <h1>Conversational Voice AI — Research Study</h1>
+    <p class="mut" id="consent-sub">Informed consent to participate</p>
+    <div id="consent-body" style="max-height:46vh;overflow:auto;padding-right:6px;
+         border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:12px 0;padding-top:12px">
+      <!-- consent text injected from /config (config.consent_html) -->
+    </div>
+    <label style="display:block;margin:14px 0"><input type="checkbox" id="agree">
+      I am 18 years or older, have read and understood the information above, and I
+      <b>voluntarily agree</b> to participate.</label>
+    <button id="consent-btn" class="primary big" disabled>Agree &amp; Continue</button>
+  </section>
+
+  <!-- ============ MAIN ============ -->
+  <section id="main" class="hidden">
+    <div class="tabs" id="tabs"></div>
+
+    <!-- ---- SURVEY VIEW ---- -->
+    <div id="survey" class="card">
+      <div id="sv-intro">
+        <span class="step">Study</span>
+        <h2>You will talk with two voice assistants</h2>
+        <p>For each system, press <b>Start</b> and have a short, natural spoken conversation
+           (ask questions, chat — about a minute is plenty). Press <b>Stop / Reset</b> when done,
+           then answer a few quick questions. The two systems are shown in a random order and
+           labelled neutrally.</p>
+        <p class="mut">Please use headphones if you can, in a quiet room, and allow microphone access when prompted.</p>
+        <button id="sv-begin" class="primary big">Begin</button>
+      </div>
+
+      <div id="sv-talk" class="hidden">
+        <span class="step">Conversation <span id="sv-idx">1</span> of <span id="sv-total">2</span></span>
+        <h2 id="sv-sysname">System 1</h2>
+        <div id="talkA"></div>
+      </div>
+
+      <div id="sv-rate" class="hidden">
+        <span class="step">Rate <span id="sv-rate-name">System 1</span></span>
+        <div id="rate-questions"></div>
+        <button id="sv-rate-next" class="primary big" style="margin-top:12px">Submit ratings</button>
+      </div>
+
+      <div id="sv-compare" class="hidden">
+        <span class="step">Final comparison</span>
+        <div id="compare-questions"></div>
+        <button id="sv-finish" class="primary big" style="margin-top:12px">Finish &amp; submit</button>
+      </div>
+
+      <div id="sv-done" class="hidden" style="text-align:center;padding:20px">
+        <div style="font-size:54px">✅</div>
+        <h2>Thank you!</h2>
+        <p class="mut">Your responses have been recorded. You may close this window.</p>
+      </div>
+
+      <div id="sv-disabled" class="hidden">
+        <div class="banner">The survey is not available: both systems must be configured by the
+          study administrator (<code>--model_a_url</code> and <code>--model_b_url</code>).</div>
+      </div>
+    </div>
+
+    <!-- ---- FREE CHAT VIEW ---- -->
+    <div id="freechat" class="card hidden">
+      <span class="step">Free chat</span>
+      <h2>Talk to a system</h2>
+      <label class="mut" style="display:block;margin-bottom:6px">Choose a system</label>
+      <select id="fc-select" style="margin-bottom:14px"></select>
+      <div id="talkB"></div>
+    </div>
+  </section>
+
+</div>
+
+<!-- ============ TALK PANEL TEMPLATE ============ -->
+<template id="talk-tpl">
+  <div class="talk">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <span class="pill disconnected"><span class="dot"></span><span class="pill-txt">Disconnected</span></span>
+      <span class="mut sess" style="font-size:12px"></span>
+    </div>
+    <button class="startstop primary big">▶ Start</button>
+    <div class="meter-row"><span class="lbl">You</span>
+      <div class="meter you"><div class="fill"></div></div></div>
+    <div class="meter-row"><span class="lbl">Bot</span>
+      <div class="meter bot"><div class="fill"></div></div></div>
+    <div class="transcript hidden"></div>
+  </div>
+</template>
+
+<script>
+//= config ==================================================================
+let CFG = {model_a_url:"", model_b_url:"", enable_free_chat:false, survey_enabled:false,
+           consent_html:"", likert:[], compare:[], study_title:""};
+
+//= base64 <-> bytes (chunked; handles large PCM buffers) ===================
+function b64encode(bytes){
+  let bin=""; const CH=0x8000;
+  for(let i=0;i<bytes.length;i+=CH) bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+CH));
+  return btoa(bin);
+}
+function b64decode(b64){
+  const bin=atob(b64); const out=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+  return out;
+}
+
+//= DuplexAudio: WS + mic capture + playback + volume meters ================
+class DuplexAudio{
+  constructor(url, cb){ this.url=url; this.cb=cb; this.ws=null; this.ctx=null;
+    this.stream=null; this.proc=null; this.src=null; this.playhead=0; this.session=""; this.alive=false; }
+
+  setState(s,txt){ this.cb.state && this.cb.state(s,txt); }
+
+  async start(){
+    this.setState("connecting","Connecting…");
+    try{
+      this.ctx = new (window.AudioContext||window.webkitAudioContext)();
+      await this.ctx.resume();
+      this.stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,
+        noiseSuppression:true, autoGainControl:true}});
+    }catch(e){ this.setState("error","Mic/permission error"); this.stop(); return; }
+
+    const ws = new WebSocket(this.url); this.ws=ws;
+    ws.onopen = ()=>{ ws.send(JSON.stringify({type:"hello",session_id:null,client:"web-survey"})); };
+    ws.onerror = ()=>{ this.setState("error","Connection error"); };
+    ws.onclose = ()=>{ if(this.alive){ this.alive=false; this.setState("disconnected","Disconnected"); } };
+    ws.onmessage = (ev)=> this._onmsg(ev.data);
+  }
+
+  _startMic(){
+    const ctx=this.ctx;
+    this.src = ctx.createMediaStreamSource(this.stream);
+    // ScriptProcessor: universally supported, simple PCM capture.
+    this.proc = ctx.createScriptProcessor(4096,1,1);
+    this.src.connect(this.proc); this.proc.connect(ctx.destination); // needed for onaudioprocess to fire
+    this.proc.onaudioprocess = (e)=>{
+      if(!this.alive || !this.ws || this.ws.readyState!==1) return;
+      const f32 = e.inputBuffer.getChannelData(0);
+      // volume meter (RMS)
+      let s=0; for(let i=0;i<f32.length;i++) s+=f32[i]*f32[i];
+      this.cb.vu && this.cb.vu("you", Math.min(1, Math.sqrt(s/f32.length)*4));
+      // send as pcm_f32le base64 at the context sample rate (server resamples to 16k)
+      const bytes=new Uint8Array(f32.buffer.slice(0));
+      this.ws.send(JSON.stringify({type:"mic_audio", sample_rate:Math.round(ctx.sampleRate),
+        encoding:"pcm_f32le", data:b64encode(bytes)}));
+    };
+  }
+
+  _onmsg(raw){
+    let m; try{ m=JSON.parse(raw); }catch(e){ return; }
+    if(m.type==="ready"){
+      this.session=m.session_id||""; this.alive=true;
+      this.cb.session && this.cb.session(this.session);
+      this.playhead=this.ctx.currentTime+0.25;
+      this._startMic();
+      this.setState("connected","Connected");
+    } else if(m.type==="audio_chunk"){
+      this._play(m);
+    } else if(m.type==="snapshot"){
+      this.cb.snapshot && this.cb.snapshot(m.snapshot);
+    } else if(m.type==="error"){
+      this.setState("error", m.message||"Server error");
+    }
+  }
+
+  _play(m){
+    // decode pcm to Float32
+    const raw=b64decode(m.data); let f32;
+    if(m.encoding==="pcm_s16le"){
+      const i16=new Int16Array(raw.buffer); f32=new Float32Array(i16.length);
+      for(let i=0;i<i16.length;i++) f32[i]=i16[i]/32768;
+    } else { f32=new Float32Array(raw.buffer); }
+    if(!f32.length) return;
+    const sr=m.sample_rate||24000;
+    const buf=this.ctx.createBuffer(1,f32.length,sr); buf.getChannelData(0).set(f32);
+    const node=this.ctx.createBufferSource(); node.buffer=buf; node.connect(this.ctx.destination);
+    const now=this.ctx.currentTime;
+    const at=Math.max(now+0.05, this.playhead);
+    node.start(at); this.playhead=at+buf.duration;
+    // bot volume meter (peak of chunk), decays via UI
+    let pk=0; for(let i=0;i<f32.length;i+=64){ const a=Math.abs(f32[i]); if(a>pk)pk=a; }
+    this.cb.vu && this.cb.vu("bot", Math.min(1,pk*1.6));
+  }
+
+  stop(){
+    this.alive=false;
+    try{ this.proc && (this.proc.onaudioprocess=null, this.proc.disconnect()); }catch(e){}
+    try{ this.src && this.src.disconnect(); }catch(e){}
+    try{ this.stream && this.stream.getTracks().forEach(t=>t.stop()); }catch(e){}
+    try{ this.ws && this.ws.close(); }catch(e){}
+    try{ this.ctx && this.ctx.close(); }catch(e){}
+    this.ws=null; this.ctx=null;
+    this.setState("disconnected","Disconnected");
+    this.cb.vu && (this.cb.vu("you",0), this.cb.vu("bot",0));
+  }
+}
+
+//= Talk panel controller (wires template to a DuplexAudio) =================
+function makeTalkPanel(mount){
+  const node=document.getElementById("talk-tpl").content.cloneNode(true);
+  const el=node.querySelector(".talk");
+  const pill=el.querySelector(".pill"), pillTxt=el.querySelector(".pill-txt");
+  const btn=el.querySelector(".startstop"), sess=el.querySelector(".sess");
+  const vuYou=el.querySelector(".meter.you .fill"), vuBot=el.querySelector(".meter.bot .fill");
+  const tr=el.querySelector(".transcript");
+  mount.innerHTML=""; mount.appendChild(el);
+  let da=null, url=null, decay;
+
+  function setPill(s,txt){ pill.className="pill "+s; pillTxt.textContent=txt;
+    if(s==="connected"){ btn.textContent="■ Stop / Reset"; btn.classList.remove("primary"); }
+    else if(s==="connecting"){ btn.textContent="Connecting…"; }
+    else { btn.textContent="▶ Start"; btn.classList.add("primary"); } }
+
+  const cb={
+    state:setPill,
+    session:(s)=>{ sess.textContent="session "+s; },
+    vu:(who,v)=>{ (who==="you"?vuYou:vuBot).style.width=(v*100).toFixed(0)+"%"; },
+    snapshot:(snap)=>{ renderTranscript(tr,snap); }
+  };
+  // slow decay for bot meter so it looks alive
+  decay=setInterval(()=>{ [vuYou,vuBot].forEach(f=>{ const w=parseFloat(f.style.width)||0;
+    if(w>0) f.style.width=Math.max(0,w-6)+"%"; }); },80);
+
+  btn.onclick=()=>{
+    if(da && da.alive){ da.stop(); da=null; }
+    else {
+      if(!url){ setPill("error","No system selected"); return; }
+      da=new DuplexAudio(url,cb); da.start();
+    }
+  };
+  return {
+    setUrl:(u)=>{ url=u; },
+    reset:()=>{ if(da){da.stop();da=null;} setPill("disconnected","Disconnected");
+                tr.classList.add("hidden"); tr.innerHTML=""; },
+    showTranscript:(b)=>{ tr.classList.toggle("hidden",!b); },
+    isConnected:()=> !!(da&&da.alive)
+  };
+}
+
+function renderTranscript(tr,snap){
+  if(!snap||!snap.blocks) return;
+  tr.classList.remove("hidden");
+  const rows=[];
+  for(const b of snap.blocks){
+    if(b.user_text) rows.push(`<div class="u">🧑 ${escapeHtml(b.user_text)}</div>`);
+    if(b.assistant_text) rows.push(`<div class="b ${b.assistant_text_stale?'stale':''}">🤖 ${escapeHtml(b.assistant_text)}</div>`);
+  }
+  tr.innerHTML=rows.join(""); tr.scrollTop=tr.scrollHeight;
+}
+function escapeHtml(s){ return (s||"").replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+//= Likert / question rendering =============================================
+function renderQuestions(mount, qs, ns){
+  mount.innerHTML="";
+  qs.forEach((q,i)=>{
+    const d=document.createElement("div"); d.className="q";
+    if(q.type==="likert"){
+      const opts=q.options||["1","2","3","4","5"];
+      d.innerHTML=`<div class="qt">${escapeHtml(q.text)}</div><div class="likert">`+
+        opts.map((o,j)=>`<label><input type="radio" name="${ns}_${q.id}" value="${j+1}"><span>${escapeHtml(o)}</span></label>`).join("")+
+        `</div><div class="scale-ends"><span>${escapeHtml(q.low||"")}</span><span>${escapeHtml(q.high||"")}</span></div>`;
+    } else if(q.type==="choice"){
+      d.innerHTML=`<div class="qt">${escapeHtml(q.text)}</div>`+
+        `<select name="${ns}_${q.id}"><option value="">— select —</option>`+
+        (q.options||[]).map(o=>`<option>${escapeHtml(o)}</option>`).join("")+`</select>`;
+    } else { // text
+      d.innerHTML=`<div class="qt">${escapeHtml(q.text)}</div><textarea rows="3" name="${ns}_${q.id}"></textarea>`;
+    }
+    mount.appendChild(d);
+  });
+}
+function collect(mount){ const o={};
+  mount.querySelectorAll("input[type=radio]:checked,select,textarea").forEach(el=>{
+    if(el.type==="radio"){ o[el.name]=el.value; }
+    else if(el.value) o[el.name]=el.value; });
+  return o;
+}
+
+//= Survey flow (blinded A/B) ===============================================
+const S={ order:[], i:0, results:{}, startedAt:Date.now(), talk:null };
+function shuffle2(){ return Math.random()<0.5 ? ["A","B"] : ["B","A"]; }
+
+function surveyBegin(){
+  S.order=shuffle2(); S.i=0; S.results={sessions:[]};
+  document.getElementById("sv-intro").classList.add("hidden");
+  surveyTalk();
+}
+function surveyTalk(){
+  const view=id=>document.getElementById(id);
+  ["sv-rate","sv-compare","sv-done"].forEach(x=>view(x).classList.add("hidden"));
+  view("sv-talk").classList.remove("hidden");
+  view("sv-idx").textContent=S.i+1; view("sv-total").textContent="2";
+  view("sv-sysname").textContent="System "+(S.i+1);
+  S.talk=makeTalkPanel(document.getElementById("talkA"));
+  S.talk.showTranscript(false);
+  const key=S.order[S.i];
+  S.talk.setUrl(key==="A"?CFG.model_a_url:CFG.model_b_url);
+  // add a "done talking → rate" control
+  let next=document.getElementById("sv-talk-next");
+  if(!next){ next=document.createElement("button"); next.id="sv-talk-next";
+    next.className="big"; next.style.marginTop="12px";
+    view("sv-talk").appendChild(next); }
+  next.textContent="I'm done talking → rate this system";
+  next.onclick=()=>{ S.talk.reset(); surveyRate(); };
+}
+function surveyRate(){
+  const view=id=>document.getElementById(id);
+  view("sv-talk").classList.add("hidden");
+  view("sv-rate-name").textContent="System "+(S.i+1);
+  renderQuestions(document.getElementById("rate-questions"), CFG.likert, "s"+S.i);
+  view("sv-rate").classList.remove("hidden");
+  document.getElementById("sv-rate-next").onclick=()=>{
+    const r=collect(document.getElementById("rate-questions"));
+    S.results.sessions.push({system_label:"System "+(S.i+1), hidden_model:S.order[S.i], ratings:r});
+    S.i++;
+    if(S.i<2){ view("sv-rate").classList.add("hidden"); surveyTalk(); }
+    else surveyCompare();
+  };
+}
+function surveyCompare(){
+  const view=id=>document.getElementById(id);
+  view("sv-rate").classList.add("hidden");
+  // build compare questions, injecting the two system labels
+  renderQuestions(document.getElementById("compare-questions"), CFG.compare, "cmp");
+  view("sv-compare").classList.remove("hidden");
+  document.getElementById("sv-finish").onclick=submitSurvey;
+}
+async function submitSurvey(){
+  const cmp=collect(document.getElementById("compare-questions"));
+  const payload={ kind:"survey", ts:new Date().toISOString(),
+    order:S.order, duration_s:Math.round((Date.now()-S.startedAt)/1000),
+    consent:true, sessions:S.results.sessions, comparison:cmp,
+    ua:navigator.userAgent };
+  try{ await fetch("submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); }catch(e){}
+  document.getElementById("sv-compare").classList.add("hidden");
+  document.getElementById("sv-done").classList.remove("hidden");
+}
+
+//= Tabs / init =============================================================
+function initTabs(){
+  const tabs=document.getElementById("tabs");
+  const views={survey:document.getElementById("survey"), freechat:document.getElementById("freechat")};
+  const defs=[{k:"survey",t:"Survey"}];
+  if(CFG.enable_free_chat) defs.push({k:"freechat",t:"Free chat"});
+  if(defs.length<2){ tabs.classList.add("hidden"); return; }
+  defs.forEach((d,i)=>{ const b=document.createElement("button"); b.textContent=d.t;
+    if(i===0)b.classList.add("active");
+    b.onclick=()=>{ tabs.querySelectorAll("button").forEach(x=>x.classList.remove("active"));
+      b.classList.add("active");
+      Object.entries(views).forEach(([k,v])=>v.classList.toggle("hidden",k!==d.k)); };
+    tabs.appendChild(b); });
+}
+function initFreeChat(){
+  const sel=document.getElementById("fc-select");
+  const opts=[]; if(CFG.model_a_url) opts.push(["A",CFG.model_a_url]);
+  if(CFG.model_b_url) opts.push(["B",CFG.model_b_url]);
+  sel.innerHTML=opts.map(([k,u])=>`<option value="${u}">System ${k}</option>`).join("");
+  const panel=makeTalkPanel(document.getElementById("talkB")); panel.showTranscript(true);
+  const apply=()=>{ panel.reset(); panel.setUrl(sel.value); };
+  sel.onchange=apply; apply();
+}
+
+async function init(){
+  try{ CFG=Object.assign(CFG, await (await fetch("config")).json()); }catch(e){}
+  document.getElementById("consent-body").innerHTML = CFG.consent_html ||
+    "<p>Consent text not configured.</p>";
+  if(CFG.study_title) document.querySelector("#consent h1").textContent=CFG.study_title;
+  const agree=document.getElementById("agree"), cbtn=document.getElementById("consent-btn");
+  agree.onchange=()=>{ cbtn.disabled=!agree.checked; };
+  const enterMain=()=>{
+    document.getElementById("consent").classList.add("hidden");
+    document.getElementById("main").classList.remove("hidden");
+    initTabs();
+    if(!CFG.survey_enabled){
+      document.getElementById("sv-intro").classList.add("hidden");
+      document.getElementById("sv-disabled").classList.remove("hidden");
+    } else {
+      document.getElementById("sv-begin").onclick=surveyBegin;
+    }
+    if(CFG.enable_free_chat) initFreeChat();
+  };
+  cbtn.onclick=enterMain;
+
+  // ?preview=[survey|rate|freechat] : skip the consent gate to preview/screenshot the UI
+  // without connecting to a backend. Purely cosmetic; no data is submitted.
+  const pv=new URLSearchParams(location.search).get("preview");
+  if(pv!==null){
+    agree.checked=true; enterMain();
+    if(pv==="rate"){ S.order=shuffle2(); S.i=0; S.results={sessions:[]};
+      document.getElementById("sv-intro").classList.add("hidden"); surveyRate(); }
+    else if(pv==="freechat" && CFG.enable_free_chat){ document.querySelectorAll(".tabs button").forEach(b=>{ if(b.textContent==="Free chat")b.click(); }); }
+    else if(CFG.survey_enabled){ surveyBegin(); }
+  }
+}
+init();
+</script>
+</body>
+</html>
