@@ -119,7 +119,11 @@ _ENABLE_EARLY_EMIT = False
 #     still work — those are legitimate harness supervision, not model-visible leakage.
 # Apostrophes inside contractions (don't, it's) are kept — they are part of the word,
 # not a turn/clause boundary. Flip to False to restore punctuated prompts.
-_STRIP_USER_PUNCTUATION = True
+# 2026-07-12: set False. Live testing showed the base MiniCPM-duplex relies on terminal
+# punctuation as its turn-end ("user finished → speak") cue — with the strip ON the base
+# model (zero RL) went mute on 3/4 casual turns. The crutch is load-bearing AND Parakeet
+# supplies punctuation timely enough in prod, so keep it. See CLAUDE.md §11 (2026-07-12).
+_STRIP_USER_PUNCTUATION = False
 
 # Drops every punctuation mark (. , ? ! ; : " ( ) - — … etc.) but preserves apostrophes
 # that sit between word characters so contractions survive (don't → don't, not do nt).
@@ -1770,11 +1774,14 @@ class DuplexAudioAgent:
     def _log_llm_request(self, ctx_ver: int, user_message: str) -> None:
         _log_blocks = self.blocks[-self._max_prompt_blocks:]
         _W = 55
-        header = f"┌─ LLM REQUEST  ctx={ctx_ver} {'─' * max(0, _W - 20 - len(str(ctx_ver)))}"
+        header = f"┌─ LLM REQUEST  ctx={ctx_ver}  strip={_STRIP_USER_PUNCTUATION} {'─' * max(0, _W - 34 - len(str(ctx_ver)))}"
         lines = [header]
         for i, blk in enumerate(_log_blocks):
             idx_label = f"B[{i - len(_log_blocks)}]"
-            u = (blk.user_text[:35] + "…") if len(blk.user_text or "") > 35 else (blk.user_text or "-")
+            # Show the MODEL-VISIBLE user text (post-strip) so the log matches exactly what
+            # the LLM receives — not the punctuated text we keep stored for harness logic.
+            u_model = strip_user_punctuation(blk.user_text or "")
+            u = (u_model[:35] + "…") if len(u_model) > 35 else (u_model or "-")
             visible_ai = self._assistant_text_for_prompt(blk)
             if blk.assistant_text and blk.assistant_text_stale:
                 ai_part = f'ai="-"  stale={blk.assistant_text[:30]!r}'

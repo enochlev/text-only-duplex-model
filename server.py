@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import threading
 import time
 import uuid
@@ -42,6 +43,7 @@ class DuplexSession:
         self,
         session_id: str,
         agent_factory: Callable[[], DuplexAudioAgent],
+        record_dir: Optional[str] = None,
     ):
         self.session_id = session_id
         self.started_at = time.time()
@@ -51,6 +53,13 @@ class DuplexSession:
         self.lock = threading.Lock()
         self._last_snapshot_key = None
         self._last_warning_seq = 0
+        # --record: buffer raw mic-in and bot-out audio (+ block trace) for offline
+        # replay/eval of iterated models. Flushed to WAV+JSON on disconnect.
+        self._record_dir = record_dir
+        self._mic_frames: list = []
+        self._bot_frames: list = []
+        self._mic_rate: Optional[int] = None
+        self._bot_rate: Optional[int] = None
 
     def _touch(self) -> None:
         self.last_active_at = time.time()
@@ -98,6 +107,9 @@ class DuplexSession:
         if not should_emit_audio_chunk(audio_array):
             return None
         self._mark_audio_activity()
+        if self._record_dir is not None:
+            self._bot_rate = sample_rate
+            self._bot_frames.append(np.asarray(audio_array, dtype=np.float32).reshape(-1))
         payload = encode_audio_payload(
             sample_rate,
             audio_array,
@@ -112,6 +124,9 @@ class DuplexSession:
         self._touch()
         if should_emit_audio_chunk(audio_array):
             self._mark_audio_activity()
+        if self._record_dir is not None:
+            self._mic_rate = sample_rate
+            self._mic_frames.append(np.asarray(audio_array, dtype=np.float32).reshape(-1))
         with self.lock:
             audio_chunk = self.agent.receive_mic_chunk(sample_rate, audio_array)
             events = []
@@ -179,6 +194,68 @@ class DuplexSession:
                 }
             return snapshot
 
+    def close_and_flush(self) -> None:
+        """On disconnect, write buffered mic/bot audio + block trace to the --record dir.
+
+        Produces <stamp>_<sid>_mic.wav, _bot.wav (mono 16-bit PCM) and _meta.json
+        (block-level user/assistant transcript). The mic WAV is the replay input for
+        evaluating iterated models on the same real audio.
+        """
+        if self._record_dir is None:
+            return
+        import wave
+
+        os.makedirs(self._record_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(self.started_at))
+        base = os.path.join(self._record_dir, f"{stamp}_{self.session_id}")
+
+        def _write_wav(path: str, frames: list, rate: Optional[int]) -> int:
+            if not frames or not rate:
+                return 0
+            audio = np.concatenate(frames).astype(np.float32)
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            if peak <= 1.5:  # float PCM in [-1, 1]
+                pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+            else:            # already integer-range samples
+                pcm16 = np.clip(audio, -32768, 32767).astype("<i2")
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(int(rate))
+                w.writeframes(pcm16.tobytes())
+            return int(audio.size)
+
+        n_mic = _write_wav(base + "_mic.wav", self._mic_frames, self._mic_rate)
+        n_bot = _write_wav(base + "_bot.wav", self._bot_frames, self._bot_rate)
+        try:
+            blocks = [
+                {
+                    "user": b.user_text,
+                    "assistant": b.assistant_text,
+                    "stale": bool(getattr(b, "assistant_text_stale", False)),
+                }
+                for b in self.agent.blocks
+            ]
+        except Exception:
+            blocks = []
+        meta = {
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "mic_rate": self._mic_rate,
+            "bot_rate": self._bot_rate,
+            "mic_samples": n_mic,
+            "bot_samples": n_bot,
+            "blocks": blocks,
+        }
+        with open(base + "_meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        mic_s = n_mic / self._mic_rate if self._mic_rate else 0.0
+        bot_s = n_bot / self._bot_rate if self._bot_rate else 0.0
+        print(
+            f"[record] session {self.session_id} → {base}_(mic|bot).wav  "
+            f"mic={mic_s:.1f}s bot={bot_s:.1f}s  blocks={len(blocks)}"
+        )
+
 
 class SessionManager:
     def __init__(
@@ -186,9 +263,11 @@ class SessionManager:
         agent_factory: Callable[[], DuplexAudioAgent],
         *,
         session_ttl_s: float = SESSION_TTL_S,
+        record_dir: Optional[str] = None,
     ):
         self._agent_factory = agent_factory
         self._session_ttl_s = session_ttl_s
+        self._record_dir = record_dir
         self._lock = threading.Lock()
         self._sessions: dict[str, DuplexSession] = {}
 
@@ -212,7 +291,9 @@ class SessionManager:
             resolved_session_id = session_id or uuid.uuid4().hex[:12]
             session = self._sessions.get(resolved_session_id)
             if session is None:
-                session = DuplexSession(resolved_session_id, self._agent_factory)
+                session = DuplexSession(
+                    resolved_session_id, self._agent_factory, record_dir=self._record_dir
+                )
                 self._sessions[resolved_session_id] = session
             return session
 
@@ -223,9 +304,10 @@ def create_app(
     poll_interval_s: float = POLL_INTERVAL_S,
     audio_idle_timeout_s: float = AUDIO_IDLE_TIMEOUT_S,
     public_url: Optional[str] = None,
+    record_dir: Optional[str] = None,
 ) -> FastAPI:
     resolved_factory = agent_factory or DuplexAudioAgent
-    manager = SessionManager(resolved_factory)
+    manager = SessionManager(resolved_factory, record_dir=record_dir)
     # When tunneled (--share), echo the public wss:// URL so clients that read the
     # ready event connect through the tunnel instead of localhost.
     resolved_server_url = server_url_from_address(public_url or "127.0.0.1")
@@ -322,6 +404,7 @@ def create_app(
             return
         finally:
             if session is not None:
+                await asyncio.to_thread(session.close_and_flush)
                 await asyncio.to_thread(manager.remove, session.session_id)
 
     return app
@@ -363,6 +446,12 @@ def main() -> None:
             f"Kokoro TTS voice id for the bot (default {TTS_MODEL!r}). Any Kokoro-82M "
             "voice works, e.g. af_heart, af_bella, am_michael, am_adam, bf_emma, bm_george."
         ),
+    )
+    parser.add_argument(
+        "--record",
+        default=None,
+        help="Directory to save per-session recordings (mic+bot WAV + block-trace JSON) "
+             "on disconnect, for offline replay/eval of iterated models.",
     )
     args = parser.parse_args()
 
@@ -410,7 +499,9 @@ def main() -> None:
     else:
         print(f"[boot] local mode: using trained model backend on port {args.vllm_port}")
         agent_factory = lambda: DuplexAudioAgent(tts_model=args.voice)
-    app = create_app(agent_factory=agent_factory, public_url=public_url)
+    if args.record:
+        print(f"[boot] recording sessions to {args.record}/ (mic+bot WAV + meta on disconnect)")
+    app = create_app(agent_factory=agent_factory, public_url=public_url, record_dir=args.record)
     uvicorn.run(app, host="0.0.0.0", port=8998)
 
 
