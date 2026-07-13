@@ -183,7 +183,8 @@ function b64decode(b64){
 //= DuplexAudio: WS + mic capture + playback + volume meters ================
 class DuplexAudio{
   constructor(url, cb){ this.url=url; this.cb=cb; this.ws=null; this.ctx=null;
-    this.stream=null; this.proc=null; this.src=null; this.playhead=0; this.session=""; this.alive=false; }
+    this.stream=null; this.proc=null; this.src=null; this.playhead=0; this.session=""; this.alive=false;
+    this.scheduled=[]; this.lastCtxVer=-1; }  // scheduled bot-audio nodes + last context_version
 
   setState(s,txt){ this.cb.state && this.cb.state(s,txt); }
 
@@ -253,6 +254,14 @@ class DuplexAudio{
     } else if(m.type==="audio_chunk"){
       this._play(m);
     } else if(m.type==="snapshot"){
+      // context_version bumps exactly when the server invalidates the in-flight response
+      // (barge-in / new user speech → the text gets crossed out). Cut buffered bot audio so
+      // playback matches the crossed-out text instead of talking over the user.
+      const cv = m.snapshot && m.snapshot.context_version;
+      if(typeof cv==="number"){
+        if(this.lastCtxVer>=0 && cv>this.lastCtxVer) this._cutAudio();
+        this.lastCtxVer = cv;
+      }
       this.cb.snapshot && this.cb.snapshot(m.snapshot);
     } else if(m.type==="error"){
       this.setState("error", m.message||"Server error");
@@ -273,9 +282,20 @@ class DuplexAudio{
     const now=this.ctx.currentTime;
     const at=Math.max(now+0.05, this.playhead);
     node.start(at); this.playhead=at+buf.duration;
+    this.scheduled.push({node, end: at+buf.duration});               // track so a barge-in can stop it
+    this.scheduled = this.scheduled.filter(s=>s.end > now-0.2);       // prune already-finished
     // bot volume meter (peak of chunk), decays via UI
     let pk=0; for(let i=0;i<f32.length;i+=64){ const a=Math.abs(f32[i]); if(a>pk)pk=a; }
     this.cb.vu && this.cb.vu("bot", Math.min(1,pk*1.6));
+  }
+
+  _cutAudio(){  // stop all scheduled bot audio immediately (barge-in) and reset the playhead
+    const now = this.ctx ? this.ctx.currentTime : 0;
+    for(const s of this.scheduled){ try{ s.node.stop(); }catch(e){ /* already stopped */ } }
+    this.scheduled = [];
+    this.playhead = now + 0.05;
+    this.cb.vu && this.cb.vu("bot", 0);
+    console.log("[duplex] barge-in → cut buffered bot audio");
   }
 
   stop(){
