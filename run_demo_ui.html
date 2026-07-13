@@ -190,20 +190,26 @@ class DuplexAudio{
   async start(){
     this.setState("connecting","Connecting…");
     if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-      console.error("[duplex] getUserMedia unavailable — page is not a secure context (need https or http://localhost)");
-      this.setState("error","Need https/localhost for mic"); this.stop(); return;
+      console.error("[duplex] getUserMedia unavailable — not a secure context (need https or http://localhost)");
+      this.stop(); this.setState("error","Need https/localhost for mic"); return;  // stop() first so the error sticks
     }
+    this.setState("connecting","Requesting mic…");
     try{
       this.ctx = new (window.AudioContext||window.webkitAudioContext)();
       await this.ctx.resume();
-      this.stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,
-        noiseSuppression:true, autoGainControl:true}});
+      // race against a timeout so a never-answered / hung permission prompt can't sit forever
+      this.stream = await Promise.race([
+        navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true}}),
+        new Promise((_,rej)=>setTimeout(()=>rej(new Error("mic-timeout")), 9000)),
+      ]);
     }catch(e){
       console.error("[duplex] getUserMedia failed:", e && e.name, e && e.message);
-      const hint = (e && e.name==="NotAllowedError") ? "Mic blocked — click Allow (check the address-bar mic icon)"
+      const hint = (e && e.message==="mic-timeout") ? "Mic prompt not answered — click Allow, then Start again"
+                 : (e && e.name==="NotAllowedError") ? "Mic blocked — Allow it (address-bar mic icon / macOS Privacy), then Start again"
                  : (e && e.name==="NotFoundError") ? "No microphone found"
-                 : "Mic error: "+((e&&e.name)||"unknown")+" (need https/localhost + Allow)";
-      this.setState("error", hint); this.stop(); return;
+                 : (e && e.name==="NotReadableError") ? "Mic in use by another app"
+                 : "Mic error: "+((e&&e.name)||"unknown");
+      this.stop(); this.setState("error", hint); return;  // stop() BEFORE setState so the message isn't overwritten
     }
 
     console.log("[duplex] opening WS", this.url);
