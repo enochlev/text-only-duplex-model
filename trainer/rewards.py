@@ -96,11 +96,12 @@ def block_interruption_penalty(
 
       committed overlap  (run=1, source silent): 0.0  (free — no causal visibility)
       true-interrupt     (run=1, source had user): -0.75
-      run=2: -1.5   run=3: -2.25  run=4+: -3.0
-    (2026-07-12 tuning: run>=2 steepened from -1.0/-1.5/-2.0 to penalise PERSISTENT
-     barge-in harder — teaches "stop fast once overlapping". run=1 kept at -0.75 and
-     committed-overlap kept free, so a single mistimed word stays cheap and the model
-     is not pushed toward silence. A/B vs the un-steepened baseline (parallel run).)
+      run=2: -1.0   run=3: -1.5  run=4+: -2.0
+    (2026-07-12: REVERTED the steepened -1.5/-2.25/-3.0 back to baseline. The steep
+     version over-silenced in the strip=True regime. Now that strip=False restores the
+     punctuation turn-end cue (so the model knows WHEN it's safe to talk), keep RM2 mild:
+     it gently trims the base model's slight over-interruption without pushing to silence.
+     Tune up only if the strip=False runs over-interrupt.)
     """
     if not block.assistant_text or not block.user_text:
         return 0.0
@@ -118,10 +119,10 @@ def block_interruption_penalty(
     if run == 1:
         return -0.75
     if run == 2:
-        return -1.5
+        return -1.0
     if run == 3:
-        return -2.25
-    return -3.0
+        return -1.5
+    return -2.0
 
 
 def block_idle_reward(
