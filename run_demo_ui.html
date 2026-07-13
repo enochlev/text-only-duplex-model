@@ -189,17 +189,31 @@ class DuplexAudio{
 
   async start(){
     this.setState("connecting","Connecting…");
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      console.error("[duplex] getUserMedia unavailable — page is not a secure context (need https or http://localhost)");
+      this.setState("error","Need https/localhost for mic"); this.stop(); return;
+    }
     try{
       this.ctx = new (window.AudioContext||window.webkitAudioContext)();
       await this.ctx.resume();
       this.stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,
         noiseSuppression:true, autoGainControl:true}});
-    }catch(e){ this.setState("error","Mic/permission error"); this.stop(); return; }
+    }catch(e){
+      console.error("[duplex] getUserMedia failed:", e && e.name, e && e.message);
+      const hint = (e && e.name==="NotAllowedError") ? "Mic blocked — click Allow (check the address-bar mic icon)"
+                 : (e && e.name==="NotFoundError") ? "No microphone found"
+                 : "Mic error: "+((e&&e.name)||"unknown")+" (need https/localhost + Allow)";
+      this.setState("error", hint); this.stop(); return;
+    }
 
-    const ws = new WebSocket(this.url); this.ws=ws;
-    ws.onopen = ()=>{ ws.send(JSON.stringify({type:"hello",session_id:null,client:"web-survey"})); };
-    ws.onerror = ()=>{ this.setState("error","Connection error"); };
-    ws.onclose = ()=>{ if(this.alive){ this.alive=false; this.setState("disconnected","Disconnected"); } };
+    console.log("[duplex] opening WS", this.url);
+    let ws; try{ ws=new WebSocket(this.url); }catch(e){ console.error("[duplex] WS ctor threw", e); this.setState("error","Bad URL"); this.stop(); return; }
+    this.ws=ws;
+    ws.onopen = ()=>{ console.log("[duplex] WS open → hello"); ws.send(JSON.stringify({type:"hello",session_id:null,client:"web-survey"})); };
+    ws.onerror = (e)=>{ console.error("[duplex] WS error", e); this.setState("error","Connection error"); };
+    ws.onclose = (e)=>{ console.warn("[duplex] WS close", e && e.code, e && e.reason);
+      if(this.alive){ this.alive=false; this.setState("disconnected","Disconnected"); }
+      else { this.setState("error","Closed before ready (code "+(e&&e.code)+")"); } };
     ws.onmessage = (ev)=> this._onmsg(ev.data);
   }
 
@@ -466,6 +480,10 @@ async function init(){
       document.getElementById("sv-intro").classList.add("hidden"); surveyRate(); }
     else if(pv==="freechat" && CFG.enable_free_chat){ document.querySelectorAll(".tabs button").forEach(b=>{ if(b.textContent==="Free chat")b.click(); }); }
     else if(CFG.survey_enabled){ surveyBegin(); }
+    // ?autostart : click Start automatically (for headless testing of the WS/audio path)
+    if(new URLSearchParams(location.search).has("autostart")){
+      setTimeout(()=>{ const b=document.querySelector(".startstop"); if(b) b.click(); }, 500);
+    }
   }
 }
 init();
