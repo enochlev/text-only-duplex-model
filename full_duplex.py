@@ -524,13 +524,24 @@ class DuplexAudioBlock:
 # ---------------------------------------------------------------------------
 
 def _resample(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
+    # numpy/scipy only — NO torch. torch.from_numpy here would intermittently crash the live
+    # server with "aten::lift_fresh has no schema" once the torch dispatcher degraded after many
+    # per-session model reloads (2026-07-14). scipy.resample_poly is anti-aliased (good for the
+    # 48k/44.1k→16k mic downsample into Parakeet); np.interp is a dependency-free fallback.
     if from_sr == to_sr:
         return audio
-    import torch
-    import torchaudio
-    tensor = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0)
-    resampled = torchaudio.functional.resample(tensor, from_sr, to_sr)
-    return resampled.squeeze(0).numpy()
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if len(audio) == 0:
+        return audio
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(int(from_sr), int(to_sr))
+        return resample_poly(audio, to_sr // g, from_sr // g).astype(np.float32)
+    except Exception:
+        n_out = max(1, int(round(len(audio) * to_sr / from_sr)))
+        x_out = np.linspace(0, len(audio), n_out, endpoint=False)
+        return np.interp(x_out, np.arange(len(audio)), audio).astype(np.float32)
 
 
 def resolve_device(device: Optional[str] = None) -> str:
