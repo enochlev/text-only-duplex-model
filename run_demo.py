@@ -35,12 +35,14 @@ import time
 import uuid
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_PATH = os.path.join(HERE, "run_demo_ui.html")
 DOC_DIR = os.path.join(HERE, "data", "survey")
+CONSENT_PDF = os.path.join(DOC_DIR, "IRB informed consent form.pdf")
+DEBRIEF_PDF = os.path.join(DOC_DIR, "IRB debriefing statement.pdf")
 
 # Google Form questionnaire (published; first question = required "Participant ID").
 # The entry id was extracted from the form's FB_PUBLIC_LOAD_DATA_; prefill link is
@@ -97,6 +99,16 @@ def create_app(args) -> FastAPI:
     instructions_html = _read_doc(args.instructions_file, "instructions.html")
     debrief_html = _read_doc(args.debrief_file, "debrief_irb24222.html")
 
+    def _load_pdf(path):
+        try:
+            with open(os.path.expanduser(path), "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    consent_pdf = _load_pdf(args.consent_pdf)
+    debrief_pdf = _load_pdf(args.debrief_pdf)
+
     models_configured = bool(args.model_a_url and args.model_b_url)
 
     with open(UI_PATH, "r", encoding="utf-8") as f:
@@ -114,6 +126,20 @@ def create_app(args) -> FastAPI:
     def healthz():
         return {"status": "ok"}
 
+    @app.get("/consent.pdf")
+    def consent_pdf_route():
+        if consent_pdf is None:
+            return JSONResponse({"error": "consent pdf not found"}, status_code=404)
+        return Response(consent_pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": "inline; filename=consent.pdf"})
+
+    @app.get("/debrief.pdf")
+    def debrief_pdf_route():
+        if debrief_pdf is None:
+            return JSONResponse({"error": "debrief pdf not found"}, status_code=404)
+        return Response(debrief_pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": "inline; filename=debrief.pdf"})
+
     @app.get("/config")
     def config():
         prefill = f"{args.form_url}?usp=pp_url&entry.{args.form_entry}=" if args.form_entry else ""
@@ -123,6 +149,9 @@ def create_app(args) -> FastAPI:
             "model_b_url": args.model_b_url or "",
             "models_configured": models_configured,
             "enable_free_chat": bool(args.enable_free_chat),
+            # PDF viewer is preferred; HTML transcription kept as a fallback when a PDF is absent.
+            "consent_pdf_url": "consent.pdf" if consent_pdf is not None else "",
+            "debrief_pdf_url": "debrief.pdf" if debrief_pdf is not None else "",
             "consent_html": consent_html,
             "instructions_html": instructions_html,
             "debrief_html": debrief_html,
@@ -172,10 +201,12 @@ def main() -> None:
     ap.add_argument("--share", action="store_true", help="Expose publicly via a gradio FRP tunnel (*.gradio.live)")
     ap.add_argument("--port", type=int, default=7870)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--title", default="Integrating Interaction, Embodiment, and Emotion to Transform Language Models")
-    ap.add_argument("--consent-file", default=None, help="HTML consent override (default data/survey/consent_irb24222.html)")
+    ap.add_argument("--title", default="Interaction with Full-Duplex Large Language Models")
+    ap.add_argument("--consent-file", default=None, help="HTML consent fallback (default data/survey/consent_irb24222.html)")
     ap.add_argument("--instructions-file", default=None, help="HTML instructions override (default data/survey/instructions.html)")
-    ap.add_argument("--debrief-file", default=None, help="HTML debrief override (default data/survey/debrief_irb24222.html)")
+    ap.add_argument("--debrief-file", default=None, help="HTML debrief fallback (default data/survey/debrief_irb24222.html)")
+    ap.add_argument("--consent-pdf", default=CONSENT_PDF, help="PDF shown in the consent step (default the IRB consent PDF)")
+    ap.add_argument("--debrief-pdf", default=DEBRIEF_PDF, help="PDF shown in the debrief step (default the IRB debrief PDF)")
     ap.add_argument("--form-url", default=DEFAULT_FORM_URL, help="Google Form URL for the questionnaires")
     ap.add_argument("--form-entry", default=DEFAULT_FORM_ENTRY, help="Form entry id of the Participant ID question ('' = no prefill)")
     ap.add_argument("--out", default="~/scratch/survey_responses", help="Directory for responses.jsonl")

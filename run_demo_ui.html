@@ -58,6 +58,8 @@
   .docbox{max-height:46vh;overflow:auto;padding:2px 10px 2px 2px;margin:12px 0;
     border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
   .docbox h2{font-size:17px} .docbox h3{font-size:16px}
+  .pdfview{width:100%;height:68vh;border:1px solid var(--line);border-radius:10px;
+    background:#fff;display:block;margin:12px 0}
   /* signature blocks */
   .sig{background:var(--card2);border:1px solid var(--line);border-radius:10px;
     padding:14px 16px;margin:10px 0}
@@ -142,6 +144,17 @@
       Participant ID should already be filled in — <b>please check that it matches the number
       above</b>, then answer the questions and press Submit in the form.</p>
     <a id="q-link" class="btnlike" target="_blank" rel="noopener">Open questionnaire ↗</a>
+
+    <div id="q-review" class="hidden" style="margin-top:18px">
+      <div class="step" style="margin-bottom:4px">Your conversation with this system</div>
+      <div class="conv-nav hidden" id="q-conv-nav">
+        <button id="q-conv-prev" title="Previous conversation">‹</button>
+        <span class="conv-label mut" id="q-conv-label">Conversation 1 of 1</span>
+        <button id="q-conv-next" title="Next conversation">›</button>
+      </div>
+      <div class="transcript" id="q-transcript"></div>
+    </div>
+
     <label style="display:block;margin:16px 0"><input type="checkbox" id="q-done">
       I have <b>submitted</b> the questionnaire form.</label>
     <button id="q-next" class="primary big" disabled>Continue</button>
@@ -178,8 +191,7 @@
     <div id="gift-reveal" class="hidden">
       <p>Show this <b>pickup PIN</b> to the researcher to collect your gift card:</p>
       <div class="pinbox" id="gift-pin">•••••</div>
-      <p class="mut">Your PIN has been recorded. It is used only to hand you the gift card in
-        person — it is <b>not</b> linked to your questionnaire answers, which remain anonymous.</p>
+      <p class="mut">Your PIN has been recorded for gift-card pickup.</p>
     </div>
     <div id="gift-done" class="hidden">
       <p class="mut" style="text-align:center">All done — you may close this window.
@@ -224,7 +236,15 @@
 //= config ==================================================================
 let CFG = {model_a_url:"", model_b_url:"", models_configured:false, enable_free_chat:false,
            consent_html:"", instructions_html:"", debrief_html:"",
+           consent_pdf_url:"", debrief_pdf_url:"",
            form_url:"", form_prefill:"", study_title:""};
+
+// Barge-in grace: when the user starts speaking, the server stalls the response and stops
+// sending audio, and we cut the buffered bot audio. Rather than cutting instantly (which made
+// the bot yield the moment it heard a syllable — not real full-duplex), let this much of the
+// already-committed audio keep playing so the bot audibly overlaps, like a natural interruption,
+// then stop. 0 = old hard-cut behaviour.
+const BARGE_IN_GRACE_S = 0.25;
 
 //= base64 <-> bytes (chunked; handles large PCM buffers) ===================
 function b64encode(bytes){
@@ -313,8 +333,8 @@ class DuplexAudio{
       this._play(m);
     } else if(m.type==="snapshot"){
       // context_version bumps exactly when the server invalidates the in-flight response
-      // (barge-in / new user speech → the text gets crossed out). Cut buffered bot audio so
-      // playback matches the crossed-out text instead of talking over the user.
+      // (barge-in / new user speech → the text gets crossed out). Cut buffered bot audio (after
+      // a short grace, see _cutAudio) so it overlaps briefly then yields instead of talking over.
       const cv = m.snapshot && m.snapshot.context_version;
       if(typeof cv==="number"){
         if(this.lastCtxVer>=0 && cv>this.lastCtxVer) this._cutAudio();
@@ -347,13 +367,16 @@ class DuplexAudio{
     this.cb.vu && this.cb.vu("bot", Math.min(1,pk*1.6));
   }
 
-  _cutAudio(){  // stop all scheduled bot audio immediately (barge-in) and reset the playhead
+  _cutAudio(){  // barge-in: let BARGE_IN_GRACE_S of buffered bot audio keep playing (natural
+                // overlap/interruption) then stop the rest; reset the playhead to the cut point.
     const now = this.ctx ? this.ctx.currentTime : 0;
-    for(const s of this.scheduled){ try{ s.node.stop(); }catch(e){ /* already stopped */ } }
+    const until = now + BARGE_IN_GRACE_S;
+    // stop(until): nodes still sounding are truncated at `until`; nodes scheduled to start after
+    // `until` produce nothing. So exactly ~BARGE_IN_GRACE_S of already-committed audio is heard.
+    for(const s of this.scheduled){ try{ s.node.stop(until); }catch(e){ /* already stopped */ } }
     this.scheduled = [];
-    this.playhead = now + 0.05;
-    this.cb.vu && this.cb.vu("bot", 0);
-    console.log("[duplex] barge-in → cut buffered bot audio");
+    this.playhead = until;
+    console.log(`[duplex] barge-in → keep ${BARGE_IN_GRACE_S}s then cut buffered bot audio`);
   }
 
   stop(){
@@ -443,10 +466,27 @@ function makeTalkPanel(mount){
     showTranscript:(b)=>{ showTr=b; renderView(); },
     isConnected:()=> !!(da&&da.alive),
     injectSnapshot:(snap)=>cb.snapshot(snap),   // test hook: feed a snapshot as if from the server
+    getConversations:()=>{ archiveLive(); return convs.filter(hasContent); },  // for the questionnaire-step review
     stats:()=>{ if(stats.started_at){ stats.talk_s+=Math.round((Date.now()-stats.started_at)/1000); stats.started_at=Date.now(); }
                 return {connected:stats.connected, ws_sessions:stats.ws_sessions, talk_s:stats.talk_s,
                         n_conversations:allT().length}; }
   };
+}
+
+//= Read-only conversation review viewer (used on the questionnaire step) ====
+function setupReview(convos, els){
+  let idx=convos.length-1;
+  function render(){
+    if(convos.length===0){ els.nav.classList.add("hidden"); els.transcript.classList.add("hidden"); return; }
+    els.nav.classList.toggle("hidden", convos.length<=1);
+    idx=Math.max(0,Math.min(idx,convos.length-1));
+    els.label.textContent=`Conversation ${idx+1} of ${convos.length}`;
+    els.prev.disabled=idx<=0; els.next.disabled=idx>=convos.length-1;
+    renderTranscript(els.transcript,{blocks:convos[idx]});
+  }
+  els.prev.onclick=()=>{ idx--; render(); };
+  els.next.onclick=()=>{ idx++; render(); };
+  render();
 }
 
 function renderTranscript(tr,snap){
@@ -496,9 +536,17 @@ function checkpoint(kind,extra){
     session_id:ST.session?ST.session.session_id:"preview"}, extra||{}));
 }
 
+//= documents: embed the original PDF when available, else the HTML transcription ===
+function injectDoc(elId, pdfUrl, html){
+  const box=document.getElementById(elId);
+  if(pdfUrl){ box.classList.remove("docbox");
+    box.innerHTML=`<iframe class="pdfview" src="${pdfUrl}" title="study document"></iframe>`; }
+  else { box.classList.add("docbox"); box.innerHTML=html || "<p>Document not configured.</p>"; }
+}
+
 //= step 1: consent =========================================================
 function initConsent(){
-  document.getElementById("consent-body").innerHTML = CFG.consent_html || "<p>Consent text not configured.</p>";
+  injectDoc("consent-body", CFG.consent_pdf_url, CFG.consent_html);
   if(CFG.study_title) document.getElementById("study-title").textContent=CFG.study_title;
   document.getElementById("consent-date").textContent="Date: "+new Date().toLocaleDateString();
   const name=document.getElementById("consent-name"), btn=document.getElementById("consent-btn");
@@ -543,15 +591,16 @@ function enterTalk(){
     const st=ST.talk.stats();
     if(!st.connected && CFG.models_configured &&
        !confirm("You haven't talked with this system yet. Continue anyway?")) return;
+    const convos=ST.talk.getConversations();   // preserve transcripts for the questionnaire-step review
     ST.talk.reset();
     await checkpoint("interact",{which:n, hidden_model:key, connected:st.connected,
       talk_s:st.talk_s, ws_sessions:st.ws_sessions, n_conversations:st.n_conversations});
-    enterQuest();
+    enterQuest(convos);
   };
 }
 
 //= steps 4/6: questionnaire ================================================
-function enterQuest(){
+function enterQuest(convos){
   const target = ST.i===2?3:5;
   showStep(target);
   const n=whichConv();
@@ -562,6 +611,15 @@ function enterQuest(){
   const link=document.getElementById("q-link");
   link.href = CFG.form_prefill ? CFG.form_prefill+encodeURIComponent(pin) : (CFG.form_url||"#");
   let opened=false; link.onclick=()=>{ opened=true; };
+  // read-only review of the conversation(s) the participant just had with this system,
+  // so they can refer back to it while filling out the questionnaire in the other tab
+  const rev=document.getElementById("q-review");
+  const list=(convos||[]).filter(c=>c && c.length);
+  if(list.length){ rev.classList.remove("hidden");
+    setupReview(list, {nav:document.getElementById("q-conv-nav"), label:document.getElementById("q-conv-label"),
+      prev:document.getElementById("q-conv-prev"), next:document.getElementById("q-conv-next"),
+      transcript:document.getElementById("q-transcript")}); }
+  else rev.classList.add("hidden");
   const done=document.getElementById("q-done"), next=document.getElementById("q-next");
   done.checked=false; next.disabled=true;
   done.onchange=()=>{ next.disabled=!done.checked; };
@@ -574,7 +632,7 @@ function enterQuest(){
 //= step 7: debrief =========================================================
 function enterDebrief(){
   showStep(6);
-  document.getElementById("debrief-body").innerHTML = CFG.debrief_html || "<p>Debrief text not configured.</p>";
+  injectDoc("debrief-body", CFG.debrief_pdf_url, CFG.debrief_html);
   document.getElementById("debrief-date").textContent="Date: "+new Date().toLocaleDateString();
   const name=document.getElementById("debrief-name"), agree=document.getElementById("debrief-agree"),
         btn=document.getElementById("debrief-btn");
