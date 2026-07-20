@@ -71,6 +71,10 @@
   .pinbox{font:700 40px/1.2 ui-monospace,Menlo,monospace;letter-spacing:.25em;text-align:center;
     background:var(--card2);border:2px dashed var(--accent);border-radius:12px;
     padding:18px 8px 18px calc(8px + .25em);margin:14px 0;user-select:all}
+  .newconv{background:var(--card2)}
+  .conv-nav{display:flex;align-items:center;justify-content:center;gap:14px;margin:16px 0 0}
+  .conv-nav button{padding:4px 16px;font-size:20px;line-height:1;background:var(--card2)}
+  .conv-nav .conv-label{font-size:13px;min-width:170px;text-align:center}
   .transcript{max-height:220px;overflow:auto;background:var(--card2);border-radius:10px;
     padding:12px;font-size:14px;margin-top:12px}
   .transcript .u{color:var(--accent2)} .transcript .b{color:var(--accent)}
@@ -174,7 +178,8 @@
     <div id="gift-reveal" class="hidden">
       <p>Show this <b>pickup PIN</b> to the researcher to collect your gift card:</p>
       <div class="pinbox" id="gift-pin">•••••</div>
-      <p class="mut">The researcher will match this PIN against the study records.</p>
+      <p class="mut">Your PIN has been recorded. It is used only to hand you the gift card in
+        person — it is <b>not</b> linked to your questionnaire answers, which remain anonymous.</p>
     </div>
     <div id="gift-done" class="hidden">
       <p class="mut" style="text-align:center">All done — you may close this window.
@@ -201,10 +206,16 @@
       <span class="mut sess" style="font-size:12px"></span>
     </div>
     <button class="startstop primary big">▶ Start</button>
+    <button class="newconv big hidden" style="margin-top:8px">🔄 Start new conversation</button>
     <div class="meter-row"><span class="lbl">You</span>
       <div class="meter you"><div class="fill"></div></div></div>
     <div class="meter-row"><span class="lbl">Bot</span>
       <div class="meter bot"><div class="fill"></div></div></div>
+    <div class="conv-nav hidden">
+      <button class="conv-prev" title="Previous conversation">‹</button>
+      <span class="conv-label mut">Conversation 1 of 1</span>
+      <button class="conv-next" title="Next conversation">›</button>
+    </div>
     <div class="transcript hidden"></div>
   </div>
 </template>
@@ -363,17 +374,39 @@ function makeTalkPanel(mount){
   const node=document.getElementById("talk-tpl").content.cloneNode(true);
   const el=node.querySelector(".talk");
   const pill=el.querySelector(".pill"), pillTxt=el.querySelector(".pill-txt");
-  const btn=el.querySelector(".startstop"), sess=el.querySelector(".sess");
+  const btn=el.querySelector(".startstop"), newBtn=el.querySelector(".newconv"), sess=el.querySelector(".sess");
   const vuYou=el.querySelector(".meter.you .fill"), vuBot=el.querySelector(".meter.bot .fill");
   const tr=el.querySelector(".transcript");
+  const nav=el.querySelector(".conv-nav"), navLabel=el.querySelector(".conv-label");
+  const navPrev=el.querySelector(".conv-prev"), navNext=el.querySelector(".conv-next");
   mount.innerHTML=""; mount.appendChild(el);
-  let da=null, url=null, decay;
+  let da=null, url=null, showTr=false;
   const stats={connected:false, ws_sessions:[], started_at:0, talk_s:0};
+  // Each WS session is one "conversation". Archived conversations are kept so the participant
+  // can scroll back and review them; the live one is appended at the end.
+  let convs=[];          // archived: array of blocks[]
+  let liveBlocks=null;   // latest snapshot.blocks of the current session
+  let viewIdx=-1;        // -1 = follow the live conversation; >=0 = pinned to a review index
+
+  const hasContent=(bl)=> !!(bl && bl.some(b=>b.user_text||b.assistant_text));
+  const allT=()=>{ const l=convs.slice(); if(liveBlocks&&liveBlocks.length) l.push(liveBlocks); return l; };
+  function archiveLive(){ if(hasContent(liveBlocks)) convs.push(liveBlocks); liveBlocks=null; }
+  function renderView(){
+    if(!showTr){ nav.classList.add("hidden"); tr.classList.add("hidden"); return; }
+    const list=allT();
+    nav.classList.toggle("hidden", list.length<=1);
+    if(list.length===0){ tr.classList.add("hidden"); return; }
+    const idx = viewIdx<0 ? list.length-1 : Math.max(0,Math.min(viewIdx,list.length-1));
+    navLabel.textContent=`Conversation ${idx+1} of ${list.length}`+(viewIdx<0?" · live":"");
+    navPrev.disabled = idx<=0; navNext.disabled = idx>=list.length-1;
+    if(hasContent(list[idx])) renderTranscript(tr,{blocks:list[idx]});
+    else tr.classList.add("hidden");
+  }
 
   function setPill(s,txt){ pill.className="pill "+s; pillTxt.textContent=txt;
-    if(s==="connected"){ btn.textContent="■ Stop / Reset"; btn.classList.remove("primary"); }
-    else if(s==="connecting"){ btn.textContent="Connecting…"; }
-    else { btn.textContent="▶ Start"; btn.classList.add("primary"); } }
+    if(s==="connected"){ btn.textContent="■ Stop"; btn.classList.remove("primary"); newBtn.classList.remove("hidden"); }
+    else if(s==="connecting"){ btn.textContent="Connecting…"; newBtn.classList.add("hidden"); }
+    else { btn.textContent="▶ Start"; btn.classList.add("primary"); newBtn.classList.add("hidden"); } }
 
   const cb={
     state:(s,txt)=>{ setPill(s,txt);
@@ -381,27 +414,38 @@ function makeTalkPanel(mount){
       if(s==="disconnected" && stats.started_at){ stats.talk_s+=Math.round((Date.now()-stats.started_at)/1000); stats.started_at=0; } },
     session:(s)=>{ sess.textContent="session "+s; stats.ws_sessions.push(s); },
     vu:(who,v)=>{ (who==="you"?vuYou:vuBot).style.width=(v*100).toFixed(0)+"%"; },
-    snapshot:(snap)=>{ renderTranscript(tr,snap); }
+    snapshot:(snap)=>{ liveBlocks=(snap&&snap.blocks)||[]; if(viewIdx<0) renderView(); }
   };
   // slow decay for bot meter so it looks alive
-  decay=setInterval(()=>{ [vuYou,vuBot].forEach(f=>{ const w=parseFloat(f.style.width)||0;
+  setInterval(()=>{ [vuYou,vuBot].forEach(f=>{ const w=parseFloat(f.style.width)||0;
     if(w>0) f.style.width=Math.max(0,w-6)+"%"; }); },80);
 
+  function startFresh(){ if(!url){ setPill("error","No system connected"); return; }
+    viewIdx=-1; liveBlocks=null; renderView(); da=new DuplexAudio(url,cb); da.start(); }
+
   btn.onclick=()=>{
-    if(da && da.alive){ da.stop(); da=null; }
-    else {
-      if(!url){ setPill("error","No system connected"); return; }
-      da=new DuplexAudio(url,cb); da.start();
-    }
+    if(da && da.alive){ da.stop(); da=null; archiveLive(); viewIdx=-1; renderView(); }
+    else startFresh();
   };
+  // Disconnect the current WS + reconnect fresh (new server session), resetting the live
+  // transcript. The previous conversation is archived and stays reviewable via the nav.
+  newBtn.onclick=()=>{ if(da){ da.stop(); da=null; } archiveLive(); setTimeout(startFresh,350); };
+  navPrev.onclick=()=>{ const list=allT(); const idx=viewIdx<0?list.length-1:viewIdx;
+    viewIdx=Math.max(0,idx-1); renderView(); };
+  navNext.onclick=()=>{ const list=allT(); const idx=viewIdx<0?list.length-1:viewIdx;
+    viewIdx=(idx+1>=list.length-1)?-1:idx+1; renderView(); };  // stepping to the end = follow live
+
   return {
     setUrl:(u)=>{ url=u; },
-    reset:()=>{ if(da){da.stop();da=null;} setPill("disconnected","Disconnected");
+    reset:()=>{ if(da){da.stop();da=null;} convs=[]; liveBlocks=null; viewIdx=-1;
+                setPill("disconnected","Disconnected"); nav.classList.add("hidden");
                 tr.classList.add("hidden"); tr.innerHTML=""; },
-    showTranscript:(b)=>{ tr.classList.toggle("hidden",!b); },
+    showTranscript:(b)=>{ showTr=b; renderView(); },
     isConnected:()=> !!(da&&da.alive),
+    injectSnapshot:(snap)=>cb.snapshot(snap),   // test hook: feed a snapshot as if from the server
     stats:()=>{ if(stats.started_at){ stats.talk_s+=Math.round((Date.now()-stats.started_at)/1000); stats.started_at=Date.now(); }
-                return {connected:stats.connected, ws_sessions:stats.ws_sessions, talk_s:stats.talk_s}; }
+                return {connected:stats.connected, ws_sessions:stats.ws_sessions, talk_s:stats.talk_s,
+                        n_conversations:allT().length}; }
   };
 }
 
@@ -491,7 +535,7 @@ function enterTalk(){
   const noconf=document.getElementById("talk-noconf");
   noconf.classList.toggle("hidden", CFG.models_configured);
   ST.talk=makeTalkPanel(document.getElementById("talk-mount"));
-  ST.talk.showTranscript(false);
+  ST.talk.showTranscript(true);   // live transcript visible; review nav appears with >1 conversation
   const key = ST.session ? ST.session.order[n-1] : (n===1?"A":"B");
   ST.talk.setUrl(key==="A" ? (CFG.model_a_url||null) : (CFG.model_b_url||null));
   const next=document.getElementById("talk-next");
@@ -501,7 +545,7 @@ function enterTalk(){
        !confirm("You haven't talked with this system yet. Continue anyway?")) return;
     ST.talk.reset();
     await checkpoint("interact",{which:n, hidden_model:key, connected:st.connected,
-      talk_s:st.talk_s, ws_sessions:st.ws_sessions});
+      talk_s:st.talk_s, ws_sessions:st.ws_sessions, n_conversations:st.n_conversations});
     enterQuest();
   };
 }
