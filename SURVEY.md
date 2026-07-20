@@ -1,78 +1,73 @@
-# Survey / demo front-end (`run_demo.py`)
+# In-person study front-end (`run_demo.py`) — IRB24-222 protocol
 
-A clean, non-gradio web front-end for running a human evaluation of the full-duplex voice
-model. It serves one self-contained page that talks the duplex WebSocket protocol **directly**
-to one or two running model backends (`server.py --share` URLs). No gradio UI; optional FRP
-tunnel for public access.
+A clean, non-gradio web front-end for the supervised human study of the full-duplex voice
+model. It serves one self-contained page (`run_demo_ui.html`) that talks the duplex
+WebSocket protocol **directly** to two running model backends (`server.py --share` URLs).
+No gradio UI; optional FRP tunnel for public access.
+
+## Participant flow (one supervised session)
+
+1. **Informed consent** (IRB24-222, `data/survey/consent_irb24222.html`) — typed name +
+   a **separate agreement checkbox per system** (System 1 / System 2), both required.
+2. **Instructions** (`data/survey/instructions.html` — team-drafted, edit freely).
+3. **Talk with System 1** — Start/Stop panel with connection pill + You/Bot volume meters.
+4. **Questionnaire 1** — a 5-digit **Participant ID PIN** is shown, plus a link to the
+   Google Form with the PIN pre-filled (`?usp=pp_url&entry.156546644=<PIN>`). The
+   participant confirms submission before continuing.
+5. **Talk with System 2** → **Questionnaire 2** (its own PIN).
+6. **Debriefing statement** (`data/survey/debrief_irb24222.html`) — typed-name signature.
+7. **Gift card** (optional) — a third 5-digit **pickup PIN** is revealed and saved;
+   matched in person by the researcher before handing out the card.
+
+The A/B order is blinded, chosen server-side per session, and recorded. All three PINs are
+allocated server-side (`/session`) and guaranteed unique across the out-dir's history.
 
 ## Run it
 
 ```bash
-# A/B survey (both systems), exposed publicly:
+# full study (A vs B), exposed publicly:
 python run_demo.py \
   --model_a_url wss://<systemA>.gradio.live/ws \
   --model_b_url wss://<systemB>.gradio.live/ws \
   --share
 
-# add a free-chat tab (pick a system and just talk, no survey):
-python run_demo.py --model_a_url ... --model_b_url ... --enable_free_chat --share
+# UI review without models (talk steps show a "not connected" banner):
+python run_demo.py --share
 
-# local free-chat only (survey auto-disabled with <2 models):
-python run_demo.py --model_a_url ws://127.0.0.1:8998/ws --enable_free_chat --port 7870
+# dev free-chat view (small link, top-right):
+python run_demo.py --model_a_url ... --model_b_url ... --enable_free_chat --share
 ```
 
-Give participants the printed `[share] public URL`. Backends are stood up separately with
-`server.py --cpm --share` (one per system, e.g. base vs RL-trained).
+Useful flags: `--consent-file/--instructions-file/--debrief-file` (HTML overrides for the
+`data/survey/` defaults), `--form-url`/`--form-entry` (Google Form + Participant-ID entry
+id; `--form-entry ''` disables prefill), `--title`, `--port`, `--out`.
 
-| Flag | Meaning |
-|---|---|
-| `--model_a_url` / `--model_b_url` | WS URLs of the systems. **Survey needs both.** |
-| `--enable_free_chat` | Adds a "Free chat" tab with a system picker. |
-| `--share` | Expose via `*.gradio.live` FRP tunnel (no gradio UI). |
-| `--out DIR` | Where `responses.jsonl` is written (default `~/scratch/survey_responses`). |
-| `--consent-file FILE` | HTML consent text (overrides the built-in draft). |
-| `--questions-file FILE` | JSON `{"likert":[...],"compare":[...]}` (overrides defaults). |
-| `--title` | Study title shown at the top. |
+`?preview=[instructions|talk|quest|debrief|gift]` jumps to a step with fake PINs and posts
+nothing (for screenshots/review); `?autostart` clicks Start automatically.
 
-Preview the UI without any backend: open `/?preview=survey`, `/?preview=rate`, or
-`/?preview=freechat`.
+## Data (`--out`, default `~/scratch/survey_responses/responses.jsonl`)
 
-## Participant flow
+One JSON line per event, all linked by `session_id`:
 
-1. **Informed-consent gate** — consent text + a required checkbox; "Agree & Continue" is
-   disabled until it's ticked.
-2. **Blinded A/B survey** — talk to each system (order randomised, shown as "System 1/2"):
-   one **Start / Stop-Reset** button, a live connection pill (Disconnected → Connecting →
-   Connected), and **You / Bot volume meters**. Then rate that system.
-3. **Comparison + optional demographics**, then responses are saved.
+- `session_start` — `pin_q1`, `pin_q2`, `pin_gift`, `order` (order[0] = what the
+  participant sees as "System 1"; `A`/`B` = `--model_a_url`/`--model_b_url`), `ua`.
+- `consent` — `name`, `agree_system1`, `agree_system2`, `ts`.
+- `interact` — `which` (1|2), `hidden_model`, `connected`, `talk_s`, `ws_sessions`.
+- `questionnaire` — `which`, `pin`, `opened_form`.
+- `debrief` — `name`, `acknowledged`.
+- `gift` — `wants_gift`, `pin` (only if wanted).
 
-## Consent form — IMPORTANT
+Questionnaire answers live in the **Google Form** responses; join them to sessions on the
+Participant ID field (= `pin_q1`/`pin_q2`). Each step checkpoints immediately, so a session
+that dies midway still leaves consent/PINs/order on disk.
 
-The built-in consent (`DEFAULT_CONSENT_HTML` in `run_demo.py`) is a **DRAFT template** with
-`[BRACKETED]` placeholders. It is **not** a substitute for your IRB-approved document. Before
-collecting real data, replace it with the advisor's approved consent via `--consent-file`
-(and confirm human-subjects training / CITI is on file). The checkbox records voluntary,
-informed agreement (18+), timestamped with each submission.
+## Notes
 
-## Data collected (`responses.jsonl`, one JSON object per submission)
-
-| Field | Meaning |
-|---|---|
-| `id`, `received_at`, `ts` | server id/time, client ISO time |
-| `kind` | `"survey"` |
-| `consent` | `true` (gate was passed) |
-| `order` | e.g. `["B","A"]` — which hidden model was shown as System 1 vs 2 (blinding key) |
-| `duration_s` | wall-clock length of the session |
-| `sessions[]` | per system: `system_label`, `hidden_model` (A/B), `ratings` (Likert answers) |
-| `comparison` | preference + optional demographics + free-text comments |
-| `ua` | browser user-agent |
-
-No names/contact info and no audio are stored by the survey; audio is only streamed to run
-the conversation. Analyse by mapping `hidden_model` → actual system (base vs trained).
-
-## Default questionnaire
-
-Per system (1–5, strongly disagree→agree): timing felt natural · responded promptly ·
-avoided interrupting · responses relevant · overall smooth/human-like. Final comparison:
-which felt more natural · which handled turn-taking better · age · native English · voice-
-assistant experience · comments. Edit via `--questions-file`.
+- The consent and debrief HTML are faithful transcriptions of the IRB-approved PDFs in
+  `data/survey/` — don't reword them without checking against the PDFs.
+- The instructions page is a study-team draft (not an IRB document) — edit freely.
+- The Google Form (`B - Cozmo`, forms.gle/jymtgBkestfN8QPK9) must keep "Participant ID" as
+  its first question; if the form is rebuilt, update `--form-entry` (find the new
+  `entry.<id>` in the form page source, `FB_PUBLIC_LOAD_DATA_`).
+- Backends are picked with `--model_a_url/--model_b_url`; keep serving **bf16** (fp8 breaks
+  the idle decision) and one vLLM per GPU.
