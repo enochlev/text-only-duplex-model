@@ -74,6 +74,19 @@
     background:var(--card2);border:2px dashed var(--accent);border-radius:12px;
     padding:18px 8px 18px calc(8px + .25em);margin:14px 0;user-select:all}
   .newconv{background:var(--card2)}
+  /* conversation timer / progress bar */
+  .timer-row{margin:16px 0 2px}
+  .timer-bar{height:10px;border-radius:6px;background:var(--card2);overflow:hidden}
+  .timer-fill{height:100%;width:0%;border-radius:6px;transition:width .3s linear,background .3s}
+  .timer-fill.grey{background:#6b7280} .timer-fill.green{background:var(--ok)}
+  .timer-fill.yellow{background:var(--warn)} .timer-fill.red{background:var(--bad)}
+  .timer-label{font-size:13px;margin-top:5px;text-align:right}
+  /* in-conversation instructions dropdown */
+  .instr-drop{margin:12px 0;background:var(--card2);border:1px solid var(--line);
+    border-radius:10px;padding:9px 13px}
+  .instr-drop summary{cursor:pointer;font-weight:600;font-size:14px;color:var(--accent2)}
+  .instr-drop[open] summary{margin-bottom:8px}
+  .instr-drop h2{font-size:16px} .instr-drop h3{font-size:15px}
   .conv-nav{display:flex;align-items:center;justify-content:center;gap:14px;margin:16px 0 0}
   .conv-nav button{padding:4px 16px;font-size:20px;line-height:1;background:var(--card2)}
   .conv-nav .conv-label{font-size:13px;min-width:170px;text-align:center}
@@ -126,11 +139,20 @@
   <section id="st-talk" class="card hidden">
     <span class="step">Conversation <span id="talk-idx">1</span> of 2</span>
     <h2 id="talk-name">System 1</h2>
-    <p class="mut">Press <b>Start</b>, allow the microphone, and talk naturally.
-      Press <b>Stop</b> when the researcher tells you the time is up.</p>
+    <p class="mut">Press <b>Start</b>, allow the microphone, and talk naturally. Aim for
+      3–5 minutes; press <b>Stop</b> whenever you're done (it ends automatically at 5 min).</p>
+    <details id="talk-instr" class="instr-drop">
+      <summary>Show instructions</summary>
+      <div id="talk-instr-body"></div>
+    </details>
     <div id="talk-noconf" class="banner hidden">This system is not connected yet — the
       researcher has not configured the model URLs. (UI review mode.)</div>
     <div id="talk-mount"></div>
+    <div id="talk-timer" class="timer-row hidden">
+      <div class="timer-bar"><div class="timer-fill grey" id="timer-fill"></div></div>
+      <div class="timer-label"><span id="timer-elapsed">0:00</span>
+        <span class="mut">/ 5:00 — aim for 3–5 min</span></div>
+    </div>
     <button id="talk-next" class="big" style="margin-top:12px">I'm done talking → questionnaire</button>
   </section>
 
@@ -467,6 +489,9 @@ function makeTalkPanel(mount){
     isConnected:()=> !!(da&&da.alive),
     injectSnapshot:(snap)=>cb.snapshot(snap),   // test hook: feed a snapshot as if from the server
     getConversations:()=>{ archiveLive(); return convs.filter(hasContent); },  // for the questionnaire-step review
+    lock:(msg)=>{ if(da){ da.stop(); da=null; } archiveLive();   // timer cap: disconnect but KEEP convs
+      btn.disabled=true; btn.classList.remove("primary"); btn.textContent=msg||"Time's up";
+      newBtn.classList.add("hidden"); viewIdx=-1; renderView(); },
     stats:()=>{ if(stats.started_at){ stats.talk_s+=Math.round((Date.now()-stats.started_at)/1000); stats.started_at=Date.now(); }
                 return {connected:stats.connected, ws_sessions:stats.ws_sessions, talk_s:stats.talk_s,
                         n_conversations:allT().length}; }
@@ -507,7 +532,7 @@ const STEPS=["consent","instructions","talk","quest","talk","quest","debrief","g
 const STEP_LABELS=["Consent","Instructions","System 1","Questionnaire 1","System 2","Questionnaire 2","Debriefing","Finish"];
 const ST={ i:0,                       // current step index into STEPS
            session:null,              // {session_id, pin_q1, pin_q2, pin_gift, order}
-           talk:null, preview:false };
+           talk:null, talkTimer:null, preview:false };
 
 function showStep(i){
   ST.i=i;
@@ -580,21 +605,45 @@ function enterTalk(){
   const n=whichConv();
   document.getElementById("talk-idx").textContent=n;
   document.getElementById("talk-name").textContent="System "+n;
+  document.getElementById("talk-instr-body").innerHTML = CFG.instructions_html || "";
+  document.getElementById("talk-instr").open=false;
   const noconf=document.getElementById("talk-noconf");
   noconf.classList.toggle("hidden", CFG.models_configured);
   ST.talk=makeTalkPanel(document.getElementById("talk-mount"));
   ST.talk.showTranscript(true);   // live transcript visible; review nav appears with >1 conversation
   const key = ST.session ? ST.session.order[n-1] : (n===1?"A":"B");
   ST.talk.setUrl(key==="A" ? (CFG.model_a_url||null) : (CFG.model_b_url||null));
+
+  // conversation timer: starts on first connect, wall-clock. grey → green(≥3 min, goal met)
+  // → yellow(last 45 s) → red(5 min: auto-disconnect + lock so this system can't be re-run).
+  const CAP=300, WARN=255, GOAL=180;
+  const fill=document.getElementById("timer-fill"), elapsedEl=document.getElementById("timer-elapsed");
+  const row=document.getElementById("talk-timer");
+  row.classList.remove("hidden"); fill.className="timer-fill grey"; fill.style.width="0%"; elapsedEl.textContent="0:00";
+  if(ST.talkTimer){ clearInterval(ST.talkTimer); ST.talkTimer=null; }
+  let started=0, locked=false;
+  ST.talkTimer=setInterval(()=>{
+    if(!started){ if(ST.talk && ST.talk.isConnected()) started=Date.now(); else return; }
+    const s=Math.floor((Date.now()-started)/1000);
+    fill.style.width=Math.min(100, s/CAP*100)+"%";
+    fill.className="timer-fill "+(s>=CAP?"red":s>=WARN?"yellow":s>=GOAL?"green":"grey");
+    elapsedEl.textContent=Math.floor(s/60)+":"+String(s%60).padStart(2,"0");
+    if(s>=CAP && !locked){ locked=true; ST.talk.lock("Time's up — 5 min reached");
+      clearInterval(ST.talkTimer); ST.talkTimer=null; }
+  },250);
+
   const next=document.getElementById("talk-next");
   next.onclick=async ()=>{
     const st=ST.talk.stats();
     if(!st.connected && CFG.models_configured &&
        !confirm("You haven't talked with this system yet. Continue anyway?")) return;
+    if(ST.talkTimer){ clearInterval(ST.talkTimer); ST.talkTimer=null; }
+    row.classList.add("hidden");
     const convos=ST.talk.getConversations();   // preserve transcripts for the questionnaire-step review
     ST.talk.reset();
     await checkpoint("interact",{which:n, hidden_model:key, connected:st.connected,
-      talk_s:st.talk_s, ws_sessions:st.ws_sessions, n_conversations:st.n_conversations});
+      talk_s:st.talk_s, ws_sessions:st.ws_sessions, n_conversations:st.n_conversations,
+      timer_s: started ? Math.floor((Date.now()-started)/1000) : 0});
     enterQuest(convos);
   };
 }
