@@ -721,7 +721,9 @@ function enterTalkInperson(n, key){
       // should see "connected — start talking" even before any speech is transcribed
       robotUp = !!(r.robot_alive && r.robot_connected);
       if(robotUp) everUp=true;
-      if(gotSnap && robotUp) setPill("connected","Live — talking with the robot");
+      if(r.robot_error && !robotUp)
+                             setPill("error","Robot connection issue — retrying automatically…");
+      else if(gotSnap && robotUp) setPill("connected","Live — talking with the robot");
       else if(robotUp)       setPill("connected","Robot connected — start talking!");
       else if(r.robot_alive) setPill("connecting","Robot is connecting…");
       else                   setPill("connecting","Waiting for the robot…");

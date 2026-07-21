@@ -174,18 +174,47 @@ def run_slot(slot: str, url: str):
     for m in modules:
         m.run()
 
+    def relay(extra=None):
+        """POST heartbeat/snapshot; returns the wizard's current active_slot ('?' if unreachable)."""
+        connected = bool(duplex.client is not None and duplex.client.connected)
+        payload = {"snapshot": snapshot_payload(duplex), "connected": connected}
+        if extra:
+            payload.update(extra)
+        try:
+            return requests.post(f"{SURVEY_URL}/live_snapshot", json=payload, timeout=3).json().get("active_slot")
+        except Exception as exc:
+            print(f"[inperson] wizard unreachable ({exc}); retrying")
+            return "?"
+
     try:
+        # Wait for the duplex WS to actually connect. prepare_run() raises inside a
+        # retico thread (e.g. a transient tunnel 404), which would otherwise leave a
+        # zombie pipeline and a wizard stuck on "connecting". Timeout → teardown →
+        # the outer loop re-activates us while the slot is still live (auto-retry).
+        deadline = time.time() + 25
+        while not (duplex.client is not None and duplex.client.connected):
+            if time.time() > deadline:
+                print(f"[inperson] could not connect to {url} within 25s — will retry")
+                relay({"error": "robot could not reach the model server — retrying"})
+                return
+            active = relay()
+            if active not in (slot, "?"):
+                print(f"[inperson] slot {slot} deactivated while connecting")
+                return
+            time.sleep(1)
+
+        was_connected = True
         while True:
             time.sleep(SNAPSHOT_S)
             connected = bool(duplex.client is not None and duplex.client.connected)
-            payload = {"snapshot": snapshot_payload(duplex), "connected": connected}
-            try:
-                r = requests.post(f"{SURVEY_URL}/live_snapshot", json=payload, timeout=3)
-                active = r.json().get("active_slot")
-            except Exception as exc:
-                print(f"[inperson] wizard unreachable ({exc}); retrying")
-                continue
-            if active != slot:
+            if was_connected and not connected:
+                # tunnel/server dropped mid-session: tear down and let the outer
+                # loop reconnect fresh (the wizard keeps the slot active)
+                print("[inperson] connection lost — tearing down to reconnect")
+                relay({"error": "robot lost the model connection — reconnecting"})
+                return
+            active = relay()
+            if active not in (slot, "?"):
                 print(f"[inperson] slot {slot} deactivated (now {active})")
                 return
     finally:

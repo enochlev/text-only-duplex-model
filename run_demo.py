@@ -134,7 +134,7 @@ def create_app(args) -> FastAPI:
     # mic→duplex→Misty pipeline to that slot's server, and pushes transcript
     # snapshots to /live_snapshot, which the wizard polls to render live.
     live = {"active_slot": None, "snapshot": None, "snapshot_ts": 0.0,
-            "robot_ts": 0.0, "robot_connected": False}
+            "robot_ts": 0.0, "robot_connected": False, "robot_error": None}
 
     @app.post("/live_control")
     async def live_control(request: Request):
@@ -150,6 +150,7 @@ def create_app(args) -> FastAPI:
         live["active_slot"] = slot
         live["snapshot"] = None  # fresh talk step → don't show the previous system's transcript
         live["snapshot_ts"] = 0.0
+        live["robot_error"] = None
         print(f"[inperson] active_slot → {slot}")
         return {"ok": True, "active_slot": slot}
 
@@ -168,6 +169,11 @@ def create_app(args) -> FastAPI:
         # every POST is a robot-client heartbeat, snapshot or not
         live["robot_ts"] = time.time()
         live["robot_connected"] = bool(body.get("connected"))
+        if body.get("error"):
+            live["robot_error"] = str(body["error"])
+            print(f"[inperson] robot error: {live['robot_error']}")
+        elif live["robot_connected"]:
+            live["robot_error"] = None  # recovered
         if body.get("snapshot") is not None:
             live["snapshot"] = body["snapshot"]
             live["snapshot_ts"] = time.time()
@@ -180,7 +186,8 @@ def create_app(args) -> FastAPI:
                 "active_slot": live["active_slot"],
                 # robot client is "alive" if it POSTed within the last 5 s
                 "robot_alive": (time.time() - live["robot_ts"]) < 5.0,
-                "robot_connected": live["robot_connected"]}
+                "robot_connected": live["robot_connected"],
+                "robot_error": live["robot_error"]}
 
     @app.get("/consent.pdf")
     def consent_pdf_route():
