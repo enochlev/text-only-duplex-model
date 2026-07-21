@@ -176,7 +176,8 @@ def run_slot(slot: str, url: str):
     try:
         while True:
             time.sleep(SNAPSHOT_S)
-            payload = {"snapshot": snapshot_payload(duplex)}
+            connected = bool(duplex.client is not None and duplex.client.connected)
+            payload = {"snapshot": snapshot_payload(duplex), "connected": connected}
             try:
                 r = requests.post(f"{SURVEY_URL}/live_snapshot", json=payload, timeout=3)
                 active = r.json().get("active_slot")

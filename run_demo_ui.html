@@ -684,7 +684,7 @@ function enterTalkInperson(n, key){
         tr=wrap.querySelector(".transcript");
   const setPill=(s,txt)=>{ pill.className="pill "+s; pillTxt.textContent=txt; };
 
-  let lastSnap=null, gotSnap=false, ended=false;
+  let lastSnap=null, gotSnap=false, robotUp=false, ended=false;
   post("live_control",{active_slot:key});
   const deactivate=()=>post("live_control",{active_slot:null});
 
@@ -692,17 +692,25 @@ function enterTalkInperson(n, key){
   ST.inpersonPoll=setInterval(async ()=>{
     try{
       const r=await (await fetch("live_snapshot")).json();
+      // pill tracks the robot client's heartbeat, not the transcript: the participant
+      // should see "connected — start talking" even before any speech is transcribed
+      if(!ended){
+        robotUp = !!(r.robot_alive && r.robot_connected);
+        if(gotSnap && robotUp) setPill("connected","Live — talking with the robot");
+        else if(robotUp)       setPill("connected","Robot connected — start talking!");
+        else if(r.robot_alive) setPill("connecting","Robot is connecting…");
+        else                   setPill("connecting","Waiting for the robot…");
+      }
       if(r.snapshot && r.snapshot.blocks){
         lastSnap=r.snapshot;
-        if(!gotSnap && r.snapshot.blocks.some(b=>b.user_text||b.assistant_text)){
-          gotSnap=true; setPill("connected","Live — talking with the robot"); }
+        if(!gotSnap && r.snapshot.blocks.some(b=>b.user_text||b.assistant_text)) gotSnap=true;
         renderTranscript(tr, r.snapshot);
       }
     }catch(e){ /* local server hiccup; keep polling */ }
   },1000);
   const stopPolling=()=>{ if(ST.inpersonPoll){ clearInterval(ST.inpersonPoll); ST.inpersonPoll=null; } };
 
-  const elapsed = startTalkTimer(()=>gotSnap, ()=>{
+  const elapsed = startTalkTimer(()=>robotUp, ()=>{
     ended=true; stopPolling(); deactivate();
     setPill("disconnected","Time's up — 5 min reached");
   });
@@ -715,8 +723,8 @@ function enterTalkInperson(n, key){
     if(!ended) deactivate();
     const convos = lastSnap && lastSnap.blocks &&
       lastSnap.blocks.some(b=>b.user_text||b.assistant_text) ? [lastSnap.blocks] : [];
-    await checkpoint("interact",{which:n, hidden_model:key, connected:gotSnap,
-      inperson:true, timer_s: elapsed(),
+    await checkpoint("interact",{which:n, hidden_model:key, connected:(robotUp||gotSnap),
+      had_text:gotSnap, inperson:true, timer_s: elapsed(),
       n_blocks: lastSnap && lastSnap.blocks ? lastSnap.blocks.length : 0});
     enterQuest(convos);
   };

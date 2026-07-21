@@ -131,7 +131,8 @@ def create_app(args) -> FastAPI:
     # /live_control; retico/inperson.py polls /inperson_target, connects the
     # mic→duplex→Misty pipeline to that slot's server, and pushes transcript
     # snapshots to /live_snapshot, which the wizard polls to render live.
-    live = {"active_slot": None, "snapshot": None, "snapshot_ts": 0.0}
+    live = {"active_slot": None, "snapshot": None, "snapshot_ts": 0.0,
+            "robot_ts": 0.0, "robot_connected": False}
 
     @app.post("/live_control")
     async def live_control(request: Request):
@@ -162,6 +163,9 @@ def create_app(args) -> FastAPI:
             body = await request.json()
         except Exception:
             return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+        # every POST is a robot-client heartbeat, snapshot or not
+        live["robot_ts"] = time.time()
+        live["robot_connected"] = bool(body.get("connected"))
         if body.get("snapshot") is not None:
             live["snapshot"] = body["snapshot"]
             live["snapshot_ts"] = time.time()
@@ -171,7 +175,10 @@ def create_app(args) -> FastAPI:
     @app.get("/live_snapshot")
     def get_live_snapshot():
         return {"snapshot": live["snapshot"], "ts": live["snapshot_ts"],
-                "active_slot": live["active_slot"]}
+                "active_slot": live["active_slot"],
+                # robot client is "alive" if it POSTed within the last 5 s
+                "robot_alive": (time.time() - live["robot_ts"]) < 5.0,
+                "robot_connected": live["robot_connected"]}
 
     @app.get("/consent.pdf")
     def consent_pdf_route():
