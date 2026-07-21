@@ -325,7 +325,10 @@ class DuplexAudio{
     console.log("[duplex] opening WS", this.url);
     let ws; try{ ws=new WebSocket(this.url); }catch(e){ console.error("[duplex] WS ctor threw", e); this.setState("error","Bad URL"); this.stop(); return; }
     this.ws=ws;
-    ws.onopen = ()=>{ console.log("[duplex] WS open → hello"); ws.send(JSON.stringify({type:"hello",session_id:null,client:"web-survey"})); };
+    ws.onopen = ()=>{ console.log("[duplex] WS open → hello");
+      // lite_snapshots: the page only renders snapshot text; skipping the embedded base64
+      // audio previews keeps megabyte snapshot frames from delaying audio over the tunnel
+      ws.send(JSON.stringify({type:"hello",session_id:null,client:"web-survey",lite_snapshots:true})); };
     ws.onerror = (e)=>{ console.error("[duplex] WS error", e); this.setState("error","Connection error"); };
     ws.onclose = (e)=>{ console.warn("[duplex] WS close", e && e.code, e && e.reason);
       if(this.alive){ this.alive=false; this.setState("disconnected","Disconnected"); }

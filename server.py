@@ -53,6 +53,11 @@ class DuplexSession:
         self.lock = threading.Lock()
         self._last_snapshot_key = None
         self._last_warning_seq = 0
+        # hello {"lite_snapshots": true} → periodic snapshots skip the embedded base64
+        # audio previews. Measured over the gradio tunnel: full snapshots were ~30x the
+        # actual audio traffic (29.5 MB vs 0.95 MB in a 22 s session) and head-of-line
+        # blocked the audio_chunk frames into multi-second bursts.
+        self.lite_snapshots = False
         # --record: buffer raw mic-in and bot-out audio (+ block trace) for offline
         # replay/eval of iterated models. Flushed to WAV+JSON on disconnect.
         self._record_dir = record_dir
@@ -94,6 +99,7 @@ class DuplexSession:
             self.session_id,
             self.agent,
             started_at=self.started_at,
+            audio_preview_blocks=0 if self.lite_snapshots else 8,
         )
         return {
             "type": "snapshot",
@@ -190,6 +196,7 @@ class DuplexSession:
                         self.session_id,
                         self.agent,
                         started_at=self.started_at,
+                        audio_preview_blocks=0 if self.lite_snapshots else 8,
                     ).to_dict(),
                 }
             return snapshot
@@ -345,6 +352,7 @@ def create_app(
                 manager.get_or_create,
                 hello.get("session_id"),
             )
+            session.lite_snapshots = bool(hello.get("lite_snapshots"))
             await websocket.send_text(
                 json.dumps(
                     {

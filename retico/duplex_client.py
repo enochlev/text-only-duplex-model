@@ -55,6 +55,7 @@ class FullDuplexClient:
         *,
         session_id: Optional[str] = None,
         client_name: str = "python-api",
+        lite_snapshots: bool = False,
     ) -> str:
         if self.connected:
             return self.session_id or ""
@@ -78,6 +79,9 @@ class FullDuplexClient:
                 "type": "hello",
                 "session_id": session_id,
                 "client": client_name,
+                # skip base64 audio previews in periodic snapshots (30x less tunnel
+                # traffic; audio_chunk frames stop queueing behind snapshot frames)
+                "lite_snapshots": lite_snapshots,
             }
         )
         if not self._ready_event.wait(timeout=self.open_timeout):

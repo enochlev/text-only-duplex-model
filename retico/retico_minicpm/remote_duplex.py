@@ -80,6 +80,7 @@ class MiniCPMDuplexModule(abstract.AbstractModule):
         wav_sample_rate: int = 16000,
         wav_flush_interval_s: float = 5.0,
         debug_audio: bool = True,
+        lite_snapshots: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -87,6 +88,7 @@ class MiniCPMDuplexModule(abstract.AbstractModule):
         self.poll_interval_s = poll_interval_s
         self.client_name = client_name
         self.open_timeout = open_timeout
+        self.lite_snapshots = lite_snapshots
 
         self.debug_audio = debug_audio
         self._fmt_logged = False
@@ -253,7 +255,8 @@ class MiniCPMDuplexModule(abstract.AbstractModule):
     # ------------------------------------------------------------------ #
     def prepare_run(self):
         self.client = FullDuplexClient(self.server_url, open_timeout=self.open_timeout)
-        session_id = self.client.connect(client_name=self.client_name)
+        session_id = self.client.connect(client_name=self.client_name,
+                                         lite_snapshots=self.lite_snapshots)
         print(f"[RemoteDuplex] connected to {self.client.server_url} (session={session_id})")
 
         self._running = True

@@ -158,7 +158,8 @@ def run_slot(slot: str, url: str):
     resampler = ResampleModule(target_rate=TARGET_RATE)
     hush = build_hush()
     duplex = MiniCPMDuplexModule(server_url=url,
-                                 wav_path=f"debug_wavs/inperson_{ts}_{slot}.wav")
+                                 wav_path=f"debug_wavs/inperson_{ts}_{slot}.wav",
+                                 lite_snapshots=True)  # text-only snapshots: 30x less tunnel traffic
     speaker = MistySpeakerModule(ip=MISTY_IP, sample_rate=16000, volume=20)
 
     mic.subscribe(resampler)
