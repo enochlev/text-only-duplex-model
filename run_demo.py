@@ -41,6 +41,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_PATH = os.path.join(HERE, "run_demo_ui.html")
 DOC_DIR = os.path.join(HERE, "data", "survey")
+# default results dir: results/ next to this file (NOT cwd-dependent). Gitignored —
+# responses.jsonl contains participant names/emails.
+DEFAULT_OUT = os.path.join(HERE, "results")
 CONSENT_PDF = os.path.join(DOC_DIR, "IRB informed consent form.pdf")
 DEBRIEF_PDF = os.path.join(DOC_DIR, "IRB debriefing statement.pdf")
 
@@ -278,7 +281,8 @@ def main() -> None:
     ap.add_argument("--form-url", default=DEFAULT_FORM_URL, help="Google Form URL for the questionnaires")
     ap.add_argument("--form-entry", default=DEFAULT_FORM_ENTRY, help="Form entry id of the Participant ID question ('' = no prefill)")
     ap.add_argument("--gift-amount", default=None, help="Gift-card amount shown to participants (default: $10 in-person, $5 online)")
-    ap.add_argument("--out", default="~/scratch/survey_responses", help="Directory for responses.jsonl")
+    ap.add_argument("--out", default=DEFAULT_OUT,
+                    help="Directory for responses.jsonl (default: results/ next to run_demo.py)")
     args = ap.parse_args()
 
     if not (args.model_a_url and args.model_b_url):

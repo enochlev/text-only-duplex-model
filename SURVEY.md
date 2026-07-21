@@ -51,7 +51,7 @@ id; `--form-entry ''` disables prefill), `--title`, `--port`, `--out`.
 `?preview=[instructions|talk|quest|debrief|gift]` jumps to a step with fake PINs and posts
 nothing (for screenshots/review); `?autostart` clicks Start automatically.
 
-## Data (`--out`, default `~/scratch/survey_responses/responses.jsonl`)
+## Data (`--out`, default `results/responses.jsonl` next to run_demo.py — gitignored, contains names/emails)
 
 One JSON line per event, all linked by `session_id`:
 
@@ -96,7 +96,7 @@ is archived separately for the review). It also disconnects on "I'm done" or the
 5-minute timer. One `inperson.py` launch covers the whole session. Per-session stereo
 WAVs (L=user, R=bot) land in `retico/debug_wavs/inperson_*.wav`.
 
-Responses save to the intern PC's `~/scratch/survey_responses/responses.jsonl` — collect
+Responses save to the intern PC's repo checkout at `results/responses.jsonl` — collect
 these files and concatenate with the online JSONL for analysis.
 
 ## Notes

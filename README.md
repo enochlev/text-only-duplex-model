@@ -164,9 +164,9 @@ cd retico && uv run inperson.py
 connects the PC-mic → duplex-server → Misty pipeline to that step's blinded model
 and relays the live transcript into the wizard. **■ Stop** disconnects it; Start
 again begins a fresh conversation, and it also disconnects on "I'm done" or the
-5-minute timer. Responses save to the local
-`~/scratch/survey_responses/responses.jsonl`; per-session stereo WAVs (L=user,
-R=bot) land in `retico/debug_wavs/`.
+5-minute timer. Responses save to the repo's `results/responses.jsonl` (gitignored;
+contains names/emails); per-session stereo WAVs (L=user, R=bot) land in
+`retico/debug_wavs/`.
 
 ### Step 3, path B — online (wizard runs on the GPU box)
 
