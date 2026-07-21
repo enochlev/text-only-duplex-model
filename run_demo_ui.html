@@ -160,11 +160,15 @@
   <section id="st-quest" class="card hidden">
     <span class="step">Questionnaire <span id="q-idx">1</span> of 2</span>
     <h2>Rate <span id="q-sys">System 1</span></h2>
-    <p>This is your <b>Participant ID</b> for this questionnaire:</p>
-    <div class="pinbox" id="q-pin">•••••</div>
-    <p>Click the button below to open the questionnaire (it opens in a new tab). The
-      Participant ID should already be filled in — <b>please check that it matches the number
-      above</b>, then answer the questions and press Submit in the form.</p>
+    <p>Click the button below to open the questionnaire for this system (it opens in a new
+      tab). Answer the questions there, press <b>Submit</b> in the form, then come back to
+      this page.</p>
+    <!-- participant id is carried invisibly via the form prefill; this fallback only
+         appears if the server has no prefill configured (--form-entry '') -->
+    <div id="q-pin-fallback" class="hidden">
+      <p>Enter this <b>Participant ID</b> in the form's first question:</p>
+      <div class="pinbox" id="q-pin">•••••</div>
+    </div>
     <a id="q-link" class="btnlike" target="_blank" rel="noopener">Open questionnaire ↗</a>
 
     <div id="q-review" class="hidden" style="margin-top:18px">
@@ -203,21 +207,25 @@
       <h2 style="margin-top:4px">Thank you for participating!</h2>
     </div>
     <div id="gift-ask">
-      <p>Would you like to collect your <b>$10 gift card</b>? Gift cards are handed out
-        in person by the researcher.</p>
-      <div style="display:flex;gap:10px">
-        <button id="gift-yes" class="primary big" style="flex:1">Yes, I'd like the gift card</button>
-        <button id="gift-no" class="big" style="flex:1">No thanks</button>
+      <p>You can receive a <b>$10 gift card</b> for participating.
+        <b>Note: one gift card per individual</b> (even if you take part more than once).</p>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <button id="gift-email-btn" class="primary big">📧 Email me my gift card</button>
+        <button id="gift-already" class="big">I have already received a gift card</button>
+        <button id="gift-no" class="big">No thanks</button>
+      </div>
+      <div id="gift-email-row" class="hidden" style="margin-top:16px">
+        <label><b>Email address</b><br>
+          <input type="email" id="gift-email" autocomplete="email" placeholder="you@example.com"
+                 style="max-width:none"></label>
+        <p class="mut" style="margin:6px 0 10px">The study team will send your gift card to this
+          address. One gift card per individual.</p>
+        <button id="gift-email-submit" class="primary big" disabled>Submit email</button>
       </div>
     </div>
-    <div id="gift-reveal" class="hidden">
-      <p>Show this <b>pickup PIN</b> to the researcher to collect your gift card:</p>
-      <div class="pinbox" id="gift-pin">•••••</div>
-      <p class="mut">Your PIN has been recorded for gift-card pickup.</p>
-    </div>
     <div id="gift-done" class="hidden">
-      <p class="mut" style="text-align:center">All done — you may close this window.
-        Thanks again for your time!</p>
+      <p class="mut" id="gift-done-msg" style="text-align:center">All done — you may close this
+        window. Thanks again for your time!</p>
     </div>
   </section>
 
@@ -257,6 +265,7 @@
 <script>
 //= config ==================================================================
 let CFG = {model_a_url:"", model_b_url:"", models_configured:false, enable_free_chat:false,
+           inperson:false,
            consent_html:"", instructions_html:"", debrief_html:"",
            consent_pdf_url:"", debrief_pdf_url:"",
            form_url:"", form_prefill:"", study_title:""};
@@ -532,7 +541,7 @@ const STEPS=["consent","instructions","talk","quest","talk","quest","debrief","g
 const STEP_LABELS=["Consent","Instructions","System 1","Questionnaire 1","System 2","Questionnaire 2","Debriefing","Finish"];
 const ST={ i:0,                       // current step index into STEPS
            session:null,              // {session_id, pin_q1, pin_q2, pin_gift, order}
-           talk:null, talkTimer:null, preview:false };
+           talk:null, talkTimer:null, inpersonPoll:null, preview:false };
 
 function showStep(i){
   ST.i=i;
@@ -599,6 +608,32 @@ function initInstructions(){
 }
 
 //= steps 3/5: talk =========================================================
+// conversation timer: wall-clock from when isActiveFn first returns true. grey → green(≥3 min,
+// goal met) → yellow(last 45 s) → red(5 min: onCap fires once — disconnect + lock the step).
+// Returns an elapsed() getter for the interact checkpoint.
+function startTalkTimer(isActiveFn, onCap){
+  const CAP=300, WARN=255, GOAL=180;
+  const fill=document.getElementById("timer-fill"), elapsedEl=document.getElementById("timer-elapsed");
+  const row=document.getElementById("talk-timer");
+  row.classList.remove("hidden"); fill.className="timer-fill grey"; fill.style.width="0%"; elapsedEl.textContent="0:00";
+  if(ST.talkTimer){ clearInterval(ST.talkTimer); ST.talkTimer=null; }
+  let started=0, capped=false;
+  ST.talkTimer=setInterval(()=>{
+    if(!started){ if(isActiveFn()) started=Date.now(); else return; }
+    const s=Math.floor((Date.now()-started)/1000);
+    fill.style.width=Math.min(100, s/CAP*100)+"%";
+    fill.className="timer-fill "+(s>=CAP?"red":s>=WARN?"yellow":s>=GOAL?"green":"grey");
+    elapsedEl.textContent=Math.floor(s/60)+":"+String(s%60).padStart(2,"0");
+    if(s>=CAP && !capped){ capped=true; onCap();
+      clearInterval(ST.talkTimer); ST.talkTimer=null; }
+  },250);
+  return ()=> started ? Math.floor((Date.now()-started)/1000) : 0;
+}
+function stopTalkTimer(){
+  if(ST.talkTimer){ clearInterval(ST.talkTimer); ST.talkTimer=null; }
+  document.getElementById("talk-timer").classList.add("hidden");
+}
+
 function enterTalk(){
   const target = (ST.i<2)?2:4;              // instructions→talk1(2), quest1→talk2(4)
   showStep(target);
@@ -609,41 +644,80 @@ function enterTalk(){
   document.getElementById("talk-instr").open=false;
   const noconf=document.getElementById("talk-noconf");
   noconf.classList.toggle("hidden", CFG.models_configured);
+  const key = ST.session ? ST.session.order[n-1] : (n===1?"A":"B");
+  if(CFG.inperson){ enterTalkInperson(n, key); return; }
+
   ST.talk=makeTalkPanel(document.getElementById("talk-mount"));
   ST.talk.showTranscript(true);   // live transcript visible; review nav appears with >1 conversation
-  const key = ST.session ? ST.session.order[n-1] : (n===1?"A":"B");
   ST.talk.setUrl(key==="A" ? (CFG.model_a_url||null) : (CFG.model_b_url||null));
-
-  // conversation timer: starts on first connect, wall-clock. grey → green(≥3 min, goal met)
-  // → yellow(last 45 s) → red(5 min: auto-disconnect + lock so this system can't be re-run).
-  const CAP=300, WARN=255, GOAL=180;
-  const fill=document.getElementById("timer-fill"), elapsedEl=document.getElementById("timer-elapsed");
-  const row=document.getElementById("talk-timer");
-  row.classList.remove("hidden"); fill.className="timer-fill grey"; fill.style.width="0%"; elapsedEl.textContent="0:00";
-  if(ST.talkTimer){ clearInterval(ST.talkTimer); ST.talkTimer=null; }
-  let started=0, locked=false;
-  ST.talkTimer=setInterval(()=>{
-    if(!started){ if(ST.talk && ST.talk.isConnected()) started=Date.now(); else return; }
-    const s=Math.floor((Date.now()-started)/1000);
-    fill.style.width=Math.min(100, s/CAP*100)+"%";
-    fill.className="timer-fill "+(s>=CAP?"red":s>=WARN?"yellow":s>=GOAL?"green":"grey");
-    elapsedEl.textContent=Math.floor(s/60)+":"+String(s%60).padStart(2,"0");
-    if(s>=CAP && !locked){ locked=true; ST.talk.lock("Time's up — 5 min reached");
-      clearInterval(ST.talkTimer); ST.talkTimer=null; }
-  },250);
-
+  const elapsed = startTalkTimer(()=> ST.talk && ST.talk.isConnected(),
+                                 ()=> ST.talk.lock("Time's up — 5 min reached"));
   const next=document.getElementById("talk-next");
   next.onclick=async ()=>{
     const st=ST.talk.stats();
     if(!st.connected && CFG.models_configured &&
        !confirm("You haven't talked with this system yet. Continue anyway?")) return;
-    if(ST.talkTimer){ clearInterval(ST.talkTimer); ST.talkTimer=null; }
-    row.classList.add("hidden");
+    stopTalkTimer();
     const convos=ST.talk.getConversations();   // preserve transcripts for the questionnaire-step review
     ST.talk.reset();
     await checkpoint("interact",{which:n, hidden_model:key, connected:st.connected,
       talk_s:st.talk_s, ws_sessions:st.ws_sessions, n_conversations:st.n_conversations,
-      timer_s: started ? Math.floor((Date.now()-started)/1000) : 0});
+      timer_s: elapsed()});
+    enterQuest(convos);
+  };
+}
+
+//= in-person talk step: the robot client (retico/inperson.py) runs the audio; we tell it
+//= which blinded slot to use via /live_control and render its transcript from /live_snapshot.
+function enterTalkInperson(n, key){
+  const mount=document.getElementById("talk-mount");
+  mount.innerHTML="";
+  const wrap=document.createElement("div"); wrap.className="talk";
+  wrap.innerHTML=`
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <span class="pill connecting"><span class="dot"></span><span class="pill-txt">Waiting for the robot…</span></span>
+    </div>
+    <p class="mut">Just talk with the robot — your conversation will appear below.</p>
+    <div class="transcript hidden"></div>`;
+  mount.appendChild(wrap);
+  const pill=wrap.querySelector(".pill"), pillTxt=wrap.querySelector(".pill-txt"),
+        tr=wrap.querySelector(".transcript");
+  const setPill=(s,txt)=>{ pill.className="pill "+s; pillTxt.textContent=txt; };
+
+  let lastSnap=null, gotSnap=false, ended=false;
+  post("live_control",{active_slot:key});
+  const deactivate=()=>post("live_control",{active_slot:null});
+
+  if(ST.inpersonPoll) clearInterval(ST.inpersonPoll);
+  ST.inpersonPoll=setInterval(async ()=>{
+    try{
+      const r=await (await fetch("live_snapshot")).json();
+      if(r.snapshot && r.snapshot.blocks){
+        lastSnap=r.snapshot;
+        if(!gotSnap && r.snapshot.blocks.some(b=>b.user_text||b.assistant_text)){
+          gotSnap=true; setPill("connected","Live — talking with the robot"); }
+        renderTranscript(tr, r.snapshot);
+      }
+    }catch(e){ /* local server hiccup; keep polling */ }
+  },1000);
+  const stopPolling=()=>{ if(ST.inpersonPoll){ clearInterval(ST.inpersonPoll); ST.inpersonPoll=null; } };
+
+  const elapsed = startTalkTimer(()=>gotSnap, ()=>{
+    ended=true; stopPolling(); deactivate();
+    setPill("disconnected","Time's up — 5 min reached");
+  });
+
+  const next=document.getElementById("talk-next");
+  next.onclick=async ()=>{
+    if(!gotSnap && !ended &&
+       !confirm("No robot conversation has been detected yet. Continue anyway?")) return;
+    stopTalkTimer(); stopPolling();
+    if(!ended) deactivate();
+    const convos = lastSnap && lastSnap.blocks &&
+      lastSnap.blocks.some(b=>b.user_text||b.assistant_text) ? [lastSnap.blocks] : [];
+    await checkpoint("interact",{which:n, hidden_model:key, connected:gotSnap,
+      inperson:true, timer_s: elapsed(),
+      n_blocks: lastSnap && lastSnap.blocks ? lastSnap.blocks.length : 0});
     enterQuest(convos);
   };
 }
@@ -656,9 +730,15 @@ function enterQuest(convos){
   document.getElementById("q-idx").textContent=n;
   document.getElementById("q-sys").textContent="System "+n;
   const pin = ST.session ? (n===1?ST.session.pin_q1:ST.session.pin_q2) : "12345";
-  document.getElementById("q-pin").textContent=pin;
+  // the participant id (PIN) rides along invisibly in the prefilled form link; only if the
+  // server has no prefill configured do we surface it and ask them to type it in
+  const fallback=document.getElementById("q-pin-fallback");
   const link=document.getElementById("q-link");
-  link.href = CFG.form_prefill ? CFG.form_prefill+encodeURIComponent(pin) : (CFG.form_url||"#");
+  if(CFG.form_prefill){ fallback.classList.add("hidden");
+    link.href = CFG.form_prefill+encodeURIComponent(pin); }
+  else { fallback.classList.remove("hidden");
+    document.getElementById("q-pin").textContent=pin;
+    link.href = CFG.form_url||"#"; }
   let opened=false; link.onclick=()=>{ opened=true; };
   // read-only review of the conversation(s) the participant just had with this system,
   // so they can refer back to it while filling out the questionnaire in the other tab
@@ -696,18 +776,27 @@ function enterDebrief(){
 //= step 8: gift card =======================================================
 function enterGift(){
   showStep(7);
-  const ask=document.getElementById("gift-ask"), rev=document.getElementById("gift-reveal"),
-        done=document.getElementById("gift-done");
-  document.getElementById("gift-yes").onclick=async ()=>{
-    const pin = ST.session ? ST.session.pin_gift : "54321";
-    document.getElementById("gift-pin").textContent=pin;
-    ask.classList.add("hidden"); rev.classList.remove("hidden"); done.classList.remove("hidden");
-    await checkpoint("gift",{wants_gift:true, pin});
+  const ask=document.getElementById("gift-ask"), done=document.getElementById("gift-done"),
+        doneMsg=document.getElementById("gift-done-msg"),
+        emailRow=document.getElementById("gift-email-row"),
+        email=document.getElementById("gift-email"),
+        submit=document.getElementById("gift-email-submit");
+  const finish=async (choice, extra, msg)=>{
+    ask.classList.add("hidden");
+    doneMsg.textContent=msg; done.classList.remove("hidden");
+    await checkpoint("gift", Object.assign({gift_choice:choice}, extra||{}));
   };
-  document.getElementById("gift-no").onclick=async ()=>{
-    ask.classList.add("hidden"); done.classList.remove("hidden");
-    await checkpoint("gift",{wants_gift:false});
+  document.getElementById("gift-email-btn").onclick=()=>{
+    emailRow.classList.remove("hidden"); email.focus();
   };
+  email.oninput=()=>{ submit.disabled=!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.value.trim()); };
+  submit.onclick=()=>finish("email", {email:email.value.trim()},
+    "Your email has been recorded — the study team will send your $10 gift card there. "+
+    "You may close this window. Thanks again!");
+  document.getElementById("gift-already").onclick=()=>finish("already_received", null,
+    "Thanks — noted. You may close this window. Thanks again for your time!");
+  document.getElementById("gift-no").onclick=()=>finish("declined", null,
+    "All done — you may close this window. Thanks again for your time!");
 }
 
 //= Free chat (dev) =========================================================

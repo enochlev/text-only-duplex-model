@@ -16,8 +16,13 @@ No gradio UI; optional FRP tunnel for public access.
    participant confirms submission before continuing.
 5. **Talk with System 2** → **Questionnaire 2** (its own PIN).
 6. **Debriefing statement** (`data/survey/debrief_irb24222.html`) — typed-name signature.
-7. **Gift card** (optional) — a third 5-digit **pickup PIN** is revealed and saved;
-   matched in person by the researcher before handing out the card.
+7. **Gift card** (optional) — three choices: submit an **email address** to receive the
+   $10 gift card (one per individual), "already received one", or decline. The email is
+   saved in the checkpoint record.
+
+The questionnaire PINs are invisible to the participant — they ride along in the
+prefilled form link (`entry.156546644=<PIN>`) automatically. The on-screen PIN + manual
+instructions only appear as a fallback if prefill is disabled (`--form-entry ''`).
 
 The A/B order is blinded, chosen server-side per session, and recorded. All three PINs are
 allocated server-side (`/session`) and guaranteed unique across the out-dir's history.
@@ -52,14 +57,45 @@ One JSON line per event, all linked by `session_id`:
 - `session_start` — `pin_q1`, `pin_q2`, `pin_gift`, `order` (order[0] = what the
   participant sees as "System 1"; `A`/`B` = `--model_a_url`/`--model_b_url`), `ua`.
 - `consent` — `name`, `agree_system1`, `agree_system2`, `ts`.
-- `interact` — `which` (1|2), `hidden_model`, `connected`, `talk_s`, `ws_sessions`.
+- `interact` — `which` (1|2), `hidden_model`, `connected`, `timer_s`; online adds
+  `talk_s`, `ws_sessions`, `n_conversations`; in-person adds `inperson: true`, `n_blocks`.
 - `questionnaire` — `which`, `pin`, `opened_form`.
 - `debrief` — `name`, `acknowledged`.
-- `gift` — `wants_gift`, `pin` (only if wanted).
+- `gift` — `gift_choice` (`email` | `already_received` | `declined`), `email` (if email).
 
 Questionnaire answers live in the **Google Form** responses; join them to sessions on the
 Participant ID field (= `pin_q1`/`pin_q2`). Each step checkpoints immediately, so a session
 that dies midway still leaves consent/PINs/order on disk.
+
+## In-person (Misty) mode — intern runbook
+
+In-person sessions run the **same wizard locally on the intern's PC** (a local link can
+reach the Misty robot on the LAN; the hosted gradio link cannot). Audio flows through the
+retico pipeline (PC mic → 16 k → [hush] → Borah duplex server → Misty speaker); the wizard
+shows the live transcript and controls which blinded system the robot client talks to.
+
+On the intern PC (two terminals + a browser):
+
+```bash
+# 1. the wizard, locally, with the Borah model URLs:
+python run_demo.py --inperson \
+  --model_a_url wss://<base>.gradio.live/ws --model_b_url wss://<run9>.gradio.live/ws
+
+# 2. the robot client (from the retico/ dir; set MISTY_IP in retico/.env):
+cd retico && uv run inperson.py
+
+# 3. open http://localhost:7870 for the participant
+```
+
+The robot client idles until the participant reaches a talk step, then automatically
+connects to that step's (blinded) system, streams mic→server→Misty, and relays the
+transcript so the participant sees it live — including on the questionnaire's review
+panel. It disconnects when they click "I'm done" or the 5-minute timer fires, and waits
+for the next talk step. One `inperson.py` launch covers the whole session. Per-session
+stereo WAVs (L=user, R=bot) land in `retico/debug_wavs/inperson_*.wav`.
+
+Responses save to the intern PC's `~/scratch/survey_responses/responses.jsonl` — collect
+these files and concatenate with the online JSONL for analysis.
 
 ## Notes
 

@@ -126,6 +126,53 @@ def create_app(args) -> FastAPI:
     def healthz():
         return {"status": "ok"}
 
+    # ---- in-person mode (one supervised session per machine) --------------------
+    # The wizard tells the local robot client which blinded slot to run via
+    # /live_control; retico/inperson.py polls /inperson_target, connects the
+    # mic→duplex→Misty pipeline to that slot's server, and pushes transcript
+    # snapshots to /live_snapshot, which the wizard polls to render live.
+    live = {"active_slot": None, "snapshot": None, "snapshot_ts": 0.0}
+
+    @app.post("/live_control")
+    async def live_control(request: Request):
+        if not args.inperson:
+            return JSONResponse({"ok": False, "error": "not in in-person mode"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+        slot = body.get("active_slot")
+        if slot not in ("A", "B", None):
+            return JSONResponse({"ok": False, "error": "bad slot"}, status_code=400)
+        live["active_slot"] = slot
+        live["snapshot"] = None  # fresh talk step → don't show the previous system's transcript
+        live["snapshot_ts"] = 0.0
+        print(f"[inperson] active_slot → {slot}")
+        return {"ok": True, "active_slot": slot}
+
+    @app.get("/inperson_target")
+    def inperson_target():
+        slot = live["active_slot"]
+        url = {"A": args.model_a_url, "B": args.model_b_url}.get(slot, "")
+        return {"active_slot": slot, "url": url or ""}
+
+    @app.post("/live_snapshot")
+    async def push_live_snapshot(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+        if body.get("snapshot") is not None:
+            live["snapshot"] = body["snapshot"]
+            live["snapshot_ts"] = time.time()
+        # echo the active slot so the robot client knows when to disconnect
+        return {"ok": True, "active_slot": live["active_slot"]}
+
+    @app.get("/live_snapshot")
+    def get_live_snapshot():
+        return {"snapshot": live["snapshot"], "ts": live["snapshot_ts"],
+                "active_slot": live["active_slot"]}
+
     @app.get("/consent.pdf")
     def consent_pdf_route():
         if consent_pdf is None:
@@ -148,6 +195,7 @@ def create_app(args) -> FastAPI:
             "model_a_url": args.model_a_url or "",
             "model_b_url": args.model_b_url or "",
             "models_configured": models_configured,
+            "inperson": bool(args.inperson),
             "enable_free_chat": bool(args.enable_free_chat),
             # PDF viewer is preferred; HTML transcription kept as a fallback when a PDF is absent.
             "consent_pdf_url": "consent.pdf" if consent_pdf is not None else "",
@@ -198,6 +246,9 @@ def main() -> None:
     ap.add_argument("--model_a_url", default="", help="WS URL of system A (e.g. wss://xxx.gradio.live/ws)")
     ap.add_argument("--model_b_url", default="", help="WS URL of system B")
     ap.add_argument("--enable_free_chat", action="store_true", help="Add a dev free-chat view (pick a system, just talk)")
+    ap.add_argument("--inperson", action="store_true",
+                    help="In-person (Misty) mode: run locally on the intern PC alongside retico/inperson.py; "
+                         "the talk step shows the robot conversation's live transcript instead of the browser mic panel")
     ap.add_argument("--share", action="store_true", help="Expose publicly via a gradio FRP tunnel (*.gradio.live)")
     ap.add_argument("--port", type=int, default=7870)
     ap.add_argument("--host", default="0.0.0.0")
