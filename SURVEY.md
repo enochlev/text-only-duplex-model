@@ -17,8 +17,9 @@ No gradio UI; optional FRP tunnel for public access.
 5. **Talk with System 2** → **Questionnaire 2** (its own PIN).
 6. **Debriefing statement** (`data/survey/debrief_irb24222.html`) — typed-name signature.
 7. **Gift card** (optional) — three choices: submit an **email address** to receive the
-   $10 gift card (one per individual), "already received one", or decline. The email is
-   saved in the checkpoint record.
+   gift card (one per individual), "already received one", or decline. The email is
+   saved in the checkpoint record. Amount shown is **$5 online / $10 in-person**
+   (auto by mode; `--gift-amount` overrides).
 
 The questionnaire PINs are invisible to the participant — they ride along in the
 prefilled form link (`entry.156546644=<PIN>`) automatically. The on-screen PIN + manual

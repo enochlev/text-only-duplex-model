@@ -110,6 +110,8 @@ def create_app(args) -> FastAPI:
     debrief_pdf = _load_pdf(args.debrief_pdf)
 
     models_configured = bool(args.model_a_url and args.model_b_url)
+    # compensation differs by mode: $10 in person, $5 online (override with --gift-amount)
+    gift_amount = args.gift_amount or ("$10" if args.inperson else "$5")
 
     with open(UI_PATH, "r", encoding="utf-8") as f:
         ui_html = f.read()
@@ -203,6 +205,7 @@ def create_app(args) -> FastAPI:
             "model_b_url": args.model_b_url or "",
             "models_configured": models_configured,
             "inperson": bool(args.inperson),
+            "gift_amount": gift_amount,
             "enable_free_chat": bool(args.enable_free_chat),
             # PDF viewer is preferred; HTML transcription kept as a fallback when a PDF is absent.
             "consent_pdf_url": "consent.pdf" if consent_pdf is not None else "",
@@ -267,6 +270,7 @@ def main() -> None:
     ap.add_argument("--debrief-pdf", default=DEBRIEF_PDF, help="PDF shown in the debrief step (default the IRB debrief PDF)")
     ap.add_argument("--form-url", default=DEFAULT_FORM_URL, help="Google Form URL for the questionnaires")
     ap.add_argument("--form-entry", default=DEFAULT_FORM_ENTRY, help="Form entry id of the Participant ID question ('' = no prefill)")
+    ap.add_argument("--gift-amount", default=None, help="Gift-card amount shown to participants (default: $10 in-person, $5 online)")
     ap.add_argument("--out", default="~/scratch/survey_responses", help="Directory for responses.jsonl")
     args = ap.parse_args()
 

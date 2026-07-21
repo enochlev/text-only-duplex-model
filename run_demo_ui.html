@@ -207,7 +207,7 @@
       <h2 style="margin-top:4px">Thank you for participating!</h2>
     </div>
     <div id="gift-ask">
-      <p>You can receive a <b>$10 gift card</b> for participating.
+      <p>You can receive a <b><span id="gift-amt">$10</span> gift card</b> for participating.
         <b>Note: one gift card per individual</b> (even if you take part more than once).</p>
       <div style="display:flex;flex-direction:column;gap:10px">
         <button id="gift-email-btn" class="primary big">📧 Email me my gift card</button>
@@ -265,7 +265,7 @@
 <script>
 //= config ==================================================================
 let CFG = {model_a_url:"", model_b_url:"", models_configured:false, enable_free_chat:false,
-           inperson:false,
+           inperson:false, gift_amount:"$10",
            consent_html:"", instructions_html:"", debrief_html:"",
            consent_pdf_url:"", debrief_pdf_url:"",
            form_url:"", form_prefill:"", study_title:""};
@@ -787,6 +787,8 @@ function enterDebrief(){
 //= step 8: gift card =======================================================
 function enterGift(){
   showStep(7);
+  const amt=CFG.gift_amount||"$10";
+  document.getElementById("gift-amt").textContent=amt;
   const ask=document.getElementById("gift-ask"), done=document.getElementById("gift-done"),
         doneMsg=document.getElementById("gift-done-msg"),
         emailRow=document.getElementById("gift-email-row"),
@@ -802,7 +804,7 @@ function enterGift(){
   };
   email.oninput=()=>{ submit.disabled=!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.value.trim()); };
   submit.onclick=()=>finish("email", {email:email.value.trim()},
-    "Your email has been recorded — the study team will send your $10 gift card there. "+
+    "Your email has been recorded — the study team will send your "+amt+" gift card there. "+
     "You may close this window. Thanks again!");
   document.getElementById("gift-already").onclick=()=>finish("already_received", null,
     "Thanks — noted. You may close this window. Thanks again for your time!");
