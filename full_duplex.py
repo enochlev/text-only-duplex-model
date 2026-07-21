@@ -218,7 +218,7 @@ def local_generate(system_prompt: str, user_message: str) -> str:
     duplex websocket server on SERVER_PORT.
     """
     import requests
-    url = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
+    url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/chat/completions"
     payload = {
         "model": "text-duplex",
         # Match cpm_generate's larger window so a full turn lands in one call (the
@@ -326,7 +326,7 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
     """
     import requests
     prompt = _build_cpm_prompt(user_message)
-    url = f"http://localhost:{VLLM_PORT}/v1/completions"
+    url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/completions"
     payload = {
         "model": "cpm-text-duplex",
         "prompt": prompt,
@@ -364,8 +364,11 @@ def cpm_generate(system_prompt: str, user_message: str) -> str:
 #                 cpm_generate() call.
 # Both have env-var defaults and can be overridden by server.py's CLI args
 # (which assign back to full_duplex.VLLM_PORT before the agent is created).
+# VLLM_HOST lets server.py run on a different machine than vLLM (e.g. the
+# Mac hosting ASR/TTS/server.py while vLLM serves from the LAN GPU box).
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8998"))
 VLLM_PORT = int(os.getenv("VLLM_PORT", "8555"))
+VLLM_HOST = os.getenv("VLLM_HOST", "localhost")
 
 DEFAULT_WPM       = 150
 DEFAULT_BLOCK_S   = 2.0
