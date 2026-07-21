@@ -130,7 +130,23 @@ B = RL.**
 ### Step 3, path A — in-person (Misty robot; wizard runs on the local PC)
 
 The survey page must be a **local** link so the browser/PC can reach the Misty
-robot on the LAN. Two terminals + a browser on the intern PC:
+robot on the LAN.
+
+One-time PC setup — the optional Hush background-speaker filter needs the
+[pulp-vision/Hush](https://github.com/pulp-vision/Hush) repo cloned **into this
+repo's root** (it's gitignored, so `git clone` of this repo doesn't bring it;
+prebuilt libs for macOS/Linux/Windows ship in `Hush/deployment/lib/`):
+
+```bash
+git clone https://github.com/pulp-vision/Hush        # from the repo root
+cd retico && uv sync --extra hush
+```
+
+Without it the client still runs — it prints `hush unavailable … running without
+filter` and continues. Set `HUSH_CHECKPOINT=off` in `retico/.env` to silence the
+warning; full details in `retico/README.md`.
+
+Two terminals + a browser on the intern PC:
 
 ```bash
 # terminal 1 — survey wizard, locally:
