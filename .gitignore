@@ -23,6 +23,7 @@ sft_checkpoints/*
 */_[!_]*
 *._*
 survey_*
+!survey_to_csv.py
 *.log
 *.pem
 # Hush repo clone (shared lib + ONNX bundle for the retico client filter)
