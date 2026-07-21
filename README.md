@@ -144,10 +144,11 @@ cd retico && uv run inperson.py
 # browser — participant at http://localhost:7870
 ```
 
-`inperson.py` idles until the participant reaches a talk step, then automatically
+`inperson.py` idles until the participant presses **▶ Start** on a talk step, then
 connects the PC-mic → duplex-server → Misty pipeline to that step's blinded model
-and relays the live transcript into the wizard. It disconnects on "I'm done" or the
-5-minute timer and waits for the next step. Responses save to the local
+and relays the live transcript into the wizard. **■ Stop** disconnects it; Start
+again begins a fresh conversation, and it also disconnects on "I'm done" or the
+5-minute timer. Responses save to the local
 `~/scratch/survey_responses/responses.jsonl`; per-session stereo WAVs (L=user,
 R=bot) land in `retico/debug_wavs/`.
 

@@ -88,12 +88,13 @@ cd retico && uv run inperson.py
 # 3. open http://localhost:7870 for the participant
 ```
 
-The robot client idles until the participant reaches a talk step, then automatically
+The robot client idles until the participant presses **▶ Start** on a talk step, then
 connects to that step's (blinded) system, streams mic→server→Misty, and relays the
 transcript so the participant sees it live — including on the questionnaire's review
-panel. It disconnects when they click "I'm done" or the 5-minute timer fires, and waits
-for the next talk step. One `inperson.py` launch covers the whole session. Per-session
-stereo WAVs (L=user, R=bot) land in `retico/debug_wavs/inperson_*.wav`.
+panel. **■ Stop** disconnects it; Start again begins a fresh conversation (each cycle
+is archived separately for the review). It also disconnects on "I'm done" or the
+5-minute timer. One `inperson.py` launch covers the whole session. Per-session stereo
+WAVs (L=user, R=bot) land in `retico/debug_wavs/inperson_*.wav`.
 
 Responses save to the intern PC's `~/scratch/survey_responses/responses.jsonl` — collect
 these files and concatenate with the online JSONL for analysis.

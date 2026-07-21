@@ -670,43 +670,64 @@ function enterTalk(){
   };
 }
 
-//= in-person talk step: the robot client (retico/inperson.py) runs the audio; we tell it
-//= which blinded slot to use via /live_control and render its transcript from /live_snapshot.
+//= in-person talk step: the robot client (retico/inperson.py) runs the audio; the
+//= participant's Start/Stop button activates/clears the blinded slot via /live_control
+//= (robot connects/disconnects accordingly) and the transcript renders from /live_snapshot.
+//= Each Start→Stop cycle is one conversation (fresh server session), like online.
 function enterTalkInperson(n, key){
   const mount=document.getElementById("talk-mount");
   mount.innerHTML="";
   const wrap=document.createElement("div"); wrap.className="talk";
   wrap.innerHTML=`
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-      <span class="pill connecting"><span class="dot"></span><span class="pill-txt">Waiting for the robot…</span></span>
+      <span class="pill disconnected"><span class="dot"></span><span class="pill-txt">Ready — press Start</span></span>
     </div>
-    <p class="mut">Just talk with the robot — your conversation will appear below.</p>
+    <button class="startstop primary big">▶ Start</button>
+    <p class="mut" style="margin-top:10px">Press <b>Start</b>, then talk with the robot — your
+      conversation appears below. <b>Stop</b> ends it; Start again begins a fresh conversation.</p>
     <div class="transcript hidden"></div>`;
   mount.appendChild(wrap);
   const pill=wrap.querySelector(".pill"), pillTxt=wrap.querySelector(".pill-txt"),
-        tr=wrap.querySelector(".transcript");
+        btn=wrap.querySelector(".startstop"), tr=wrap.querySelector(".transcript");
   const setPill=(s,txt)=>{ pill.className="pill "+s; pillTxt.textContent=txt; };
 
-  let lastSnap=null, gotSnap=false, robotUp=false, ended=false;
-  post("live_control",{active_slot:key});
+  const convs=[];
+  let lastSnap=null, gotSnap=false, robotUp=false, everUp=false, active=false, ended=false;
+  const hasText=(snap)=> !!(snap && snap.blocks && snap.blocks.some(b=>b.user_text||b.assistant_text));
+  const archive=()=>{ if(hasText(lastSnap)) convs.push(lastSnap.blocks); lastSnap=null; gotSnap=false; };
   const deactivate=()=>post("live_control",{active_slot:null});
+
+  btn.onclick=()=>{
+    if(ended) return;
+    if(!active){
+      active=true; lastSnap=null; gotSnap=false;
+      post("live_control",{active_slot:key});
+      btn.textContent="■ Stop"; btn.classList.remove("primary");
+      setPill("connecting","Waiting for the robot…");
+      tr.classList.add("hidden"); tr.innerHTML="";
+    } else {
+      active=false; archive(); deactivate();
+      btn.textContent="▶ Start"; btn.classList.add("primary");
+      setPill("disconnected","Stopped — press Start to talk again");
+    }
+  };
 
   if(ST.inpersonPoll) clearInterval(ST.inpersonPoll);
   ST.inpersonPoll=setInterval(async ()=>{
+    if(!active || ended) return;
     try{
       const r=await (await fetch("live_snapshot")).json();
       // pill tracks the robot client's heartbeat, not the transcript: the participant
       // should see "connected — start talking" even before any speech is transcribed
-      if(!ended){
-        robotUp = !!(r.robot_alive && r.robot_connected);
-        if(gotSnap && robotUp) setPill("connected","Live — talking with the robot");
-        else if(robotUp)       setPill("connected","Robot connected — start talking!");
-        else if(r.robot_alive) setPill("connecting","Robot is connecting…");
-        else                   setPill("connecting","Waiting for the robot…");
-      }
+      robotUp = !!(r.robot_alive && r.robot_connected);
+      if(robotUp) everUp=true;
+      if(gotSnap && robotUp) setPill("connected","Live — talking with the robot");
+      else if(robotUp)       setPill("connected","Robot connected — start talking!");
+      else if(r.robot_alive) setPill("connecting","Robot is connecting…");
+      else                   setPill("connecting","Waiting for the robot…");
       if(r.snapshot && r.snapshot.blocks){
         lastSnap=r.snapshot;
-        if(!gotSnap && r.snapshot.blocks.some(b=>b.user_text||b.assistant_text)) gotSnap=true;
+        if(!gotSnap && hasText(r.snapshot)) gotSnap=true;
         renderTranscript(tr, r.snapshot);
       }
     }catch(e){ /* local server hiccup; keep polling */ }
@@ -714,22 +735,23 @@ function enterTalkInperson(n, key){
   const stopPolling=()=>{ if(ST.inpersonPoll){ clearInterval(ST.inpersonPoll); ST.inpersonPoll=null; } };
 
   const elapsed = startTalkTimer(()=>robotUp, ()=>{
-    ended=true; stopPolling(); deactivate();
+    ended=true; stopPolling(); if(active){ active=false; deactivate(); }
+    btn.disabled=true; btn.textContent="Time's up — 5 min reached"; btn.classList.remove("primary");
     setPill("disconnected","Time's up — 5 min reached");
   });
 
   const next=document.getElementById("talk-next");
   next.onclick=async ()=>{
-    if(!gotSnap && !ended &&
-       !confirm("No robot conversation has been detected yet. Continue anyway?")) return;
+    if(!everUp && convs.length===0 && !hasText(lastSnap) && !ended &&
+       !confirm("You haven't talked with the robot yet. Continue anyway?")) return;
     stopTalkTimer(); stopPolling();
-    if(!ended) deactivate();
-    const convos = lastSnap && lastSnap.blocks &&
-      lastSnap.blocks.some(b=>b.user_text||b.assistant_text) ? [lastSnap.blocks] : [];
-    await checkpoint("interact",{which:n, hidden_model:key, connected:(robotUp||gotSnap),
-      had_text:gotSnap, inperson:true, timer_s: elapsed(),
-      n_blocks: lastSnap && lastSnap.blocks ? lastSnap.blocks.length : 0});
-    enterQuest(convos);
+    if(active && !ended){ active=false; deactivate(); }
+    archive();
+    await checkpoint("interact",{which:n, hidden_model:key, connected:everUp,
+      had_text:convs.length>0, inperson:true, timer_s: elapsed(),
+      n_conversations:convs.length,
+      n_blocks: convs.reduce((s,c)=>s+c.length,0)});
+    enterQuest(convs);
   };
 }
 
