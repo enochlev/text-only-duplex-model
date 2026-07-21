@@ -1,5 +1,4 @@
 import os
-import uuid
 import wave
 import tempfile
 
@@ -48,6 +47,16 @@ class MistySpeakerModule(AbstractConsumingModule):
 
         self.audio_buffer = bytearray()
 
+        # Fixed ring of filenames reused with OverwriteExisting=True. A fresh
+        # uuid per chunk accumulated forever on the robot — at ~2,470 files the
+        # 820's asset service hangs on every list/save (10s IPC timeout) and
+        # uploads start failing with "Could not find location of newly saved
+        # audio file" (observed 2026-07-16, took both robots down). Ten names
+        # is plenty: chunks are ~1s and play immediately, so a name is free
+        # again long before the ring wraps.
+        self._name_ring = [f"retico_chunk_{i}.wav" for i in range(10)]
+        self._ring_idx = 0
+
     def process_update(self, update_message):
         if not update_message:
             return
@@ -87,7 +96,8 @@ class MistySpeakerModule(AbstractConsumingModule):
 
     def _play_buffer(self):
 
-        filename = f"retico_{uuid.uuid4().hex}.wav"
+        filename = self._name_ring[self._ring_idx]
+        self._ring_idx = (self._ring_idx + 1) % len(self._name_ring)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = tmp.name
