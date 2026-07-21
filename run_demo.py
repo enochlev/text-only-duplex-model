@@ -261,6 +261,29 @@ def create_app(args) -> FastAPI:
     return app
 
 
+def _check_model_url(slot: str, ws_url: str) -> None:
+    """Startup probe of a model WS URL's /healthz. A mistyped gradio host 404s on
+    every connect but only surfaces mid-session as a cryptic InvalidStatus in the
+    robot client — catch it loudly here instead (URLs are often hand-typed)."""
+    import urllib.request
+    from urllib.parse import urlparse
+    parsed = urlparse(ws_url)
+    scheme = "https" if parsed.scheme in ("wss", "https") else "http"
+    probe = f"{scheme}://{parsed.netloc}/healthz"
+    try:
+        code = urllib.request.urlopen(probe, timeout=8).status
+    except Exception as exc:
+        code = getattr(exc, "code", None)
+        if code is None:
+            print(f"[check] system {slot}: {probe} unreachable ({type(exc).__name__}: {exc}) — check the tunnel/network")
+            return
+    if code == 200:
+        print(f"[check] system {slot}: {ws_url} is up")
+    else:
+        print(f"[check] system {slot}: {probe} answered HTTP {code} — WRONG or DEAD URL."
+              f" Copy-paste the wss:// URL from that server.py console (don't hand-type it).")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="In-person study front-end for the duplex model (IRB24-222).")
     ap.add_argument("--model_a_url", default="", help="WS URL of system A (e.g. wss://xxx.gradio.live/ws)")
@@ -287,6 +310,10 @@ def main() -> None:
 
     if not (args.model_a_url and args.model_b_url):
         print("[warn] no --model_a_url/--model_b_url — talk steps will show a not-configured notice (UI review mode).")
+    for slot in ("A", "B"):
+        url = {"A": args.model_a_url, "B": args.model_b_url}[slot]
+        if url:
+            _check_model_url(slot, url)
     app = create_app(args)
 
     public_url = None
